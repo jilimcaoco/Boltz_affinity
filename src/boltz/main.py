@@ -814,6 +814,14 @@ def cli() -> None:
     return
 
 
+# Register the affinity rescoring CLI subcommand
+try:
+    from boltz.affinity_rescoring.cli import rescore_cli
+    cli.add_command(rescore_cli)
+except ImportError:
+    pass  # affinity_rescoring module not installed
+
+
 @cli.command()
 @click.argument("data", type=click.Path(exists=True))
 @click.option(
