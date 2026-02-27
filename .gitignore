@@ -177,6 +177,7 @@ boltz_results_*/
 slurm_scripts/*.log
 slurm_scripts/*.out
 slurm_scripts/*.err
+slurm_scripts/*.slurm
 
 # Cached/copied path artifacts
 home/
