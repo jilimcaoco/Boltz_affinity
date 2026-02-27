@@ -352,6 +352,10 @@ def rescore_batch(
          'Overrides SEQRES and ATOM-derived sequences.',
 )
 @click.option(
+    "--use-msa-server", is_flag=True, default=False,
+    help="Use ColabFold MSA server for sequence search.",
+)
+@click.option(
     "--log-level", default="INFO",
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
 )
@@ -366,6 +370,7 @@ def rescore_receptor(
     checkpoint: str,
     sort_by: str,
     reference_sequence: Optional[str],
+    use_msa_server: bool,
     log_level: str,
 ):
     """Score a receptor against multiple ligands from MOL2 file."""
@@ -400,6 +405,7 @@ def rescore_receptor(
         output_format=output_format,
         sort_by=sort_by,
         reference_sequences=ref_seqs,
+        use_msa_server=use_msa_server,
     )
 
     # Print summary

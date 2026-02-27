@@ -290,9 +290,9 @@ class RescoreConfig(BaseModel):
     device: DeviceOption = DeviceOption.AUTO
 
     # Inference
-    recycling_steps: int = 5
-    diffusion_samples: int = 5
-    sampling_steps: int = 200
+    recycling_steps: int = 1
+    diffusion_samples: int = 1
+    sampling_steps: int = 50
     affinity_mw_correction: bool = True
 
     # Validation

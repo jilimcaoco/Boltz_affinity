@@ -31,9 +31,9 @@ DEFAULT_CONFIG = {
         "device": "auto",
     },
     "inference": {
-        "recycling_steps": 5,
-        "diffusion_samples": 5,
-        "sampling_steps": 200,
+        "recycling_steps": 1,
+        "diffusion_samples": 1,
+        "sampling_steps": 50,
         "affinity_mw_correction": True,
     },
     "validation": {
@@ -104,9 +104,9 @@ def load_config(config_path: Optional[str | Path] = None) -> RescoreConfig:
     return RescoreConfig(
         checkpoint=config_data.get("model", {}).get("checkpoint", "auto"),
         device=DeviceOption(config_data.get("model", {}).get("device", "auto")),
-        recycling_steps=config_data.get("inference", {}).get("recycling_steps", 5),
-        diffusion_samples=config_data.get("inference", {}).get("diffusion_samples", 5),
-        sampling_steps=config_data.get("inference", {}).get("sampling_steps", 200),
+        recycling_steps=config_data.get("inference", {}).get("recycling_steps", 1),
+        diffusion_samples=config_data.get("inference", {}).get("diffusion_samples", 1),
+        sampling_steps=config_data.get("inference", {}).get("sampling_steps", 50),
         affinity_mw_correction=config_data.get("inference", {}).get("affinity_mw_correction", True),
         validation_level=ValidationLevel(
             config_data.get("validation", {}).get("level", "moderate")

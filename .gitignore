@@ -164,3 +164,19 @@ cython_debug/
 # Boltz prediction outputs
 #   All result files generated from a boltz prediction call
 boltz_results_*/
+
+# Generated data files (receptor PDBs, ligand mol2s, score CSVs)
+*.pdb
+*.mol2
+*.csv
+
+# Generated plots
+*.png
+
+# SLURM logs
+slurm_scripts/*.log
+slurm_scripts/*.out
+slurm_scripts/*.err
+
+# Cached/copied path artifacts
+home/

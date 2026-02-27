@@ -149,7 +149,7 @@ class AffinityRescorer:
 
         self._cache_dir = Path(
             cache_dir or os.environ.get("BOLTZ_CACHE", "~/.boltz")
-        ).expanduser()
+        ).expanduser().resolve()
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._validator = StructureValidator(level=self.config.validation_level)
@@ -509,6 +509,7 @@ class AffinityRescorer:
         validation_level: str = "moderate",
         sort_by: str = "affinity_score",
         reference_sequences: Optional[Dict[str, str]] = None,
+        use_msa_server: bool = False,
     ) -> List[LigandScore]:
         """
         Score a fixed receptor against multiple ligands from MOL2 file.
@@ -591,18 +592,42 @@ class AffinityRescorer:
         # Score each ligand
         scores: List[LigandScore] = []
 
+        # Pre-generate MSA once for the receptor protein if using MSA server
+        cached_msa_path = None
+        if use_msa_server:
+            cached_msa_path = self._generate_msa(protein_seq, protein_chain_id)
+            if cached_msa_path is not None:
+                logger.info(
+                    f"MSA pre-generated and cached. Will reuse for all "
+                    f"{len(ligand_structures)} ligands."
+                )
+            else:
+                logger.warning(
+                    "MSA pre-generation failed. Will fall back to "
+                    "--use_msa_server per ligand (slow)."
+                )
+
         try:
             from tqdm import tqdm
             lig_iter = tqdm(ligand_structures, desc="Scoring ligands", unit="lig")
         except ImportError:
             lig_iter = ligand_structures
 
-        for lig_struct in lig_iter:
+        import time as _time
+        for lig_idx, lig_struct in enumerate(lig_iter):
+            _t0 = _time.time()
             score = self._score_single_ligand(
                 lig_struct,
                 protein_atoms,
                 protein_seq,
                 protein_chain_id,
+                use_msa_server=use_msa_server,
+                msa_path=cached_msa_path,
+            )
+            _elapsed = _time.time() - _t0
+            logger.debug(
+                f"Ligand {lig_idx+1}/{len(ligand_structures)} "
+                f"({lig_struct.name}): {_elapsed:.1f}s"
             )
             scores.append(score)
 
@@ -646,9 +671,17 @@ class AffinityRescorer:
         ligand_chains: List[str],
         ligand_smiles: Dict[str, str],
         use_msa_server: bool = False,
+        msa_path: Optional[Path] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Run Boltz prediction by creating YAML and invoking the predict command.
+
+        Parameters
+        ----------
+        msa_path : Path, optional
+            Path to a pre-computed MSA file (.a3m or .csv). When provided,
+            the MSA path is embedded in the YAML and --use_msa_server is
+            not needed.
 
         Returns parsed affinity JSON or None on failure.
         """
@@ -659,7 +692,8 @@ class AffinityRescorer:
             # Create YAML
             yaml_path = work_dir / "input.yaml"
             yaml_data = self._build_yaml_data(
-                sequences, protein_chains, ligand_chains, ligand_smiles
+                sequences, protein_chains, ligand_chains, ligand_smiles,
+                msa_path=msa_path,
             )
 
             import yaml
@@ -668,12 +702,15 @@ class AffinityRescorer:
 
             # Run Boltz predict
             cmd = [
-                sys.executable, "-m", "boltz", "predict",
+                sys.executable, "-m", "boltz.main", "predict",
                 str(yaml_path),
                 "--out_dir", str(work_dir / "output"),
+                "--cache", str(self._cache_dir),
                 "--recycling_steps", str(self.config.recycling_steps),
                 "--diffusion_samples_affinity", str(self.config.diffusion_samples),
                 "--sampling_steps", str(self.config.sampling_steps),
+                "--sampling_steps_affinity", str(self.config.sampling_steps),
+                "--num_workers", "0",
             ]
 
             if self._checkpoint != "auto":
@@ -686,7 +723,7 @@ class AffinityRescorer:
             if self.config.device != DeviceOption.AUTO:
                 cmd.extend(["--accelerator", self.config.device.value])
 
-            if use_msa_server:
+            if use_msa_server and msa_path is None:
                 cmd.append("--use_msa_server")
 
             logger.debug(f"Running: {' '.join(cmd)}")
@@ -702,15 +739,33 @@ class AffinityRescorer:
             if result.returncode != 0:
                 logger.error(f"Boltz predict failed (rc={result.returncode}):")
                 logger.error(result.stderr[-2000:] if result.stderr else "No stderr")
+                logger.error(result.stdout[-2000:] if result.stdout else "No stdout")
                 return None
 
-            # Find affinity output
+            # Log subprocess output at debug level even on success
+            if result.stdout:
+                logger.debug(f"Boltz predict stdout: {result.stdout[-2000:]}")
+            if result.stderr:
+                logger.debug(f"Boltz predict stderr: {result.stderr[-2000:]}")
+
+            # Find affinity output — boltz predict nests under boltz_results_<stem>/
             output_base = work_dir / "output"
+
+            # Log what files exist for debugging
+            if output_base.exists():
+                all_files = list(output_base.rglob("*"))
+                logger.debug(f"Files in output dir ({len(all_files)}): {[str(f.relative_to(output_base)) for f in all_files[:30]]}")
+            else:
+                logger.warning(f"Output directory does not exist: {output_base}")
+                return None
+
+            # Search for affinity JSON anywhere under the output tree
             for json_file in output_base.rglob("affinity_*.json"):
+                logger.info(f"Found affinity output: {json_file}")
                 with open(json_file) as f:
                     return json.load(f)
 
-            logger.warning("No affinity JSON found in output")
+            logger.warning(f"No affinity JSON found in output. Searched: {output_base}")
             return None
 
         except subprocess.TimeoutExpired:
@@ -732,18 +787,20 @@ class AffinityRescorer:
         protein_chains: List[str],
         ligand_chains: List[str],
         ligand_smiles: Dict[str, str],
+        msa_path: Optional[Path] = None,
     ) -> Dict[str, Any]:
         """Build the YAML data structure for Boltz input."""
         yaml_sequences = []
 
         for chain_id in protein_chains:
             if chain_id in sequences:
-                yaml_sequences.append({
-                    "protein": {
-                        "id": chain_id,
-                        "sequence": sequences[chain_id],
-                    }
-                })
+                protein_entry = {
+                    "id": chain_id,
+                    "sequence": sequences[chain_id],
+                }
+                if msa_path is not None:
+                    protein_entry["msa"] = str(msa_path)
+                yaml_sequences.append({"protein": protein_entry})
 
         binder_chain = None
         for chain_id in ligand_chains:
@@ -771,12 +828,106 @@ class AffinityRescorer:
             ],
         }
 
+    def _generate_msa(
+        self,
+        protein_seq: str,
+        protein_chain_id: str,
+    ) -> Optional[Path]:
+        """
+        Generate MSA once for the protein sequence and return the cached path.
+
+        Calls boltz predict with --use_msa_server on a dummy ligand,
+        then extracts the generated MSA .csv file for reuse.
+        """
+        msa_dir = Path(tempfile.mkdtemp(prefix="boltz_msa_cache_"))
+        logger.info("Pre-generating MSA for receptor protein (one-time)...")
+
+        try:
+            # Create a dummy YAML with a trivial ligand
+            yaml_data = {
+                "version": 1,
+                "sequences": [
+                    {"protein": {"id": protein_chain_id, "sequence": protein_seq}},
+                    {"ligand": {"id": "L", "smiles": "C"}},  # methane placeholder
+                ],
+            }
+
+            import yaml
+            yaml_path = msa_dir / "msa_gen.yaml"
+            with open(yaml_path, "w") as f:
+                yaml.dump(yaml_data, f, default_flow_style=False)
+
+            cmd = [
+                sys.executable, "-m", "boltz.main", "predict",
+                str(yaml_path),
+                "--out_dir", str(msa_dir / "output"),
+                "--cache", str(self._cache_dir),
+                "--recycling_steps", "1",
+                "--diffusion_samples_affinity", "1",
+                "--sampling_steps", "1",
+                "--num_workers", "0",
+                "--use_msa_server",
+            ]
+
+            if self.config.device != DeviceOption.AUTO:
+                cmd.extend(["--accelerator", self.config.device.value])
+
+            logger.debug(f"MSA generation cmd: {' '.join(cmd)}")
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=3600,
+                cwd=str(msa_dir),
+            )
+
+            # Note: prediction may fail (e.g. SVD error on dummy ligand) but
+            # that's OK — we only need the MSA file which is generated before
+            # the prediction step. So we search for it regardless of returncode.
+            if result.returncode != 0:
+                logger.debug(
+                    f"MSA generation predict returned rc={result.returncode} "
+                    f"(expected — dummy ligand prediction may crash). "
+                    f"Checking for MSA file anyway..."
+                )
+
+            # Find the generated MSA .csv file in the msa/ subdirectory
+            msa_content_files = list(msa_dir.rglob("msa/*.csv"))
+
+            if not msa_content_files:
+                # Broader search: any .csv starting with "key,sequence" header
+                all_csv = list(msa_dir.rglob("*.csv"))
+                msa_content_files = [
+                    f for f in all_csv
+                    if f.read_text(errors='ignore').startswith("key,sequence")
+                ]
+
+            if msa_content_files:
+                # Copy to a stable location outside temp dirs
+                stable_msa_dir = Path(tempfile.mkdtemp(prefix="boltz_msa_cached_"))
+                cached_path = stable_msa_dir / "receptor_msa.csv"
+                shutil.copy2(msa_content_files[0], cached_path)
+                logger.info(f"MSA cached at: {cached_path}")
+                return cached_path
+            else:
+                logger.warning("MSA generation succeeded but no MSA .csv file found")
+                all_files = list((msa_dir / "output").rglob("*"))
+                logger.debug(f"Files in MSA output: {[str(f) for f in all_files[:30]]}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Failed to pre-generate MSA: {e}")
+            return None
+
     def _score_single_ligand(
         self,
         ligand: "LigandStructure",
         protein_atoms: List["AtomInfo"],
         protein_seq: str,
         protein_chain_id: str,
+        use_msa_server: bool = False,
+        msa_path: Optional[Path] = None,
     ) -> LigandScore:
         """
         Score a single ligand against a receptor.
@@ -836,6 +987,8 @@ class AffinityRescorer:
                     protein_chains=[protein_chain_id],
                     ligand_chains=[ligand_chain_id],
                     ligand_smiles={ligand_chain_id: smiles},
+                    use_msa_server=use_msa_server,
+                    msa_path=msa_path,
                 )
 
                 if affinity_output is not None:

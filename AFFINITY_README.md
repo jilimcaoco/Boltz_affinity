@@ -58,7 +58,7 @@ Boltz-2 is a **sequence-based structure predictor** — it takes an amino acid s
 
 ```bash
 # From PyPI (recommended)
-
+pip install -e .[cuda]
 
 # Or from source
 git clone https://github.com/jwohlwend/boltz.git
