@@ -182,9 +182,44 @@ class AffinityModelManager:
             "write_full_pde": False,
         }
 
+        # ── Patch checkpoint to strip unknown kwargs ──────────────
+        # Newer checkpoints may store hyperparameters (e.g.
+        # mse_rotational_alignment) that the current source code's
+        # AtomDiffusion.__init__() does not accept.  Rather than
+        # modifying Boltz source, we strip them from the checkpoint
+        # in memory before loading.
+        _STRIP_DIFFUSION_KEYS = {"mse_rotational_alignment"}
+
+        ckpt_data = torch.load(str(ckpt_path), map_location="cpu")
+        patched = False
+        if "hyper_parameters" in ckpt_data:
+            hp = ckpt_data["hyper_parameters"]
+            if "diffusion_process_args" in hp:
+                for key in _STRIP_DIFFUSION_KEYS:
+                    if key in hp["diffusion_process_args"]:
+                        del hp["diffusion_process_args"][key]
+                        patched = True
+                        logger.info(
+                            f"Stripped unsupported checkpoint hparam: "
+                            f"diffusion_process_args.{key}"
+                        )
+
+        if patched:
+            # Save patched checkpoint to a temp file for loading
+            import tempfile as _tmpmod
+            _tmp_fd, _tmp_ckpt = _tmpmod.mkstemp(suffix=".ckpt")
+            os.close(_tmp_fd)
+            torch.save(ckpt_data, _tmp_ckpt)
+            _load_path = _tmp_ckpt
+        else:
+            _load_path = str(ckpt_path)
+            _tmp_ckpt = None
+
+        del ckpt_data  # free memory
+
         try:
             model = Boltz2.load_from_checkpoint(
-                str(ckpt_path),
+                _load_path,
                 strict=True,
                 map_location="cpu",  # Load to CPU first, then move
                 predict_args=predict_args,
@@ -201,7 +236,7 @@ class AffinityModelManager:
                 logger.warning(f"GPU loading failed: {e}. Falling back to CPU.")
                 self.device = "cpu"
                 model = Boltz2.load_from_checkpoint(
-                    str(ckpt_path),
+                    _load_path,
                     strict=True,
                     map_location="cpu",
                     predict_args=predict_args,
@@ -214,6 +249,14 @@ class AffinityModelManager:
                 f"Model loading failed: {e}. "
                 f"Verify CUDA/torch installation: pip install torch --force-reinstall"
             ) from e
+
+        finally:
+            # Clean up temp patched checkpoint
+            if _tmp_ckpt is not None:
+                try:
+                    os.remove(_tmp_ckpt)
+                except OSError:
+                    pass
 
     @property
     def model(self):
