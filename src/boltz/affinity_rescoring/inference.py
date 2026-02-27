@@ -1,6 +1,11 @@
 """
 Inference engine for affinity rescoring.
 
+*** AFFINITY-ONLY MODE ***
+This module runs ONLY the trunk + affinity head of Boltz-2.
+Diffusion and confidence modules are intentionally bypassed.
+All coordinates come from pre-existing PDB/CIF structures.
+
 Manages model loading, device detection, checkpoint management,
 and direct affinity inference (trunk + affinity head) for the
 Boltz-2 affinity module.
@@ -163,11 +168,15 @@ class AffinityModelManager:
 
         logger.info(f"Loading model from {ckpt_path} on {self.device}")
 
-        # Default predict args for affinity (mirroring main.py)
+        # Affinity-only predict args.
+        # NOTE: diffusion / confidence parameters are intentionally omitted.
+        # This module runs trunk + affinity head ONLY — no diffusion, no
+        # confidence module.  Setting diffusion/sampling values here would
+        # have no effect since affinity_forward() bypasses those stages.
         predict_args = {
             "recycling_steps": 5,
-            "sampling_steps": 200,
-            "diffusion_samples": 5,
+            "sampling_steps": 0,      # unused — affinity-only mode
+            "diffusion_samples": 0,   # unused — affinity-only mode
             "write_confidence_summary": False,
             "write_full_pae": False,
             "write_full_pde": False,
@@ -293,6 +302,10 @@ def affinity_forward(
     must already contain ``coords`` (from PDB coordinate injection)
     which will be used directly as ``x_pred`` for the affinity head.
 
+    *** SAFETY: This function NEVER calls diffusion or confidence. ***
+    If you see results from this function, they came from affinity-only
+    inference (trunk + affinity head with injected PDB coordinates).
+
     Parameters
     ----------
     model : Boltz2
@@ -308,7 +321,20 @@ def affinity_forward(
     dict
         Affinity predictions including ``affinity_pred_value``,
         ``affinity_probability_binary``, and ensemble values if applicable.
+
+    Raises
+    ------
+    RuntimeError
+        If ``feats`` does not contain ``coords`` (PDB coordinates must
+        be injected before calling this function).
     """
+    # ── Safety check: PDB coordinates must be present ─────────────
+    if "coords" not in feats:
+        raise RuntimeError(
+            "AFFINITY-ONLY MODE: 'coords' not found in features. "
+            "PDB coordinates must be injected before calling "
+            "affinity_forward(). This function does NOT run diffusion."
+        )
     model.eval()
 
     # ── Trunk ─────────────────────────────────────────────────────────
@@ -513,6 +539,7 @@ def run_direct_affinity_inference(
     """
     from boltz.affinity_rescoring.coord_injection import (
         build_chain_id_map,
+        check_unresolved_near_pocket,
         inject_pdb_coords_into_structure,
         save_pre_affinity_structure,
     )
@@ -596,9 +623,20 @@ def run_direct_affinity_inference(
             if yaml_cid in asym_map:
                 full_map[pdb_cid] = asym_map[yaml_cid]
 
-        injected = inject_pdb_coords_into_structure(
+        injected, unmatched_indices = inject_pdb_coords_into_structure(
             processed_struct, pdb_atoms, full_map
         )
+
+        # ── Step 2b: Check if unresolved residues are near pocket ────
+        pocket_report = check_unresolved_near_pocket(
+            injected, unmatched_indices, threshold=10.0
+        )
+        if unmatched_indices:
+            logger.warning(
+                f"{len(unmatched_indices)} atoms had no PDB match and were "
+                f"zeroed out. Atom indices: {unmatched_indices[:20]}"
+                + ("..." if len(unmatched_indices) > 20 else "")
+            )
 
         # ── Step 3: Save pre_affinity structure ──────────────────────
         save_pre_affinity_structure(injected, predictions_dir, record.id)
@@ -661,10 +699,32 @@ def run_direct_affinity_inference(
                 batch[k] = v.unsqueeze(0).to(device)  # add batch dim
             elif isinstance(v, np.ndarray):
                 batch[k] = torch.from_numpy(v).unsqueeze(0).to(device)
+            elif k == "affinity_mw":
+                # Must be a list so feats["affinity_mw"][0] works
+                # (matches collate() in inferencev2.py which keeps it as list)
+                batch[k] = [v]
             else:
                 batch[k] = v
 
         results = affinity_forward(model, batch, recycling_steps=recycling_steps)
+
+        # Attach pocket proximity report for benchmarking
+        results["pocket_proximity_report"] = {
+            "n_unresolved_residues": pocket_report.n_unresolved_residues,
+            "n_near_pocket": pocket_report.n_near_pocket,
+            "threshold_angstrom": pocket_report.threshold_angstrom,
+            "near_pocket_residues": [
+                {
+                    "chain": r.chain_name,
+                    "residue_index": r.residue_index,
+                    "unresolved_atoms": r.n_unresolved_atoms,
+                    "total_atoms": r.n_total_atoms,
+                    "min_dist_to_ligand": r.min_distance_to_ligand,
+                    "nearest_ligand_chain": r.nearest_ligand_chain,
+                }
+                for r in pocket_report.near_pocket_residues
+            ],
+        }
 
         logger.info(
             f"Direct affinity inference complete: "

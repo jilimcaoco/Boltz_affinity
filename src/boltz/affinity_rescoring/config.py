@@ -32,9 +32,9 @@ DEFAULT_CONFIG = {
     },
     "inference": {
         "recycling_steps": 5,
-        "diffusion_samples": 5,
-        "sampling_steps": 200,
         "affinity_mw_correction": True,
+        # NOTE: diffusion_samples and sampling_steps intentionally removed.
+        # This module is affinity-only — no diffusion pipeline.
     },
     "validation": {
         "level": "moderate",
@@ -105,8 +105,6 @@ def load_config(config_path: Optional[str | Path] = None) -> RescoreConfig:
         checkpoint=config_data.get("model", {}).get("checkpoint", "auto"),
         device=DeviceOption(config_data.get("model", {}).get("device", "auto")),
         recycling_steps=config_data.get("inference", {}).get("recycling_steps", 5),
-        diffusion_samples=config_data.get("inference", {}).get("diffusion_samples", 5),
-        sampling_steps=config_data.get("inference", {}).get("sampling_steps", 200),
         affinity_mw_correction=config_data.get("inference", {}).get("affinity_mw_correction", True),
         validation_level=ValidationLevel(
             config_data.get("validation", {}).get("level", "moderate")
@@ -133,8 +131,6 @@ def save_config(config: RescoreConfig, output_path: str | Path) -> None:
         },
         "inference": {
             "recycling_steps": config.recycling_steps,
-            "diffusion_samples": config.diffusion_samples,
-            "sampling_steps": config.sampling_steps,
             "affinity_mw_correction": config.affinity_mw_correction,
         },
         "validation": {
@@ -191,7 +187,6 @@ def _apply_env_overrides(config: Dict) -> None:
         "BOLTZ_RESCORE_CHECKPOINT": ("model", "checkpoint"),
         "BOLTZ_RESCORE_DEVICE": ("model", "device"),
         "BOLTZ_RESCORE_RECYCLING_STEPS": ("inference", "recycling_steps"),
-        "BOLTZ_RESCORE_DIFFUSION_SAMPLES": ("inference", "diffusion_samples"),
         "BOLTZ_RESCORE_VALIDATION": ("validation", "level"),
         "BOLTZ_RESCORE_OUTPUT_FORMAT": ("output", "format"),
         "BOLTZ_RESCORE_LOG_LEVEL": ("logging", "level"),
@@ -203,7 +198,7 @@ def _apply_env_overrides(config: Dict) -> None:
             if section not in config:
                 config[section] = {}
             # Try to convert to appropriate type
-            if key in ("recycling_steps", "diffusion_samples", "sampling_steps",
+            if key in ("recycling_steps",
                        "max_tokens", "max_atoms", "max_tokens_protein"):
                 try:
                     value = int(value)

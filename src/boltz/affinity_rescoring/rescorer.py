@@ -1,6 +1,12 @@
 """
 Main AffinityRescorer class.
 
+*** AFFINITY-ONLY MODE ***
+This module intentionally does NOT run the full Boltz pipeline.
+Diffusion and confidence modules are disabled. All inference goes
+through trunk + affinity head with pre-existing PDB coordinates.
+The subprocess fallback (`boltz predict`) has been removed.
+
 Orchestrates the complete affinity rescoring pipeline:
 input validation → parsing → featurization → inference → export.
 """
@@ -12,7 +18,6 @@ import logging
 import math
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -671,11 +676,10 @@ class AffinityRescorer:
         pdb_atoms: Optional[list] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Run Boltz affinity prediction.
+        Run Boltz affinity prediction (affinity-only, no diffusion).
 
-        If ``pdb_atoms`` are provided, uses the direct in-process pipeline
-        (trunk + affinity head with PDB coordinates, skipping diffusion).
-        Otherwise, falls back to the subprocess-based full prediction.
+        Requires ``pdb_atoms`` — feeds PDB coordinates directly through
+        trunk + affinity head, skipping diffusion and confidence.
 
         Parameters
         ----------
@@ -689,32 +693,36 @@ class AffinityRescorer:
             chain_id → SMILES for ligands.
         use_msa_server : bool
             Whether to use the MSA server.
-        pdb_atoms : list, optional
+        pdb_atoms : list
             Parsed PDB atoms for direct coordinate injection.
-            If provided, uses the fast direct pipeline.
+            **Required** — will raise RuntimeError if None.
 
         Returns
         -------
         dict or None
             Parsed affinity output, or None on failure.
+
+        Raises
+        ------
+        RuntimeError
+            If ``pdb_atoms`` is None (full pipeline is disabled).
         """
-        if pdb_atoms is not None:
-            return self._run_direct_prediction(
-                sequences=sequences,
-                protein_chains=protein_chains,
-                ligand_chains=ligand_chains,
-                ligand_smiles=ligand_smiles,
-                pdb_atoms=pdb_atoms,
-                use_msa_server=use_msa_server,
+        if pdb_atoms is None:
+            raise RuntimeError(
+                "AFFINITY-ONLY MODE: pdb_atoms are required for direct "
+                "affinity inference.  The full Boltz pipeline (diffusion + "
+                "confidence) has been intentionally disabled in this module. "
+                "Ensure you are passing a PDB/CIF file with 3D coordinates."
             )
-        else:
-            return self._run_subprocess_prediction(
-                sequences=sequences,
-                protein_chains=protein_chains,
-                ligand_chains=ligand_chains,
-                ligand_smiles=ligand_smiles,
-                use_msa_server=use_msa_server,
-            )
+
+        return self._run_direct_prediction(
+            sequences=sequences,
+            protein_chains=protein_chains,
+            ligand_chains=ligand_chains,
+            ligand_smiles=ligand_smiles,
+            pdb_atoms=pdb_atoms,
+            use_msa_server=use_msa_server,
+        )
 
     def _run_direct_prediction(
         self,
@@ -777,93 +785,11 @@ class AffinityRescorer:
             except Exception:
                 pass
 
-    def _run_subprocess_prediction(
-        self,
-        sequences: Dict[str, str],
-        protein_chains: List[str],
-        ligand_chains: List[str],
-        ligand_smiles: Dict[str, str],
-        use_msa_server: bool = False,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Fallback: run Boltz prediction via subprocess (original approach).
-
-        Used when PDB atoms are not available (e.g., SMILES-only ligand
-        with no 3D coordinates).
-        """
-        # Create temp directory
-        work_dir = Path(tempfile.mkdtemp(prefix="boltz_rescore_"))
-
-        try:
-            # Create YAML
-            yaml_path = work_dir / "input.yaml"
-            yaml_data = self._build_yaml_data(
-                sequences, protein_chains, ligand_chains, ligand_smiles
-            )
-
-            import yaml
-            with open(yaml_path, "w") as f:
-                yaml.dump(yaml_data, f, default_flow_style=False)
-
-            # Run Boltz predict
-            cmd = [
-                sys.executable, "-m", "boltz", "predict",
-                str(yaml_path),
-                "--out_dir", str(work_dir / "output"),
-                "--recycling_steps", str(self.config.recycling_steps),
-                "--diffusion_samples_affinity", str(self.config.diffusion_samples),
-                "--sampling_steps", str(self.config.sampling_steps),
-            ]
-
-            if self._checkpoint != "auto":
-                cmd.extend(["--affinity_checkpoint", self._checkpoint])
-
-            if not self.config.affinity_mw_correction:
-                # The CLI flag is --affinity_mw_correction (toggle)
-                pass  # Default is True
-
-            if self.config.device != DeviceOption.AUTO:
-                cmd.extend(["--accelerator", self.config.device.value])
-
-            if use_msa_server:
-                cmd.append("--use_msa_server")
-
-            logger.debug(f"Running: {' '.join(cmd)}")
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=7200,  # 2 hour timeout
-                cwd=str(work_dir),
-            )
-
-            if result.returncode != 0:
-                logger.error(f"Boltz predict failed (rc={result.returncode}):")
-                logger.error(result.stderr[-2000:] if result.stderr else "No stderr")
-                return None
-
-            # Find affinity output
-            output_base = work_dir / "output"
-            for json_file in output_base.rglob("affinity_*.json"):
-                with open(json_file) as f:
-                    return json.load(f)
-
-            logger.warning("No affinity JSON found in output")
-            return None
-
-        except subprocess.TimeoutExpired:
-            logger.error("Boltz predict timed out (>2h)")
-            return None
-        except Exception as e:
-            logger.error(f"Error running Boltz predict: {e}")
-            return None
-        finally:
-            # Clean up temp directory
-            try:
-                shutil.rmtree(work_dir, ignore_errors=True)
-            except Exception:
-                pass
+    # NOTE: _run_subprocess_prediction has been intentionally removed.
+    # The full Boltz pipeline (diffusion + confidence) is disabled in this
+    # affinity-only rescoring module.  All inference goes through
+    # _run_direct_prediction → affinity_forward (trunk + affinity head).
+    # If you need the full pipeline, use `boltz predict` directly.
 
     def _build_yaml_data(
         self,
@@ -920,9 +846,10 @@ class AffinityRescorer:
         """
         Score a single ligand against a receptor.
 
-        Note: This currently creates a placeholder score since
-        direct MOL2→Boltz integration requires SMILES conversion.
-        For full functionality, ligands should provide SMILES strings.
+        Converts MOL2 ligand to SMILES, combines receptor + ligand
+        atoms into a single atom list with consistent chain IDs, then
+        runs the affinity-only pipeline (trunk + affinity head) with
+        PDB/MOL2 coordinate injection.
         """
         score = LigandScore(
             ligand_name=ligand.name,
@@ -968,13 +895,39 @@ class AffinityRescorer:
                     )
                     return score
 
-                # Run Boltz prediction
+                # ── Build combined pdb_atoms ──────────────────────────
+                # The coordinate injection needs ALL atoms (receptor +
+                # ligand) with chain IDs matching the YAML.  Receptor
+                # atoms keep their original chain ID; ligand atoms are
+                # reassigned to the YAML ligand chain ID ("L").
                 ligand_chain_id = "L"
+
+                from boltz.affinity_rescoring.models import AtomInfo as _AI
+                ligand_atoms_remapped = [
+                    _AI(
+                        index=a.index,
+                        name=a.name,
+                        element=a.element,
+                        x=a.x, y=a.y, z=a.z,
+                        chain_id=ligand_chain_id,
+                        residue_name=a.residue_name,
+                        residue_number=a.residue_number,
+                        occupancy=a.occupancy,
+                        b_factor=a.b_factor,
+                        is_hetatm=True,
+                    )
+                    for a in ligand.atoms
+                ]
+
+                combined_atoms = list(protein_atoms) + ligand_atoms_remapped
+
+                # Run Boltz prediction with coordinate injection
                 affinity_output = self._run_boltz_prediction(
                     sequences={protein_chain_id: protein_seq},
                     protein_chains=[protein_chain_id],
                     ligand_chains=[ligand_chain_id],
                     ligand_smiles={ligand_chain_id: smiles},
+                    pdb_atoms=combined_atoms,
                 )
 
                 if affinity_output is not None:
@@ -989,6 +942,16 @@ class AffinityRescorer:
                         v1 = affinity_output["affinity_pred_value1"]
                         v2 = affinity_output.get("affinity_pred_value2", v1)
                         score.affinity_uncertainty = abs(v1 - v2) / 2.0
+
+                    # Attach pocket proximity report for benchmarking
+                    report = affinity_output.get("pocket_proximity_report")
+                    if report:
+                        score.n_unresolved_near_pocket = report.get(
+                            "n_near_pocket", 0
+                        )
+                        score.pocket_proximity_details = report.get(
+                            "near_pocket_residues"
+                        )
 
                     if score.validation_status != ValidationStatus.WARNING:
                         score.validation_status = ValidationStatus.SUCCESS

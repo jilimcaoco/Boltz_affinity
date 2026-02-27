@@ -1,6 +1,10 @@
 """
 Core data models for the affinity rescoring system.
 
+*** AFFINITY-ONLY MODE ***
+No diffusion_samples or sampling_steps parameters exist in this module.
+If you need those, use the main Boltz pipeline (`boltz predict`) instead.
+
 Defines Pydantic models for validation, dataclasses for results,
 and typed structures used across all layers.
 """
@@ -245,6 +249,10 @@ class LigandScore:
     # Timing
     processing_ms: float = 0.0
 
+    # Pocket proximity check (for benchmarking unresolved loop effects)
+    n_unresolved_near_pocket: int = 0
+    pocket_proximity_details: Optional[List[Dict[str, Any]]] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "ligand_name": self.ligand_name,
@@ -258,6 +266,7 @@ class LigandScore:
             "rotatable_bonds": self.rotatable_bonds,
             "processing_ms": round(self.processing_ms, 2),
             "error_message": self.error_message,
+            "n_unresolved_near_pocket": self.n_unresolved_near_pocket,
         }
 
 
@@ -289,10 +298,8 @@ class RescoreConfig(BaseModel):
     checkpoint: str = "auto"
     device: DeviceOption = DeviceOption.AUTO
 
-    # Inference
+    # Inference (affinity-only — no diffusion / confidence)
     recycling_steps: int = 5
-    diffusion_samples: int = 5
-    sampling_steps: int = 200
     affinity_mw_correction: bool = True
 
     # Validation
@@ -318,12 +325,8 @@ class RescoreConfig(BaseModel):
             raise ValueError(f"recycling_steps must be 1-20, got {v}")
         return v
 
-    @field_validator("diffusion_samples")
-    @classmethod
-    def validate_diffusion_samples(cls, v: int) -> int:
-        if v < 1 or v > 100:
-            raise ValueError(f"diffusion_samples must be 1-100, got {v}")
-        return v
+    # diffusion_samples and sampling_steps validators removed:
+    # those fields no longer exist — this module is affinity-only.
 
 
 # ─── Utility Functions ───────────────────────────────────────────────────────

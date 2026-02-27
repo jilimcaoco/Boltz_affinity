@@ -1,10 +1,10 @@
 # Boltz Affinity Rescoring
 
-A production-ready module for rescoring protein-ligand complexes using the Boltz-2 affinity prediction model.
+Affinity-only rescoring for protein-ligand complexes using the Boltz-2 affinity module. **Diffusion and confidence modules are intentionally disabled** — all predictions use pre-existing 3D coordinates fed directly through the trunk + affinity head.
 
 ## Overview
 
-The affinity rescoring system integrates with the existing Boltz-2 pipeline to predict binding affinities (pKd) for protein-ligand complexes. It supports three primary workflows:
+Three workflows:
 
 - **Single Complex**: Score one protein-ligand complex from a PDB/CIF file
 - **Batch Processing**: Score all complexes in a directory  
@@ -12,59 +12,123 @@ The affinity rescoring system integrates with the existing Boltz-2 pipeline to p
 
 ## Installation
 
-The module is included in the Boltz package. Additional dependencies:
-
 ```bash
-pip install -r requirements_affinity.txt
-```
+# Install the full package (editable)
+pip install -e .
 
-Or install via the main package:
-
-```bash
+# Or with affinity extras
 pip install -e ".[affinity]"
 ```
 
-## Quick Start
+The first run will auto-download the `boltz2_aff.ckpt` checkpoint (~1.5 GB) to `~/.boltz/`.
 
-### CLI Usage
+## Quick Start — CLI
 
 ```bash
-# Single complex
-boltz rescore pdb --input complex.pdb --output results.json
+# ─── Single complex ────────────────────────────────────────────
+# Score a protein-ligand PDB. Auto-detects protein/ligand chains.
+boltz rescore pdb --input complex.pdb
 
-# Batch mode
-boltz rescore batch --input structures/ --output batch_results.csv
+# Specify chains explicitly + JSON output
+boltz rescore pdb --input complex.pdb \
+  --protein-chain A --ligand-chains B \
+  --output result.json --output-format json
 
-# Virtual screening
-boltz rescore receptor --receptor receptor.pdb --ligands ligands.mol2 --output scores.csv
+# Provide ligand SMILES manually (if auto-inference fails)
+boltz rescore pdb --input complex.pdb \
+  --ligand-smiles '{"B": "CCO"}' \
+  --output result.json
 
-# Dry run (validate only, no inference)
+# Provide the full biological sequence (for structures with
+# missing loops / incomplete SEQRES records)
+boltz rescore pdb --input complex.pdb \
+  --reference-sequence '{"A": "MKTLLILTLVVA...FULL_SEQ_HERE"}'
+
+# Dry run — validate inputs without loading the model
 boltz rescore pdb --input complex.pdb --dry-run
+
+# ─── Batch mode ────────────────────────────────────────────────
+# Score every PDB/CIF in a directory
+boltz rescore batch --input-dir ./structures/ --output batch_results.csv
+
+# Recursive scan + Excel output
+boltz rescore batch --input-dir ./structures/ \
+  --recursive --output results.xlsx --output-format excel
+
+# ─── Virtual screening (receptor + multi-ligand MOL2) ─────────
+# Single receptor PDB scored against all ligands in a MOL2 file
+boltz rescore receptor \
+  --receptor receptor.pdb \
+  --ligands docked_poses.mol2 \
+  --output scores.csv
+
+# Sort by score, Excel output, strict validation
+boltz rescore receptor \
+  --receptor receptor.pdb \
+  --ligands library.mol2 \
+  --output screening_results.xlsx \
+  --output-format excel \
+  --sort-by affinity_score \
+  --validation strict
+
+# With explicit protein chain
+boltz rescore receptor \
+  --receptor complex.pdb \
+  --protein-chain A \
+  --ligands compounds.mol2 \
+  --output scores.csv
+
+# ─── Manifest mode ─────────────────────────────────────────────
+# Score complexes listed in a YAML manifest
+boltz rescore manifest --manifest complexes.yaml --output-dir ./scores/
+
+# ─── Common options (apply to all commands) ────────────────────
+#   --device cpu|cuda|mps|auto      Device (default: auto)
+#   --validation strict|moderate|lenient  (default: moderate)
+#   --checkpoint /path/to/ckpt      Custom checkpoint (default: auto-download)
+#   --log-level DEBUG|INFO|WARNING|ERROR
 ```
 
-### Python API
+## Quick Start — Python API
 
 ```python
 from boltz.affinity_rescoring import AffinityRescorer
-from boltz.affinity_rescoring.models import RescoreConfig, DeviceOption
 
-# Configure
-config = RescoreConfig(device=DeviceOption.AUTO)
-rescorer = AffinityRescorer(config=config)
+# Initialize (auto-downloads checkpoint on first use)
+rescorer = AffinityRescorer(device="auto")
 
-# Score a single complex
+# ─── Single complex ───────────────────────────────────────────
 result = rescorer.rescore_pdb("complex.pdb")
 print(f"Predicted pKd: {result.affinity_pred:.2f}")
+print(f"Binding probability: {result.affinity_probability_binary:.2f}")
 
-# Batch processing
-results = rescorer.rescore_directory("structures/")
-rescorer.export_results(results, "output.csv")
+# With explicit chains and SMILES
+result = rescorer.rescore_pdb(
+    "complex.pdb",
+    protein_chain="A",
+    ligand_chains=["B"],
+    ligand_smiles={"B": "CCO"},
+)
 
-# Virtual screening
+# ─── Batch ────────────────────────────────────────────────────
+results = rescorer.rescore_directory("structures/", recursive=True)
+rescorer.export_results(results, "output.csv", format="csv")
+
+# ─── Virtual screening ───────────────────────────────────────
 scores = rescorer.rescore_receptor(
     receptor_path="receptor.pdb",
     ligands_path="ligands.mol2",
+    output_path="scores.csv",
+    sort_by="affinity_score",
 )
+
+# Access individual scores
+for s in scores:
+    print(f"{s.ligand_name}: {s.affinity_score:.3f} (conf={s.confidence:.3f})")
+
+# ─── Dry run (validate only) ─────────────────────────────────
+report = rescorer.dry_run("complex.pdb")
+print(report)  # chains, atom counts, validation issues
 ```
 
 ## Architecture
@@ -105,10 +169,8 @@ model:
   checkpoint: auto      # auto-downloads or path to .ckpt
 
 inference:
-  recycling_steps: 5
-  diffusion_samples: 5
-  sampling_steps: 200
-  affinity_mw_correction: true
+  recycling_steps: 5              # trunk recycling iterations
+  affinity_mw_correction: true    # molecular weight correction
 
 validation:
   level: moderate       # strict | moderate | lenient
@@ -119,6 +181,8 @@ output:
 ```
 
 Save to `~/.boltz/rescore_config.yaml` or pass via `--config`.
+
+> **Note:** `diffusion_samples` and `sampling_steps` are not available. This module is affinity-only — no diffusion pipeline is executed.
 
 ### Environment Variables
 
