@@ -197,7 +197,9 @@ class AtomDiffusion(Module):
         compile_score: bool = False,
         alignment_reverse_diff: bool = False,
         synchronize_sigmas: bool = False,
+        mse_rotational_alignment: bool = False,  # ADDED for checkpoint compatibility
     ):
+        # Accept mse_rotational_alignment for checkpoint compatibility, but do not use it
         super().__init__()
         self.score_model = DiffusionModule(
             **score_model_args,
