@@ -352,6 +352,19 @@ def rescore_batch(
          'Overrides SEQRES and ATOM-derived sequences.',
 )
 @click.option(
+    "--use-msa-server", is_flag=True, default=False,
+    help="Use MSA server for sequence search. Only needed when "
+         "--msa-directory is not provided.",
+)
+@click.option(
+    "--msa-directory", default=None,
+    type=click.Path(exists=False),
+    help="Directory with pre-computed MSA files (.a3m or .csv), or "
+         "a directory in which to cache server-generated MSAs. "
+         "Ideal for HPC nodes without internet access. "
+         "Pre-compute on a login node, then pass the directory here.",
+)
+@click.option(
     "--log-level", default="INFO",
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
 )
@@ -366,6 +379,8 @@ def rescore_receptor(
     checkpoint: str,
     sort_by: str,
     reference_sequence: Optional[str],
+    use_msa_server: bool,
+    msa_directory: Optional[str],
     log_level: str,
 ):
     """Score a receptor against multiple ligands from MOL2 file."""
@@ -400,6 +415,8 @@ def rescore_receptor(
         output_format=output_format,
         sort_by=sort_by,
         reference_sequences=ref_seqs,
+        use_msa_server=use_msa_server,
+        msa_directory=msa_directory,
     )
 
     # Print summary

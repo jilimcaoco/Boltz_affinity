@@ -519,6 +519,8 @@ class AffinityRescorer:
         validation_level: str = "moderate",
         sort_by: str = "affinity_score",
         reference_sequences: Optional[Dict[str, str]] = None,
+        use_msa_server: bool = False,
+        msa_directory: Optional[str | Path] = None,
     ) -> List[LigandScore]:
         """
         Score a fixed receptor against multiple ligands from MOL2 file.
@@ -545,6 +547,15 @@ class AffinityRescorer:
         reference_sequences : dict, optional
             Map of chain_id → full amino acid sequence.
             Overrides ATOM-derived and SEQRES-derived sequences.
+        use_msa_server : bool
+            Whether to use the MSA server for sequence search.
+            Only needed if msa_directory is not provided.
+        msa_directory : str or Path, optional
+            Path to directory containing pre-computed MSA files
+            (.a3m or .csv).  When provided, the MSA server is
+            never contacted — ideal for HPC compute nodes without
+            internet.  The directory is also used to cache the MSA
+            when use_msa_server=True so it is only computed once.
 
         Returns
         -------
@@ -589,6 +600,19 @@ class AffinityRescorer:
             f"{len(protein_atoms)} atoms, {len(protein_seq)} residues"
         )
 
+        # ── Pre-compute / locate MSA (once for the whole batch) ───────
+        msa_paths = self._resolve_msa_paths(
+            sequences={protein_chain_id: protein_seq},
+            protein_chains=[protein_chain_id],
+            use_msa_server=use_msa_server,
+            msa_directory=msa_directory,
+        )
+        if msa_paths:
+            logger.info(
+                f"MSA resolved for {len(msa_paths)} chain(s) — "
+                f"will reuse for all ligands"
+            )
+
         # Parse ligands
         logger.info(f"Parsing ligands from: {ligands}")
         ligand_structures = self._mol2_parser.extract_ligands_with_names(ligands)
@@ -598,7 +622,7 @@ class AffinityRescorer:
             logger.warning("No ligands found in MOL2 file")
             return []
 
-        # Score each ligand
+        # Score each ligand (MSA is reused, never recomputed)
         scores: List[LigandScore] = []
 
         try:
@@ -613,6 +637,8 @@ class AffinityRescorer:
                 protein_atoms,
                 protein_seq,
                 protein_chain_id,
+                msa_paths=msa_paths,
+                use_msa_server=use_msa_server,
             )
             scores.append(score)
 
@@ -649,6 +675,131 @@ class AffinityRescorer:
 
     # ─── Internal Methods ─────────────────────────────────────────────────
 
+    def _resolve_msa_paths(
+        self,
+        sequences: Dict[str, str],
+        protein_chains: List[str],
+        use_msa_server: bool = False,
+        msa_directory: Optional[str | Path] = None,
+    ) -> Optional[Dict[str, str]]:
+        """Pre-compute or locate MSA files for the given protein chains.
+
+        This is called **once** before the per-ligand scoring loop so that
+        the same MSA is reused for every ligand, avoiding redundant MSA
+        server calls.
+
+        Resolution order for each protein chain:
+        1. If ``msa_directory`` is given and contains a matching file
+           (``<chain_id>.a3m``, ``<chain_id>.csv``, or a single .a3m/.csv
+           when only one protein chain exists), use it directly.
+        2. If ``use_msa_server`` is True and no pre-computed file was
+           found, generate the MSA via the server, write it to
+           ``msa_directory`` (or a temp cache), and return its path.
+        3. If neither is available, return ``None`` — ``process_input``
+           will see ``msa: 0`` and decide what to do.
+
+        Parameters
+        ----------
+        sequences : dict
+            chain_id → amino acid sequence (protein chains only).
+        protein_chains : list
+            Protein chain IDs to resolve.
+        use_msa_server : bool
+            Whether to use the ColabFold MSA server.
+        msa_directory : str or Path, optional
+            Directory with pre-computed MSA files, or a directory in
+            which to cache the server-generated MSA.
+
+        Returns
+        -------
+        dict or None
+            chain_id → absolute path to MSA file, or None if no MSA
+            could be resolved for any chain.
+        """
+        msa_paths: Dict[str, str] = {}
+        msa_dir = Path(msa_directory) if msa_directory else None
+
+        for chain_id in protein_chains:
+            if chain_id not in sequences:
+                continue
+
+            # ── 1. Check for existing file in msa_directory ───────────
+            if msa_dir is not None:
+                candidates = [
+                    msa_dir / f"{chain_id}.a3m",
+                    msa_dir / f"{chain_id}.csv",
+                ]
+                # If there's only one protein chain and one MSA file,
+                # allow any .a3m or .csv file in the directory.
+                if len(protein_chains) == 1:
+                    for ext in ("*.a3m", "*.csv"):
+                        found = list(msa_dir.glob(ext))
+                        if len(found) == 1:
+                            candidates.insert(0, found[0])
+
+                for cand in candidates:
+                    if cand.exists():
+                        msa_paths[chain_id] = str(cand.resolve())
+                        logger.info(
+                            f"MSA for chain {chain_id}: using pre-computed "
+                            f"{cand}"
+                        )
+                        break
+
+                if chain_id in msa_paths:
+                    continue
+
+            # ── 2. Generate MSA via server ────────────────────────────
+            if use_msa_server:
+                # Create a persistent cache dir so the MSA survives
+                # across ligand iterations.
+                if msa_dir is None:
+                    msa_dir = Path(
+                        tempfile.mkdtemp(prefix="boltz_msa_cache_")
+                    )
+                    logger.info(
+                        f"No --msa-directory provided; caching MSA in "
+                        f"{msa_dir}"
+                    )
+                msa_dir.mkdir(parents=True, exist_ok=True)
+
+                logger.info(
+                    f"Generating MSA for chain {chain_id} via server "
+                    f"(this only happens once)…"
+                )
+                try:
+                    from boltz.main import compute_msa
+
+                    target_id = f"receptor_{chain_id}"
+                    data = {target_id: sequences[chain_id]}
+                    compute_msa(
+                        data=data,
+                        target_id=target_id,
+                        msa_dir=msa_dir,
+                        msa_server_url="https://api.colabfold.com",
+                        msa_pairing_strategy="paired+unpaired",
+                    )
+
+                    # compute_msa writes <name>.csv files
+                    csv_out = msa_dir / f"{target_id}.csv"
+                    if csv_out.exists():
+                        msa_paths[chain_id] = str(csv_out.resolve())
+                        logger.info(
+                            f"MSA for chain {chain_id}: generated and "
+                            f"cached at {csv_out}"
+                        )
+                    else:
+                        logger.warning(
+                            f"MSA generation for chain {chain_id} "
+                            f"completed but output file not found."
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"MSA generation failed for chain {chain_id}: {e}"
+                    )
+
+        return msa_paths if msa_paths else None
+
     def _ensure_model_loaded(self):
         """Lazily load the Boltz2 model for direct inference."""
         if self._loaded_model is not None:
@@ -674,6 +825,7 @@ class AffinityRescorer:
         ligand_smiles: Dict[str, str],
         use_msa_server: bool = False,
         pdb_atoms: Optional[list] = None,
+        msa_paths: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Run Boltz affinity prediction (affinity-only, no diffusion).
@@ -696,6 +848,10 @@ class AffinityRescorer:
         pdb_atoms : list
             Parsed PDB atoms for direct coordinate injection.
             **Required** — will raise RuntimeError if None.
+        msa_paths : dict, optional
+            chain_id → path to pre-computed MSA file (.a3m or .csv).
+            When provided, injected into the YAML so ``process_input``
+            skips MSA generation entirely.
 
         Returns
         -------
@@ -722,6 +878,7 @@ class AffinityRescorer:
             ligand_smiles=ligand_smiles,
             pdb_atoms=pdb_atoms,
             use_msa_server=use_msa_server,
+            msa_paths=msa_paths,
         )
 
     def _run_direct_prediction(
@@ -732,6 +889,7 @@ class AffinityRescorer:
         ligand_smiles: Dict[str, str],
         pdb_atoms: list,
         use_msa_server: bool = False,
+        msa_paths: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Run direct in-process affinity prediction using PDB coordinates.
@@ -742,9 +900,10 @@ class AffinityRescorer:
         work_dir = Path(tempfile.mkdtemp(prefix="boltz_direct_"))
 
         try:
-            # Build YAML
+            # Build YAML (with pre-computed MSA paths if available)
             yaml_data = self._build_yaml_data(
-                sequences, protein_chains, ligand_chains, ligand_smiles
+                sequences, protein_chains, ligand_chains, ligand_smiles,
+                msa_paths=msa_paths,
             )
             yaml_path = work_dir / "input.yaml"
 
@@ -760,6 +919,12 @@ class AffinityRescorer:
             # Load model
             model = self._ensure_model_loaded()
 
+            # Determine whether process_input needs the MSA server.
+            # If we already injected MSA paths into the YAML, the
+            # schema parser will see msa != 0 and process_input will
+            # NOT call compute_msa, so use_msa_server is irrelevant.
+            needs_msa_server = use_msa_server and not msa_paths
+
             # Run direct inference
             results = run_direct_affinity_inference(
                 model=model,
@@ -768,7 +933,7 @@ class AffinityRescorer:
                 chain_id_map=chain_id_map,
                 cache_dir=self._cache_dir,
                 work_dir=work_dir,
-                use_msa_server=use_msa_server,
+                use_msa_server=needs_msa_server,
                 recycling_steps=self.config.recycling_steps,
             )
 
@@ -797,18 +962,37 @@ class AffinityRescorer:
         protein_chains: List[str],
         ligand_chains: List[str],
         ligand_smiles: Dict[str, str],
+        msa_paths: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """Build the YAML data structure for Boltz input."""
+        """Build the YAML data structure for Boltz input.
+
+        Parameters
+        ----------
+        sequences : dict
+            chain_id → amino acid sequence.
+        protein_chains : list
+            Protein chain IDs.
+        ligand_chains : list
+            Ligand chain IDs.
+        ligand_smiles : dict
+            chain_id → SMILES.
+        msa_paths : dict, optional
+            chain_id → path to pre-computed MSA file (.a3m or .csv).
+            When provided, the ``msa`` field is set on each protein
+            entry so ``process_input`` skips MSA generation.
+        """
         yaml_sequences = []
 
         for chain_id in protein_chains:
             if chain_id in sequences:
-                yaml_sequences.append({
-                    "protein": {
-                        "id": chain_id,
-                        "sequence": sequences[chain_id],
-                    }
-                })
+                entry: Dict[str, Any] = {
+                    "id": chain_id,
+                    "sequence": sequences[chain_id],
+                }
+                # Inject pre-computed MSA path if available
+                if msa_paths and chain_id in msa_paths:
+                    entry["msa"] = str(msa_paths[chain_id])
+                yaml_sequences.append({"protein": entry})
 
         binder_chain = None
         for chain_id in ligand_chains:
@@ -842,6 +1026,8 @@ class AffinityRescorer:
         protein_atoms: List["AtomInfo"],
         protein_seq: str,
         protein_chain_id: str,
+        msa_paths: Optional[Dict[str, str]] = None,
+        use_msa_server: bool = False,
     ) -> LigandScore:
         """
         Score a single ligand against a receptor.
@@ -850,6 +1036,14 @@ class AffinityRescorer:
         atoms into a single atom list with consistent chain IDs, then
         runs the affinity-only pipeline (trunk + affinity head) with
         PDB/MOL2 coordinate injection.
+
+        Parameters
+        ----------
+        msa_paths : dict, optional
+            Pre-computed MSA paths (chain_id → file path) to inject
+            into the YAML so the MSA server is never contacted.
+        use_msa_server : bool
+            Fallback: contact MSA server if msa_paths is not provided.
         """
         score = LigandScore(
             ligand_name=ligand.name,
@@ -928,6 +1122,8 @@ class AffinityRescorer:
                     ligand_chains=[ligand_chain_id],
                     ligand_smiles={ligand_chain_id: smiles},
                     pdb_atoms=combined_atoms,
+                    msa_paths=msa_paths,
+                    use_msa_server=use_msa_server,
                 )
 
                 if affinity_output is not None:
