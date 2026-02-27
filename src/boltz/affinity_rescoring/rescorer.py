@@ -24,6 +24,7 @@ from boltz.affinity_rescoring.export import ResultsExporter, compute_batch_summa
 from boltz.affinity_rescoring.inference import (
     AffinityModelManager,
     create_affinity_yaml,
+    run_direct_affinity_inference,
 )
 from boltz.affinity_rescoring.models import (
     AffinityResult,
@@ -161,6 +162,9 @@ class AffinityRescorer:
         # Model manager - lazy initialization
         self._model_manager: Optional[AffinityModelManager] = None
         self._checkpoint = checkpoint
+
+        # Eagerly loaded model for direct inference (loaded on first use)
+        self._loaded_model = None
 
         # Results cache
         self._last_results: List[AffinityResult] = []
@@ -313,6 +317,7 @@ class AffinityRescorer:
                         ligand_chains=chain_assignment.ligand_chains,
                         ligand_smiles=ligand_smiles,
                         use_msa_server=use_msa_server,
+                        pdb_atoms=atoms,  # pass PDB atoms for direct inference
                     )
 
                 result.inference_time_ms = inference_timer.elapsed_ms
@@ -639,7 +644,140 @@ class AffinityRescorer:
 
     # ─── Internal Methods ─────────────────────────────────────────────────
 
+    def _ensure_model_loaded(self):
+        """Lazily load the Boltz2 model for direct inference."""
+        if self._loaded_model is not None:
+            return self._loaded_model
+
+        if self._model_manager is None:
+            self._model_manager = AffinityModelManager(
+                device=self.config.device,
+                cache_dir=str(self._cache_dir),
+            )
+
+        self._loaded_model = self._model_manager.load_model(
+            checkpoint_path=self._checkpoint if self._checkpoint != "auto" else None,
+            affinity_mw_correction=self.config.affinity_mw_correction,
+        )
+        return self._loaded_model
+
     def _run_boltz_prediction(
+        self,
+        sequences: Dict[str, str],
+        protein_chains: List[str],
+        ligand_chains: List[str],
+        ligand_smiles: Dict[str, str],
+        use_msa_server: bool = False,
+        pdb_atoms: Optional[list] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Run Boltz affinity prediction.
+
+        If ``pdb_atoms`` are provided, uses the direct in-process pipeline
+        (trunk + affinity head with PDB coordinates, skipping diffusion).
+        Otherwise, falls back to the subprocess-based full prediction.
+
+        Parameters
+        ----------
+        sequences : dict
+            chain_id → amino acid sequence.
+        protein_chains : list
+            Protein chain IDs.
+        ligand_chains : list
+            Ligand chain IDs.
+        ligand_smiles : dict
+            chain_id → SMILES for ligands.
+        use_msa_server : bool
+            Whether to use the MSA server.
+        pdb_atoms : list, optional
+            Parsed PDB atoms for direct coordinate injection.
+            If provided, uses the fast direct pipeline.
+
+        Returns
+        -------
+        dict or None
+            Parsed affinity output, or None on failure.
+        """
+        if pdb_atoms is not None:
+            return self._run_direct_prediction(
+                sequences=sequences,
+                protein_chains=protein_chains,
+                ligand_chains=ligand_chains,
+                ligand_smiles=ligand_smiles,
+                pdb_atoms=pdb_atoms,
+                use_msa_server=use_msa_server,
+            )
+        else:
+            return self._run_subprocess_prediction(
+                sequences=sequences,
+                protein_chains=protein_chains,
+                ligand_chains=ligand_chains,
+                ligand_smiles=ligand_smiles,
+                use_msa_server=use_msa_server,
+            )
+
+    def _run_direct_prediction(
+        self,
+        sequences: Dict[str, str],
+        protein_chains: List[str],
+        ligand_chains: List[str],
+        ligand_smiles: Dict[str, str],
+        pdb_atoms: list,
+        use_msa_server: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Run direct in-process affinity prediction using PDB coordinates.
+
+        Bypasses diffusion and confidence — feeds PDB coords directly
+        through trunk + affinity head.
+        """
+        work_dir = Path(tempfile.mkdtemp(prefix="boltz_direct_"))
+
+        try:
+            # Build YAML
+            yaml_data = self._build_yaml_data(
+                sequences, protein_chains, ligand_chains, ligand_smiles
+            )
+            yaml_path = work_dir / "input.yaml"
+
+            import yaml
+            with open(yaml_path, "w") as f:
+                yaml.dump(yaml_data, f, default_flow_style=False)
+
+            # Build chain_id_map: PDB chain_id → YAML chain_id
+            # The YAML uses the same chain IDs as the PDB
+            all_chain_ids = protein_chains + ligand_chains
+            chain_id_map = {cid: cid for cid in all_chain_ids}
+
+            # Load model
+            model = self._ensure_model_loaded()
+
+            # Run direct inference
+            results = run_direct_affinity_inference(
+                model=model,
+                yaml_path=yaml_path,
+                pdb_atoms=pdb_atoms,
+                chain_id_map=chain_id_map,
+                cache_dir=self._cache_dir,
+                work_dir=work_dir,
+                use_msa_server=use_msa_server,
+                recycling_steps=self.config.recycling_steps,
+            )
+
+            return results
+
+        except Exception as e:
+            logger.error(f"Direct affinity prediction failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        finally:
+            try:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    def _run_subprocess_prediction(
         self,
         sequences: Dict[str, str],
         protein_chains: List[str],
@@ -648,9 +786,10 @@ class AffinityRescorer:
         use_msa_server: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
-        Run Boltz prediction by creating YAML and invoking the predict command.
+        Fallback: run Boltz prediction via subprocess (original approach).
 
-        Returns parsed affinity JSON or None on failure.
+        Used when PDB atoms are not available (e.g., SMILES-only ligand
+        with no 3D coordinates).
         """
         # Create temp directory
         work_dir = Path(tempfile.mkdtemp(prefix="boltz_rescore_"))
