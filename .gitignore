@@ -164,3 +164,11 @@ cython_debug/
 # Boltz prediction outputs
 #   All result files generated from a boltz prediction call
 boltz_results_*/
+
+# Local experiment / test files
+AA2AR_subposes.mol2
+AA2AR_receptor.pdb
+boltz_affinity.yaml
+submit_boltz.py
+experiment_files/
+slurm_scripts/

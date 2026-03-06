@@ -66,10 +66,9 @@ boltz rescore receptor \
 boltz rescore receptor \
   --receptor receptor.pdb \
   --ligands library.mol2 \
-  --output screening_results.xlsx \
-  --output-format excel \
+  --output AA2AR_screening_results.csv \
+  --output-format csv \
   --sort-by affinity_score \
-  --validation strict
 
 # With explicit protein chain
 boltz rescore receptor \

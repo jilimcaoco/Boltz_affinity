@@ -1090,28 +1090,42 @@ class AffinityRescorer:
                     return score
 
                 # ── Build combined pdb_atoms ──────────────────────────
-                # The coordinate injection needs ALL atoms (receptor +
-                # ligand) with chain IDs matching the YAML.  Receptor
-                # atoms keep their original chain ID; ligand atoms are
-                # reassigned to the YAML ligand chain ID ("L").
+                # Boltz assigns atom names as ELEMENT.upper() + (canonical_rank+1)
+                # where ranks come from AllChem.CanonicalRankAtoms on the
+                # H-inclusive mol of the standardised SMILES.  The mol2 file
+                # uses per-element sequential names (C1, C2, N1, …) that
+                # never match.  _remap_ligand_atoms_to_canonical() uses
+                # RDKit GetSubstructMatch to establish the mol2→canonical
+                # atom mapping and returns AtomInfo with canonical names.
                 ligand_chain_id = "L"
 
                 from boltz.affinity_rescoring.models import AtomInfo as _AI
-                ligand_atoms_remapped = [
-                    _AI(
-                        index=a.index,
-                        name=a.name,
-                        element=a.element,
-                        x=a.x, y=a.y, z=a.z,
-                        chain_id=ligand_chain_id,
-                        residue_name=a.residue_name,
-                        residue_number=a.residue_number,
-                        occupancy=a.occupancy,
-                        b_factor=a.b_factor,
-                        is_hetatm=True,
+
+                ligand_atoms_remapped = self._remap_ligand_atoms_to_canonical(
+                    ligand, smiles, ligand_chain_id
+                )
+                if ligand_atoms_remapped is None:
+                    # Fallback: pass mol2 atom names — injection will likely
+                    # fail to match but the pipeline will not crash.
+                    logger.warning(
+                        f"Using original mol2 atom names for {ligand.name}; "
+                        f"ligand 3-D coordinates may not be injected."
                     )
-                    for a in ligand.atoms
-                ]
+                    ligand_atoms_remapped = [
+                        _AI(
+                            index=a.index,
+                            name=a.name,
+                            element=a.element,
+                            x=a.x, y=a.y, z=a.z,
+                            chain_id=ligand_chain_id,
+                            residue_name=a.residue_name,
+                            residue_number=a.residue_number,
+                            occupancy=a.occupancy,
+                            b_factor=a.b_factor,
+                            is_hetatm=True,
+                        )
+                        for a in ligand.atoms
+                    ]
 
                 combined_atoms = list(protein_atoms) + ligand_atoms_remapped
 
@@ -1161,6 +1175,146 @@ class AffinityRescorer:
 
         score.processing_ms = t.elapsed_ms
         return score
+
+    def _remap_ligand_atoms_to_canonical(
+        self,
+        ligand: "LigandStructure",
+        smiles: str,
+        ligand_chain_id: str,
+    ) -> Optional[List]:
+        """Remap mol2 atom coordinates to Boltz's canonical atom naming.
+
+        Boltz's ``schema.py`` assigns atom names as
+        ``element_symbol.upper() + (canonical_rank + 1)`` where
+        ``canonical_rank`` comes from ``AllChem.CanonicalRankAtoms`` on the
+        H-inclusive mol of the *standardised* SMILES.  The mol2 file uses
+        per-element sequential names (``C1``, ``C2``, …, ``N1``, ``Cl1``,
+        …) that never match the processed-structure names (``C23``, ``CL18``,
+        etc.).
+
+        This method uses ``GetSubstructMatch`` to find the correspondence,
+        then returns an ``AtomInfo`` list with canonical names and mol2
+        coordinates.  Protein atoms are not touched.
+
+        Returns ``None`` if the mapping cannot be established; callers should
+        fall back to passing the original mol2 names with a warning.
+        """
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+
+            from boltz.affinity_rescoring.models import AtomInfo as _AI
+            from boltz.data.parse.schema import standardize
+
+            # ── 1. Standardise SMILES (same as schema.py affinity path) ──
+            std_smiles = standardize(smiles) if smiles else None
+            if not std_smiles:
+                return None
+
+            # ── 2. Build SMILES mol with Boltz canonical names ────────────
+            # Mirrors schema.py lines that assign atom names before the
+            # 3-D conformer is computed.
+            smiles_mol_h = Chem.AddHs(Chem.MolFromSmiles(std_smiles))
+            canonical_order = AllChem.CanonicalRankAtoms(smiles_mol_h)
+            Chem.AssignStereochemistry(smiles_mol_h, force=True, cleanIt=True)
+            for atom, can_idx in zip(smiles_mol_h.GetAtoms(), canonical_order):
+                atom.SetProp(
+                    "name", atom.GetSymbol().upper() + str(can_idx + 1)
+                )
+            smiles_mol_noh = Chem.RemoveHs(smiles_mol_h, sanitize=False)
+
+            # ── 3. Build mol2 ligand as an RDKit mol (heavy atoms only) ──
+            mol2_rdmol = Chem.RWMol()
+            mol2_atom_map: Dict[int, int] = {}  # atom.index → rdkit atom idx
+            for a in ligand.atoms:
+                ridx = mol2_rdmol.AddAtom(Chem.Atom(a.element))
+                mol2_atom_map[a.index] = ridx
+            _bt = {
+                1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE,
+                3: Chem.BondType.TRIPLE, 4: Chem.BondType.AROMATIC,
+                5: Chem.BondType.SINGLE,
+            }
+            for a1, a2, btype in ligand.bonds:
+                if a1 in mol2_atom_map and a2 in mol2_atom_map:
+                    try:
+                        mol2_rdmol.AddBond(
+                            mol2_atom_map[a1], mol2_atom_map[a2],
+                            _bt.get(btype, Chem.BondType.SINGLE),
+                        )
+                    except Exception:
+                        pass
+            try:
+                Chem.SanitizeMol(mol2_rdmol)
+            except Exception:
+                pass
+
+            # ── 4. Substructure match ──────────────────────────────────────
+            # mol2_rdmol.GetSubstructMatch(query) → for each query atom i
+            # returns the mol2 atom index that matches it.
+            match = mol2_rdmol.GetSubstructMatch(smiles_mol_noh)
+            if not match or len(match) != smiles_mol_noh.GetNumAtoms():
+                # Retry without chirality (handles stereochemistry differences)
+                match = mol2_rdmol.GetSubstructMatch(
+                    smiles_mol_noh, useChirality=False
+                )
+
+            if not match or len(match) != smiles_mol_noh.GetNumAtoms():
+                logger.warning(
+                    f"Could not establish mol2 → canonical atom mapping for "
+                    f"{ligand.name} ({len(ligand.atoms)} heavy atoms). "
+                    f"Ligand coordinates will not be injected into the "
+                    f"processed structure."
+                )
+                return None
+
+            # ── 5. Build remapped AtomInfo with canonical names ────────────
+            rdkit_idx_to_info = {
+                mol2_atom_map[a.index]: a for a in ligand.atoms
+            }
+            # All ligand atoms belong to one residue; use the first atom's
+            # residue_number so coord_lookup keying is consistent.
+            residue_number = ligand.atoms[0].residue_number if ligand.atoms else 1
+
+            remapped: List = []
+            for smiles_idx in range(smiles_mol_noh.GetNumAtoms()):
+                mol2_rdkit_idx = match[smiles_idx]
+                src = rdkit_idx_to_info.get(mol2_rdkit_idx)
+                can_name = smiles_mol_noh.GetAtomWithIdx(smiles_idx).GetProp(
+                    "name"
+                )
+                if src is None:
+                    logger.warning(
+                        f"Incomplete atom mapping for {ligand.name} at "
+                        f"SMILES idx {smiles_idx}"
+                    )
+                    return None
+                remapped.append(
+                    _AI(
+                        index=src.index,
+                        name=can_name,   # canonical name matches processed struct
+                        element=src.element,
+                        x=src.x, y=src.y, z=src.z,
+                        chain_id=ligand_chain_id,
+                        residue_name=src.residue_name,
+                        residue_number=residue_number,
+                        occupancy=src.occupancy,
+                        b_factor=src.b_factor,
+                        is_hetatm=True,
+                    )
+                )
+
+            logger.debug(
+                f"Canonical remapping succeeded for {ligand.name}: "
+                f"{len(remapped)} atoms mapped."
+            )
+            return remapped
+
+        except Exception as e:
+            logger.debug(
+                f"_remap_ligand_atoms_to_canonical failed for "
+                f"{ligand.name}: {e}"
+            )
+            return None
 
     def _mol2_to_smiles(self, ligand: "LigandStructure") -> Optional[str]:
         """

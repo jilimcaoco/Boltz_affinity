@@ -46,7 +46,7 @@ class AffinityModelManager:
     - Handle device fallback (GPU → CPU)
     """
 
-    # Default checkpoint URLs (same as main.py)
+    # Default checkpoint URLs (same as main.py) I had to put this here cause of cache errors that may occur. 
     CHECKPOINT_URLS = {
         "gateway": "https://model-gateway.boltz.bio/boltz2_aff.ckpt",
         "huggingface": "https://huggingface.co/boltz-community/boltz2/resolve/main/boltz2_aff.ckpt",
@@ -190,7 +190,12 @@ class AffinityModelManager:
         # in memory before loading.
         _STRIP_DIFFUSION_KEYS = {"mse_rotational_alignment"}
 
-        ckpt_data = torch.load(str(ckpt_path), map_location="cpu")
+        # PyTorch ≥2.6 changed weights_only default to True.  This checkpoint
+        # is from a trusted internal source and serialises multiple omegaconf
+        # internal types (DictConfig, ListConfig, ContainerMetadata, …).
+        # Rather than maintaining an ever-growing allowlist, load with
+        # weights_only=False which is the correct approach for trusted ckpts.
+        ckpt_data = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
         patched = False
         if "hyper_parameters" in ckpt_data:
             hp = ckpt_data["hyper_parameters"]
