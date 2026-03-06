@@ -42,7 +42,11 @@ class PairformerLayer(nn.Module):
         if v2:
             self.attention = AttentionPairBiasV2(token_s, token_z, num_heads)
         else:
-            self.attention = AttentionPairBias(token_s, token_z, num_heads)
+            # initial_norm=False: PairformerLayer already normalises s via
+            # pre_norm_s before calling attention, so the inner norm_s in
+            # AttentionPairBias is redundant and was not present when the
+            # checkpoint was trained (matches boltz2_aff.ckpt state_dict).
+            self.attention = AttentionPairBias(token_s, token_z, num_heads, initial_norm=False)
 
         self.tri_mul_out = TriangleMultiplicationOutgoing(token_z)
         self.tri_mul_in = TriangleMultiplicationIncoming(token_z)

@@ -342,6 +342,8 @@ def affinity_forward(
     model: Any,
     feats: Dict[str, Tensor],
     recycling_steps: int = 5,
+    distogram_mask_mode: str = "none",
+    distance_cutoff: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run trunk + affinity head, skipping diffusion and confidence.
 
@@ -351,8 +353,6 @@ def affinity_forward(
     which will be used directly as ``x_pred`` for the affinity head.
 
     *** SAFETY: This function NEVER calls diffusion or confidence. ***
-    If you see results from this function, they came from affinity-only
-    inference (trunk + affinity head with injected PDB coordinates).
 
     Parameters
     ----------
@@ -363,18 +363,21 @@ def affinity_forward(
         (tokenize → crop → featurize) with PDB coordinates.
     recycling_steps : int
         Number of recycling iterations for the trunk.
+    distogram_mask_mode : str
+        Ablation mode: ``"none"``, ``"zero_all"``, ``"zero_cross"``,
+        ``"zero_ligand"``, ``"zero_receptor"``, ``"distance_cutoff"``.
+    distance_cutoff : float, optional
+        Distance threshold in Å for ``"distance_cutoff"`` mode.
 
     Returns
     -------
     dict
-        Affinity predictions including ``affinity_pred_value``,
-        ``affinity_probability_binary``, and ensemble values if applicable.
+        Affinity predictions.
 
     Raises
     ------
     RuntimeError
-        If ``feats`` does not contain ``coords`` (PDB coordinates must
-        be injected before calling this function).
+        If ``feats`` does not contain ``coords``.
     """
     # ── Safety check: PDB coordinates must be present ─────────────
     if "coords" not in feats:
@@ -473,6 +476,8 @@ def affinity_forward(
                 feats=feats,
                 multiplicity=1,
                 use_kernels=use_kernels,
+                distogram_mask_mode=distogram_mask_mode,
+                distance_cutoff=distance_cutoff,
             )
             out1["affinity_probability_binary"] = torch.nn.functional.sigmoid(
                 out1["affinity_logits_binary"]
@@ -485,6 +490,8 @@ def affinity_forward(
                 feats=feats,
                 multiplicity=1,
                 use_kernels=use_kernels,
+                distogram_mask_mode=distogram_mask_mode,
+                distance_cutoff=distance_cutoff,
             )
             out2["affinity_probability_binary"] = torch.nn.functional.sigmoid(
                 out2["affinity_logits_binary"]
@@ -525,6 +532,8 @@ def affinity_forward(
                 feats=feats,
                 multiplicity=1,
                 use_kernels=use_kernels,
+                distogram_mask_mode=distogram_mask_mode,
+                distance_cutoff=distance_cutoff,
             )
 
             results["affinity_pred_value"] = out["affinity_pred_value"].item()
@@ -546,6 +555,8 @@ def run_direct_affinity_inference(
     msa_server_url: str = "https://api.colabfold.com",
     recycling_steps: int = 5,
     device: Optional[str] = None,
+    distogram_mask_mode: str = "none",
+    distance_cutoff: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run the complete direct affinity inference pipeline.
 
@@ -754,7 +765,13 @@ def run_direct_affinity_inference(
             else:
                 batch[k] = v
 
-        results = affinity_forward(model, batch, recycling_steps=recycling_steps)
+        results = affinity_forward(
+            model, batch,
+            recycling_steps=recycling_steps,
+            distogram_mask_mode=distogram_mask_mode,
+            distance_cutoff=distance_cutoff,
+        )
+        results["distogram_mask_mode"] = distogram_mask_mode
 
         # Attach pocket proximity report for benchmarking
         results["pocket_proximity_report"] = {

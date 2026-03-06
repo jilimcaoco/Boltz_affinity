@@ -1,3 +1,5 @@
+import logging
+
 import torch
 from torch import nn
 
@@ -6,6 +8,8 @@ from boltz.model.layers.pairformer import PairformerNoSeqModule
 from boltz.model.modules.encodersv2 import PairwiseConditioning
 from boltz.model.modules.transformersv2 import DiffusionTransformer
 from boltz.model.modules.utils import LinearNoBias
+
+logger = logging.getLogger(__name__)
 
 
 class GaussianSmearing(torch.nn.Module):
@@ -82,6 +86,8 @@ class AffinityModule(nn.Module):
         feats,
         multiplicity=1,
         use_kernels=False,
+        distogram_mask_mode="none",
+        distance_cutoff=None,
     ):
         z = self.z_linear(self.z_norm(z))
         z = z.repeat_interleave(multiplicity, 0)
@@ -106,6 +112,83 @@ class AffinityModule(nn.Module):
 
         distogram = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
         distogram = self.dist_bin_pairwise_embed(distogram)
+
+        # ── Debug: distogram BEFORE masking ───────────────────────
+        if distogram_mask_mode != "none":
+            _norm_pre = distogram.norm().item()
+            _nonzero_pre = (distogram.abs() > 1e-8).sum().item()
+            _numel = distogram.numel()
+            logger.info(
+                f"[distogram-debug] mode={distogram_mask_mode} "
+                f"BEFORE masking: shape={list(distogram.shape)} "
+                f"norm={_norm_pre:.4f} "
+                f"nonzero={_nonzero_pre}/{_numel} "
+                f"mean={distogram.mean().item():.6f} "
+                f"std={distogram.std().item():.6f}"
+            )
+
+        # ── Distogram masking for ablation studies ────────────────
+        if distogram_mask_mode != "none":
+            pad_mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
+            rec = (feats["mol_type"] == 0).repeat_interleave(multiplicity, 0) * pad_mask
+            lig = (
+                feats["affinity_token_mask"]
+                .repeat_interleave(multiplicity, 0)
+                .to(torch.bool)
+            ) * pad_mask
+
+            if distogram_mask_mode == "zero_all":
+                # Zero entire embedded distogram
+                distogram = torch.zeros_like(distogram)
+            elif distogram_mask_mode == "zero_cross":
+                # Zero protein-ligand and ligand-protein cross pairs
+                cross = (
+                    lig[:, :, None] * rec[:, None, :]
+                    + rec[:, :, None] * lig[:, None, :]
+                )
+                distogram = distogram * (1 - cross.unsqueeze(-1).float())
+            elif distogram_mask_mode == "zero_ligand":
+                # Zero all pairs involving the ligand
+                any_lig = lig[:, :, None] | lig[:, None, :]
+                distogram = distogram * (~any_lig).unsqueeze(-1).float()
+            elif distogram_mask_mode == "zero_receptor":
+                # Zero receptor-receptor pairs only
+                rec_rec = rec[:, :, None] * rec[:, None, :]
+                distogram = distogram * (1 - rec_rec.unsqueeze(-1).float())
+            elif distogram_mask_mode == "distance_cutoff":
+                # Zero distogram entries for pairs beyond the cutoff
+                cutoff = distance_cutoff if distance_cutoff is not None else 8.0
+                beyond = (d > cutoff).unsqueeze(-1).float()
+                distogram = distogram * (1 - beyond)
+
+            # ── Debug: distogram AFTER masking ────────────────────
+            _norm_post = distogram.norm().item()
+            _nonzero_post = (distogram.abs() > 1e-8).sum().item()
+            _frac_zeroed = 1.0 - (_nonzero_post / max(_nonzero_pre, 1))
+            logger.info(
+                f"[distogram-debug] mode={distogram_mask_mode} "
+                f"AFTER masking: "
+                f"norm={_norm_post:.4f} "
+                f"nonzero={_nonzero_post}/{_numel} "
+                f"fraction_zeroed={_frac_zeroed:.4f} "
+                f"mean={distogram.mean().item():.6f} "
+                f"std={distogram.std().item():.6f}"
+            )
+            # Mask region breakdown
+            _n_rec = rec.sum().item()
+            _n_lig = lig.sum().item()
+            logger.info(
+                f"[distogram-debug] token counts: "
+                f"receptor={_n_rec:.0f} ligand={_n_lig:.0f} "
+                f"total_tokens={pad_mask.sum().item():.0f}"
+            )
+
+        # ── Debug: confirm this is what enters pairwise_conditioner ──
+        logger.debug(
+            f"[distogram-debug] feeding to pairwise_conditioner: "
+            f"norm={distogram.norm().item():.4f} "
+            f"shape={list(distogram.shape)}"
+        )
 
         z = z + self.pairwise_conditioner(z_trunk=z, token_rel_pos_feats=distogram)
 
