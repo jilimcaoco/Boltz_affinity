@@ -157,17 +157,46 @@ class InstrumentedAffinityModule(nn.Module):
             except AttributeError:
                 self._num_heads = None
 
+        # 3. Pre-layer-0 hook -----------------------------------------
+        # Capture z BEFORE the first pairformer layer processes it.
+        # Stored at key -1 in captured_z to distinguish from post-layer
+        # outputs at keys 0, 1, 2, …
+        # PairformerNoSeqLayer.forward(z, pair_mask, ...) receives z as
+        # the first positional argument.
+        if self._num_layers > 0:
+
+            def _pre_layer0_hook(
+                mod: nn.Module,
+                args: tuple,
+            ) -> None:
+                z_in = args[0]
+                self.captured_z[-1] = z_in.detach().clone()
+
+            self._hooks.append(
+                layers[0].register_forward_pre_hook(_pre_layer0_hook)
+            )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def clear(self) -> None:
-        """Empty both capture dicts."""
+        """Empty both capture dicts.
+
+        After a forward pass, captured_z contains key -1 (pre-layer-0 z)
+        plus keys 0 … L-1 (post-layer z for each pairformer layer).
+        """
         self.captured_z.clear()
         self.captured_attn.clear()
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Clear captures, run the wrapped module, return output unchanged."""
+        assert not self.module.training, (
+            "InstrumentedAffinityModule must be used in eval() "
+            "mode. Call module.eval() before running analysis. "
+            "Training mode activates dropout which makes captured "
+            "activations stochastic and uninterpretable."
+        )
         self.clear()
         return self.module.forward(*args, **kwargs)
 
@@ -195,8 +224,9 @@ class InstrumentedAffinityModule(nn.Module):
             f"  layers hooked       : {self._num_layers}\n"
             f"  heads per tri_att   : {heads_str}\n"
             f"  total hooks         : {len(self._hooks)} "
-            f"(3 per layer: 1 block-z + 2 softmax)\n"
-            f"  captured_z keys     : {z_keys or 'empty'}\n"
+            f"(3 per layer + 1 pre-layer-0: block-z + 2 softmax each)\n"
+            f"  captured_z keys     : {z_keys or 'empty'} "
+            f"(-1=pre-layer-0, 0..L-1=post-layer)\n"
             f"  captured_attn keys  : {attn_summary or 'empty'}\n"
             f"  attn tensor shape   : (B, N, N, N) per head "
             f"[B=batch, N=seq, Q×K attention]\n"

@@ -85,31 +85,31 @@ def extract_head_circuits(
     W_O = attn_mha.linear_o.weight[:, head_idx * c_hidden : (head_idx + 1) * c_hidden]
     # (c_q, c_hidden)
 
-    # Compute QK and OV circuits.
+    # Compute QK and OV circuits in pair-representation space (c_q × c_q).
     #
-    # QK circuit: queries and keys interact.
-    #   W_QK = W_Q @ W_K^T  →  (c_hidden, c_hidden)
+    # QK circuit: attention score = x^T W_Q^T W_K x
+    #   W_QK = W_Q^T @ W_K  →  (c_q, c_q)
     #
-    # OV circuit: values and outputs interact.
-    #   W_OV = W_V @ W_O^T  →  (c_hidden, c_hidden)
-    # However, we may want to project both to the pair space (c_q).
-    # For now, we compute the c_hidden × c_hidden version.
+    # OV circuit: output contribution = W_O @ W_V @ x
+    #   W_OV = W_O @ W_V  →  (c_q, c_q)
 
-    W_QK = W_Q @ W_K.T  # (c_hidden, c_hidden)
-    W_OV = W_V @ W_O.T  # (c_hidden, c_hidden)
+    W_QK = W_Q.T @ W_K  # (c_q, c_q)
+    W_OV = W_O @ W_V    # (c_q, c_q)
 
     # Run SVD decomposition (full matrices).
     qk_U, qk_S, qk_Vh = torch.linalg.svd(W_QK, full_matrices=True)
     ov_U, ov_S, ov_Vh = torch.linalg.svd(W_OV, full_matrices=True)
 
     # Extract principal directions.
-    top_qk_query_dir = qk_Vh[0, :]  # First row of right-singular vectors
-    top_qk_key_dir = qk_U[:, 0]  # First column of left-singular vectors
+    # SVD: W_QK = U S Vh.  Score = z_i^T W_QK z_j, so position i (query)
+    # aligns with U[:,0] and position j (key) aligns with Vh[0,:].
+    top_qk_query_dir = qk_U[:, 0]   # left singular vector = query direction
+    top_qk_key_dir = qk_Vh[0, :]    # right singular vector = key direction
     top_ov_input_dir = ov_Vh[0, :]  # First row of right-singular vectors
     top_ov_output_dir = ov_U[:, 0]  # First column of left-singular vectors
 
     # Spectrum ratio: ratio of first to second singular value of OV.
-    spectrum_ratio = (ov_S[0] / ov_S[1]).item() if len(ov_S) > 1 else float("inf")
+    spectrum_ratio = (ov_S[0] / ov_S[1].clamp(min=1e-12)).item() if len(ov_S) > 1 else float("inf")
 
     return {
         "qk_U": qk_U.detach(),

@@ -60,7 +60,10 @@ def compute_logit_lens(
     layer_z_dict : dict[int, torch.Tensor]
         Mapping ``{layer_idx: z}`` where z has shape ``(B, N, N, token_z)``.
         Typically comes from ``instrumented_module.captured_z`` after a
-        forward pass.
+        forward pass.  If the dict contains key ``-1``, that entry is the
+        pre-layer-0 z (before any pairformer layer has processed it) and
+        will appear first in the returned trajectory.  When visualising
+        the trajectory, plot the ``-1`` entry as the leftmost point.
     interface_mask : torch.Tensor
         Boolean mask of shape ``(B, N, N)`` indicating which (i, j) pair
         entries should contribute to the mean pool.  This is the caller's
