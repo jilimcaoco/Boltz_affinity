@@ -172,6 +172,20 @@ def softmax_no_cast(t: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return s
 
 
+class _SoftmaxWeights(nn.Module):
+    """Thin nn.Module wrapper around softmax_no_cast.
+
+    Exists solely to create a hookable sub-module boundary inside Attention so
+    that per-head attention weight tensors (shape [*, H, Q, K]) can be captured
+    by interpretability forward hooks without modifying the numerical result.
+
+    This module has no learnable parameters and is numerically transparent.
+    """
+
+    def forward(self, a: torch.Tensor) -> torch.Tensor:
+        return softmax_no_cast(a, dim=-1)
+
+
 # @torch.jit.script
 def _attention(
     query: torch.Tensor,
@@ -268,6 +282,11 @@ class Attention(nn.Module):
 
         self.sigmoid = nn.Sigmoid()
 
+        # Hookable softmax — no parameters, numerically identical to the bare
+        # softmax_no_cast call.  Used by interpretability tooling in
+        # interpretability/hooks.py to capture per-head attention weights.
+        self.softmax = _SoftmaxWeights()
+
     def _prep_qkv(
         self, q_x: torch.Tensor, kv_x: torch.Tensor, apply_scale: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -357,9 +376,19 @@ class Attention(nn.Module):
             )
             o = o.transpose(-2, -3)
         else:
-            biases = [mask_bias, tri_bias]
-            o = _attention(q, k, v, biases)
-            o = o.transpose(-2, -3)
+            # Inline _attention so the softmax step routes through self.softmax,
+            # making per-head attention weight tensors capturable via forward
+            # hooks.  Numerically identical to the original _attention() call.
+            #   q:   [*, H, Q, C_hidden]
+            #   k_T: [*, H, C_hidden, K]
+            #   a:   [*, H, Q, K]  ← shape at softmax and capture point
+            k_T = permute_final_dims(k, (1, 0))
+            a = torch.matmul(q, k_T)
+            for b in [mask_bias, tri_bias]:
+                a = a + b
+            a = self.softmax(a)          # [*, H, Q, K] — hookable
+            o = torch.matmul(a, v)       # [*, H, Q, C_hidden]
+            o = o.transpose(-2, -3)      # [*, Q, H, C_hidden]
 
         o = self._wrap_up(o, q_x)
 
