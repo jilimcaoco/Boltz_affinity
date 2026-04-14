@@ -1,0 +1,106 @@
+# Snakefile — FEP+ benchmark dataset pipeline
+#
+# Chains three scripts to build an annotated congeneric-series dataset:
+#   1. fetch_fep_benchmark_structures.py  → fep_benchmark_structures.csv
+#   2. annotate_affinities.py             → fep_benchmark_annotated.csv
+#   3. identify_congeneric_series.py      → congeneric_series.csv + congeneric_pairs.csv
+#
+# Usage:
+#   snakemake -j1                          # run full pipeline
+#   snakemake -j1 -n                       # dry-run (print what would happen)
+#   snakemake -j1 --forceall               # re-run everything from scratch
+#   snakemake -j1 congeneric               # run up to the congeneric step
+#
+# PDBbind index (optional):
+#   If ~/Downloads/INDEX_refined_data.2020 exists it is used automatically.
+#   Otherwise pass it via: snakemake -j1 --config pdbbind_index=/path/to/file
+
+import os
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+PDBBIND_INDEX = config.get(
+    "pdbbind_index",
+    os.path.expanduser("~/Downloads/INDEX_refined_data.2020"),
+)
+
+DATASETS = "datasets"
+
+# ---------------------------------------------------------------------------
+# Default target: run everything
+# ---------------------------------------------------------------------------
+
+rule all:
+    input:
+        f"{DATASETS}/congeneric_series.csv",
+        f"{DATASETS}/congeneric_pairs.csv",
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — Fetch structures from RCSB PDB
+# ---------------------------------------------------------------------------
+
+rule fetch_structures:
+    output:
+        f"{DATASETS}/fep_benchmark_structures.csv",
+    log:
+        f"{DATASETS}/logs/fetch_structures.log",
+    shell:
+        """
+        mkdir -p {DATASETS}/logs
+        python {DATASETS}/fetch_fep_benchmark_structures.py --yes \
+            2>&1 | tee {log}
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — Annotate with experimental affinities
+# ---------------------------------------------------------------------------
+
+def _pdbbind_flag(wildcards):
+    """Return --pdbbind_index flag only if the file exists."""
+    if os.path.isfile(PDBBIND_INDEX):
+        return f"--pdbbind_index {PDBBIND_INDEX}"
+    return ""
+
+rule annotate_affinities:
+    input:
+        f"{DATASETS}/fep_benchmark_structures.csv",
+    output:
+        f"{DATASETS}/fep_benchmark_annotated.csv",
+    params:
+        pdbbind=_pdbbind_flag,
+    log:
+        f"{DATASETS}/logs/annotate_affinities.log",
+    shell:
+        """
+        mkdir -p {DATASETS}/logs
+        python {DATASETS}/annotate_affinities.py \
+            --input {input} --output {output} {params.pdbbind} \
+            2>&1 | tee {log}
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — Identify congeneric series
+# ---------------------------------------------------------------------------
+
+rule congeneric:
+    input:
+        f"{DATASETS}/fep_benchmark_annotated.csv",
+    output:
+        f"{DATASETS}/congeneric_series.csv",
+        f"{DATASETS}/congeneric_pairs.csv",
+    log:
+        f"{DATASETS}/logs/identify_congeneric_series.log",
+    shell:
+        """
+        mkdir -p {DATASETS}/logs
+        python {DATASETS}/identify_congeneric_series.py \
+            --input {input} \
+            --series-out {output[0]} \
+            --pairs-out {output[1]} \
+            2>&1 | tee {log}
+        """

@@ -1,5 +1,7 @@
-# Datasets (downloaded structures and generated CSVs)
-datasets/
+# Datasets — ignore generated data but track scripts
+datasets/*
+!datasets/*.py
+!datasets/Snakefile
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

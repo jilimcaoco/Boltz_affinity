@@ -76,7 +76,6 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -322,14 +321,15 @@ def run_distance_perturb(
     directions = torch.randn(n_directions, 3, generator=rng)
     directions = directions / directions.norm(dim=-1, keepdim=True)  # (D, 3)
 
-    original_x_pred = forward_kwargs["x_pred"].clone()  # (1, N_atoms, 3)
+    original_x_pred = forward_kwargs["x_pred"].clone()  # (B, mult, N_atoms, 3)
 
     rows: list[dict] = []
     for displacement in displacements:
         for dir_idx, direction in enumerate(directions):
             x_pred = original_x_pred.clone()
             # Translate ligand representative atoms.
-            x_pred[0, lig_rep_atoms_t, :] += displacement * direction
+            # x_pred is 4D: (B, mult, N_atoms, 3). Index the N_atoms dim.
+            x_pred[:, :, lig_rep_atoms_t, :] += displacement * direction
 
             patched_kwargs = {**forward_kwargs, "x_pred": x_pred}
             with torch.no_grad():
