@@ -119,7 +119,7 @@ def aggregate_logit_lens(
     csv_files = sorted(results_dir.glob("*_logit_lens.csv"))
     if not csv_files:
         print("  No *_logit_lens.csv files found.")
-        return {}
+        return {}, {}
 
     # {layer_transition: [delta, ...]}
     delta_by_transition: dict[str, list[float]] = defaultdict(list)
@@ -206,12 +206,16 @@ def aggregate_logit_lens(
 def aggregate_svd(
     results_dir: Path,
     output_dir: Path,
-) -> dict[str, dict]:
-    """Returns {complex_name: {max_spectrum_layer, max_spectrum_head}}."""
+) -> tuple[dict[str, dict], dict[tuple[int, int], list[float]]]:
+    """Returns (per_complex_max, ratios).
+
+    per_complex_max: {complex_name: {max_spectrum_layer, max_spectrum_head}}
+    ratios: {(layer, head): [spectrum_ratio, ...]} for cross-analysis
+    """
     csv_files = sorted(results_dir.glob("*_svd.csv"))
     if not csv_files:
         print("  No *_svd.csv files found.")
-        return {}
+        return {}, {}
 
     # {(layer, head): [spectrum_ratio, ...]}
     ratios: dict[tuple[int, int], list[float]] = defaultdict(list)
@@ -260,21 +264,22 @@ def aggregate_svd(
     ]
     _write_csv(spectrum_rows, output_dir / "head_spectrum_ratios.csv")
 
-    return per_complex_max
+    return per_complex_max, ratios
 
 
 # ---------------------------------------------------------------------------
 # Aggregate head-ablation patching CSVs
 # ---------------------------------------------------------------------------
 
-def aggregate_head_ablation(results_dir: Path, output_dir: Path) -> None:
+def aggregate_head_ablation(results_dir: Path, output_dir: Path) -> dict:
+    """Returns {(layer, head): mean_abs_effect} for cross-analysis."""
     patch_dir = results_dir / "patching"
     if not patch_dir.exists():
-        return
+        return {}
 
     csv_files = sorted(patch_dir.glob("*_head_ablation.csv"))
     if not csv_files:
-        return
+        return {}
 
     # {(layer, head): [|effect|, ...]}
     effects: dict[tuple[int, int], list[float]] = defaultdict(list)
@@ -297,6 +302,184 @@ def aggregate_head_ablation(results_dir: Path, output_dir: Path) -> None:
         for (layer, head), vals in sorted(effects.items())
     ]
     _write_csv(ablation_rows, output_dir / "head_ablation_summary.csv")
+
+    return {k: _mean(v) for k, v in effects.items()}
+
+
+# ---------------------------------------------------------------------------
+# Aggregate activation SVD CSVs
+# ---------------------------------------------------------------------------
+
+def aggregate_activation_svd(
+    results_dir: Path,
+    output_dir: Path,
+) -> None:
+    """Aggregate per-complex z-delta and attention SVD results."""
+
+    # --- Z-delta SVD ---
+    z_files = sorted(results_dir.glob("*_z_delta_svd.csv"))
+    if z_files:
+        # Per-layer effective rank (averaged across complexes)
+        eff_rank_by_layer: dict[int, list[float]] = defaultdict(list)
+        # Per-layer top singular value (how much update occurs)
+        top_sv_by_layer: dict[int, list[float]] = defaultdict(list)
+
+        for csv_file in z_files:
+            with open(csv_file) as f:
+                for r in csv.DictReader(f):
+                    layer = int(r["layer"])
+                    rank = int(r["rank"])
+                    if rank == 0:
+                        eff_rank_by_layer[layer].append(float(r["effective_rank"]))
+                        top_sv_by_layer[layer].append(float(r["singular_value"]))
+
+        z_rows = [
+            {
+                "layer": layer,
+                "mean_effective_rank": f"{_mean(eff_rank_by_layer[layer]):.4f}",
+                "std_effective_rank": f"{_std(eff_rank_by_layer[layer]):.4f}",
+                "mean_top_sv": f"{_mean(top_sv_by_layer[layer]):.6f}",
+                "std_top_sv": f"{_std(top_sv_by_layer[layer]):.6f}",
+                "n_complexes": len(eff_rank_by_layer[layer]),
+            }
+            for layer in sorted(eff_rank_by_layer.keys())
+        ]
+        _write_csv(z_rows, output_dir / "z_delta_svd_summary.csv")
+
+    # --- Attention SVD ---
+    attn_files = sorted(results_dir.glob("*_attn_svd.csv"))
+    if attn_files:
+        eff_rank_by_head: dict[tuple[int, str, int], list[float]] = defaultdict(list)
+
+        for csv_file in attn_files:
+            with open(csv_file) as f:
+                for r in csv.DictReader(f):
+                    if int(r["rank"]) != 0:
+                        continue
+                    key = (int(r["layer"]), r["direction"], int(r["head"]))
+                    eff_rank_by_head[key].append(float(r["effective_rank"]))
+
+        attn_rows = [
+            {
+                "layer": layer,
+                "direction": direction,
+                "head": head,
+                "mean_effective_rank": f"{_mean(vals):.4f}",
+                "std_effective_rank": f"{_std(vals):.4f}",
+                "n_complexes": len(vals),
+            }
+            for (layer, direction, head), vals in sorted(eff_rank_by_head.items())
+        ]
+        _write_csv(attn_rows, output_dir / "attn_svd_summary.csv")
+
+
+# ---------------------------------------------------------------------------
+# Cross-analysis: triangulate logit lens, SVD spectrum, and ablation
+# ---------------------------------------------------------------------------
+
+def aggregate_cross_analysis(
+    results_dir: Path,
+    output_dir: Path,
+    svd_spectrum: dict[tuple[int, int], list[float]] | None = None,
+    ablation_effects: dict[tuple[int, int], float] | None = None,
+) -> None:
+    """Produce a unified per-(layer, head) table merging all three signals.
+
+    Columns:
+      layer, head, mean_spectrum_ratio, mean_ablation_effect,
+      mean_logit_lens_delta_at_layer, convergent_signal
+
+    ``convergent_signal`` is True when all three metrics agree the head is
+    important: spectrum_ratio > median, ablation_effect > median, and the
+    logit lens delta at this layer is above its median.  This is the
+    triangulation indicator.
+    """
+    # Collect logit lens layer deltas (layer → mean_abs_delta).
+    layer_deltas: dict[int, float] = {}
+    ll_summary = output_dir / "layer_importance.csv"
+    if ll_summary.exists():
+        with open(ll_summary) as f:
+            for r in csv.DictReader(f):
+                # Parse transition "X→Y" to get the target layer Y.
+                transition = r["layer_transition"]
+                try:
+                    target_layer = int(transition.split("→")[1])
+                except (IndexError, ValueError):
+                    continue
+                layer_deltas[target_layer] = float(r["mean_abs_delta"])
+
+    # Collect SVD spectrum ratios if not already provided.
+    if svd_spectrum is None:
+        svd_spectrum = {}
+        svd_summary = output_dir / "head_spectrum_ratios.csv"
+        if svd_summary.exists():
+            with open(svd_summary) as f:
+                for r in csv.DictReader(f):
+                    key = (int(r["layer"]), int(r["head"]))
+                    svd_spectrum[key] = [float(r["mean_spectrum_ratio"])]
+
+    # Build the cross table.
+    all_keys: set[tuple[int, int]] = set()
+    if svd_spectrum:
+        all_keys.update(svd_spectrum.keys())
+    if ablation_effects:
+        all_keys.update(ablation_effects.keys())
+
+    if not all_keys:
+        print("  Cross-analysis: insufficient data (need SVD + ablation results).")
+        return
+
+    rows: list[dict] = []
+    spectrum_vals: list[float] = []
+    ablation_vals: list[float] = []
+    delta_vals: list[float] = []
+
+    for layer, head in sorted(all_keys):
+        sr = _mean(svd_spectrum.get((layer, head), []))
+        ae = ablation_effects.get((layer, head), float("nan"))
+        ld = layer_deltas.get(layer, float("nan"))
+        spectrum_vals.append(sr)
+        ablation_vals.append(ae)
+        delta_vals.append(ld)
+        rows.append({
+            "layer": layer,
+            "head": head,
+            "spectrum_ratio": sr,
+            "ablation_effect": ae,
+            "logit_lens_delta": ld,
+        })
+
+    # Compute medians for convergence test.
+    def _median(xs):
+        clean = sorted(x for x in xs if not math.isnan(x))
+        if not clean:
+            return 0.0
+        mid = len(clean) // 2
+        return clean[mid] if len(clean) % 2 else (clean[mid - 1] + clean[mid]) / 2
+
+    sr_med = _median(spectrum_vals)
+    ae_med = _median(ablation_vals)
+    ld_med = _median(delta_vals)
+
+    for row in rows:
+        sr_above = row["spectrum_ratio"] > sr_med if not math.isnan(row["spectrum_ratio"]) else False
+        ae_above = row["ablation_effect"] > ae_med if not math.isnan(row["ablation_effect"]) else False
+        ld_above = row["logit_lens_delta"] > ld_med if not math.isnan(row["logit_lens_delta"]) else False
+
+        # All three signals must agree for convergent_signal.
+        has_all = not (math.isnan(row["spectrum_ratio"]) or
+                       math.isnan(row["ablation_effect"]) or
+                       math.isnan(row["logit_lens_delta"]))
+        row["convergent_signal"] = has_all and sr_above and ae_above and ld_above
+
+        # Format floats for CSV.
+        row["spectrum_ratio"] = f"{row['spectrum_ratio']:.4f}"
+        row["ablation_effect"] = f"{row['ablation_effect']:.6f}"
+        row["logit_lens_delta"] = f"{row['logit_lens_delta']:.6f}"
+
+    _write_csv(rows, output_dir / "cross_analysis.csv")
+    convergent = sum(1 for r in rows if r["convergent_signal"])
+    print(f"  {convergent}/{len(rows)} (layer, head) pairs show convergent signal.")
 
 
 # ---------------------------------------------------------------------------
@@ -363,10 +546,20 @@ def main() -> None:
     )
 
     print("\n--- SVD aggregation ---")
-    per_complex_max = aggregate_svd(results_dir, output_dir)
+    per_complex_max, svd_spectrum = aggregate_svd(results_dir, output_dir)
+
+    print("\n--- Activation SVD aggregation ---")
+    aggregate_activation_svd(results_dir, output_dir)
 
     print("\n--- Head ablation aggregation (if present) ---")
-    aggregate_head_ablation(results_dir, output_dir)
+    ablation_effects = aggregate_head_ablation(results_dir, output_dir)
+
+    print("\n--- Cross-analysis (triangulation) ---")
+    aggregate_cross_analysis(
+        results_dir, output_dir,
+        svd_spectrum=svd_spectrum,
+        ablation_effects=ablation_effects,
+    )
 
     print("\n--- Per-complex summary ---")
     write_summary(

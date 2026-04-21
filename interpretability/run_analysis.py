@@ -70,6 +70,14 @@ def _load_affinity_module(
     LightningModule:
       - model.affinity_module   (non-ensemble)
       - model.affinity_module1  (ensemble, first head)
+
+    Returns
+    -------
+    tuple[AffinityModule, dict]
+        The AffinityModule and a dict of embedding tables extracted from
+        the full model for chemical interpretability projections:
+        ``{"residue_embedding": Tensor (num_tokens, token_s) or None,
+           "residue_embedding_z": Tensor (num_tokens, token_z) or None}``
     """
     from boltz.affinity_rescoring.inference import (
         AffinityModelManager,
@@ -94,7 +102,30 @@ def _load_affinity_module(
 
     affinity_mod = affinity_mod.to(device)
     affinity_mod.eval()
-    return affinity_mod
+
+    # --- Extract embedding tables for chemical interpretability ---
+    # res_type_encoding lives in the trunk InputEmbedder (token_s space).
+    # SVD directions live in token_z (pair-representation) space.
+    # We project via the AffinityModule's s_to_z_prod_in1 to bridge.
+    embedding_tables: dict = {
+        "residue_embedding": None,
+        "residue_embedding_z": None,
+    }
+    try:
+        # model.input_embedder.res_type_encoding.weight: (token_s, num_tokens)
+        res_enc_weight = model.input_embedder.res_type_encoding.weight  # (token_s, num_tokens)
+        res_emb_s = res_enc_weight.T.detach().to(device)  # (num_tokens, token_s)
+        embedding_tables["residue_embedding"] = res_emb_s
+
+        # Project into token_z space via s_to_z_prod_in1.
+        # s_to_z_prod_in1.weight: (token_z, token_s)
+        s_to_z = affinity_mod.s_to_z_prod_in1.weight  # (token_z, token_s)
+        res_emb_z = (res_emb_s @ s_to_z.T).detach()  # (num_tokens, token_z)
+        embedding_tables["residue_embedding_z"] = res_emb_z
+    except AttributeError:
+        print("  WARNING: Could not extract residue embeddings from trunk.")
+
+    return affinity_mod, embedding_tables
 
 
 def _build_forward_kwargs(
@@ -192,6 +223,7 @@ def _run_svd(
     affinity_module,
     output_dir: Path,
     complex_name: str,
+    embedding_tables: dict | None = None,
 ):
     """Run SVD extraction for every layer×head and save CSV."""
     from interpretability.svd_extractor import extract_head_circuits
@@ -201,6 +233,12 @@ def _run_svd(
     num_layers = len(layers)
     # All tri_att_start heads have the same count.
     num_heads = layers[0].tri_att_start.mha.no_heads
+
+    # Prepare embedding tables for chemical projection.
+    # SVD directions are in token_z space, so use the z-projected table.
+    res_emb_z = None
+    if embedding_tables is not None:
+        res_emb_z = embedding_tables.get("residue_embedding_z")
 
     csv_path = output_dir / f"{complex_name}_svd.csv"
     with open(csv_path, "w", newline="") as f:
@@ -226,12 +264,10 @@ def _run_svd(
                 }
 
                 for dir_name, (circuit_type, direction) in direction_map.items():
-                    # classify_direction needs embedding tables which
-                    # the AffinityModule doesn't have.  Fall back to
-                    # a bare summary (no projection) to avoid crashing.
                     try:
                         label = classify_direction(
                             direction, affinity_module, top_k=3,
+                            residue_embedding_table=res_emb_z,
                         )
                     except (ValueError, RuntimeError):
                         label = "<no embedding tables available>"
@@ -246,6 +282,120 @@ def _run_svd(
                     ])
 
     print(f"  SVD analysis saved to {csv_path}")
+
+
+def _run_activation_svd(
+    instrumented_module,
+    forward_kwargs: dict,
+    interface_mask: torch.Tensor,
+    output_dir: Path,
+    complex_name: str,
+    embedding_tables: dict | None = None,
+) -> None:
+    """Run activation-level SVD on captured z-deltas and attention patterns.
+
+    Produces two CSVs:
+      {complex_name}_z_delta_svd.csv   — per-layer z-update decomposition
+      {complex_name}_attn_svd.csv      — per-(layer,head) attention pattern SVD
+
+    These complement the weight SVD (which is input-independent) by showing
+    what the model *actually computes* on this specific input.
+    """
+    from interpretability.svd_extractor import (
+        extract_attention_svd,
+        extract_z_delta_svd,
+        extract_head_circuits,
+    )
+    import torch.nn.functional as F
+
+    # Run forward pass to populate captured_z and captured_attn.
+    instrumented_module(**forward_kwargs)
+    layer_z = instrumented_module.captured_z
+    layer_attn = instrumented_module.captured_attn
+
+    # Get metadata for labelling token positions.
+    affinity_module = instrumented_module.module
+    num_layers = len(affinity_module.pairformer_stack.layers)
+    num_heads = affinity_module.pairformer_stack.layers[0].tri_att_start.mha.no_heads
+
+    # --- Z-delta SVD ---
+    z_delta_rows: list[dict] = []
+    for layer_idx in range(num_layers):
+        try:
+            result = extract_z_delta_svd(
+                layer_z, layer_idx, interface_mask=interface_mask, top_k=5,
+            )
+        except ValueError:
+            continue
+
+        sv = result["singular_values"]
+        channel_dirs = result["channel_dirs"]  # (k, token_z)
+
+        # Compare top channel direction with OV output directions from weight SVD.
+        ov_alignments: list[str] = []
+        if channel_dirs.shape[0] > 0:
+            top_channel = channel_dirs[0]  # (token_z,)
+            for head_idx in range(num_heads):
+                circuits = extract_head_circuits(affinity_module, layer_idx, head_idx)
+                ov_out = circuits["top_ov_output_dir"]
+                cos = F.cosine_similarity(
+                    top_channel.unsqueeze(0), ov_out.unsqueeze(0)
+                ).item()
+                ov_alignments.append(f"h{head_idx}:{cos:.3f}")
+
+        for rank_k in range(len(sv)):
+            top_i, top_j = result["top_pair_idx"][rank_k] if rank_k < len(result["top_pair_idx"]) else (-1, -1)
+            z_delta_rows.append({
+                "layer": layer_idx,
+                "rank": rank_k,
+                "singular_value": f"{sv[rank_k].item():.6f}",
+                "effective_rank": f"{result['effective_rank']:.4f}",
+                "top_pair_i": top_i,
+                "top_pair_j": top_j,
+                "ov_alignment": "; ".join(ov_alignments) if rank_k == 0 else "",
+            })
+
+    z_csv = output_dir / f"{complex_name}_z_delta_svd.csv"
+    if z_delta_rows:
+        with open(z_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(z_delta_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(z_delta_rows)
+        print(f"  Z-delta SVD saved to {z_csv}")
+
+    # --- Attention pattern SVD ---
+    attn_rows: list[dict] = []
+    for layer_idx in range(num_layers):
+        if layer_idx not in layer_attn:
+            continue
+        for direction_name in ("tri_att_start", "tri_att_end"):
+            head_dict = layer_attn[layer_idx].get(direction_name, {})
+            for head_idx in sorted(head_dict.keys()):
+                attn_w = head_dict[head_idx].unsqueeze(0)  # (1, N, N)
+                result = extract_attention_svd(attn_w, top_k=3)
+
+                sv = result["singular_values"]
+                for rank_k in range(len(sv)):
+                    q_idx = result["top_query_idx"][rank_k] if rank_k < len(result["top_query_idx"]) else -1
+                    k_idx = result["top_key_idx"][rank_k] if rank_k < len(result["top_key_idx"]) else -1
+                    attn_rows.append({
+                        "layer": layer_idx,
+                        "direction": direction_name,
+                        "head": head_idx,
+                        "rank": rank_k,
+                        "singular_value": f"{sv[rank_k].item():.6f}",
+                        "effective_rank": f"{result['effective_rank']:.4f}",
+                        "top_query_token": q_idx,
+                        "top_key_token": k_idx,
+                    })
+
+    attn_csv = output_dir / f"{complex_name}_attn_svd.csv"
+    if attn_rows:
+        with open(attn_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(attn_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(attn_rows)
+        print(f"  Attention SVD saved to {attn_csv}")
 
 
 def _run_patch(
@@ -313,6 +463,12 @@ def main():
         help="Run SVD circuit analysis (default: True).  Use --no-run_svd to skip.",
     )
     parser.add_argument(
+        "--run_activation_svd",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run activation-level SVD (default: True).  Use --no-run_activation_svd to skip.",
+    )
+    parser.add_argument(
         "--run_patch",
         default=None,
         help=(
@@ -350,7 +506,7 @@ def main():
     # 2. Load AffinityModule and wrap in InstrumentedAffinityModule
     # ---------------------------------------------------------------
     print(f"Loading AffinityModule from {checkpoint_path} ...")
-    affinity_module = _load_affinity_module(checkpoint_path, device)
+    affinity_module, embedding_tables = _load_affinity_module(checkpoint_path, device)
 
     from interpretability.hooks import InstrumentedAffinityModule
     instrumented = InstrumentedAffinityModule(affinity_module)
@@ -384,7 +540,18 @@ def main():
     # ---------------------------------------------------------------
     if args.run_svd:
         print("Running SVD circuit analysis ...")
-        _run_svd(affinity_module, output_dir, args.complex_name)
+        _run_svd(affinity_module, output_dir, args.complex_name,
+                 embedding_tables=embedding_tables)
+
+    # ---------------------------------------------------------------
+    # 5b. Activation SVD analysis
+    # ---------------------------------------------------------------
+    if args.run_activation_svd:
+        print("Running activation SVD analysis ...")
+        _run_activation_svd(
+            instrumented, forward_kwargs, interface_mask,
+            output_dir, args.complex_name, embedding_tables,
+        )
 
     # ---------------------------------------------------------------
     # 6. Causal patching (optional)

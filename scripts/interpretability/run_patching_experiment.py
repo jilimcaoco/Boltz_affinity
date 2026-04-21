@@ -397,7 +397,7 @@ def main() -> None:
     cached = torch.load(cached_path, map_location=args.device, weights_only=False)
 
     print(f"Loading AffinityModule from {args.checkpoint} ...")
-    affinity_module = _load_affinity_module(
+    affinity_module, _embedding_tables = _load_affinity_module(
         Path(args.checkpoint).expanduser(), args.device
     )
 

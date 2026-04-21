@@ -201,3 +201,164 @@ def extract_triangle_mult_circuits(
         "top_pout_dir": p_out_Vh[0, :].detach(),
         "top_gout_dir": g_out_Vh[0, :].detach(),
     }
+
+
+# -----------------------------------------------------------------------
+# Activation-level SVD
+# -----------------------------------------------------------------------
+
+
+def extract_attention_svd(
+    attention_weights: torch.Tensor,
+    top_k: int = 5,
+) -> dict:
+    """SVD-decompose a captured attention pattern matrix.
+
+    Parameters
+    ----------
+    attention_weights : torch.Tensor
+        Shape ``(B, N, N)`` — the softmax attention weights for one head
+        at one layer.  B is typically 1 for interpretability.
+    top_k : int
+        Number of singular triplets to return.
+
+    Returns
+    -------
+    dict
+        - ``singular_values``: top-k singular values (Tensor)
+        - ``query_dirs``: (top_k, N) — which query positions dominate
+        - ``key_dirs``: (top_k, N) — which key positions are attended to
+        - ``effective_rank``: scalar — sum(S)^2 / sum(S^2), measures
+          how concentrated the attention pattern is
+        - ``top_query_idx``: list[int] — argmax of each left singular
+          vector (which token position is the strongest "query")
+        - ``top_key_idx``: list[int] — argmax of each right singular
+          vector (which token position is the strongest "key")
+    """
+    # Use first batch element.
+    A = attention_weights[0].float()  # (N, N)
+
+    U, S, Vh = torch.linalg.svd(A, full_matrices=False)
+
+    k = min(top_k, len(S))
+    S_top = S[:k]
+    U_top = U[:, :k]   # (N, k)
+    Vh_top = Vh[:k, :]  # (k, N)
+
+    # Effective rank: (sum S)^2 / sum(S^2).  High = diffuse, low = concentrated.
+    s_sum = S.sum()
+    s_sq_sum = (S ** 2).sum()
+    effective_rank = (s_sum ** 2 / s_sq_sum.clamp(min=1e-12)).item()
+
+    top_query_idx = U_top.abs().argmax(dim=0).tolist()  # k entries
+    top_key_idx = Vh_top.abs().argmax(dim=1).tolist()    # k entries
+
+    return {
+        "singular_values": S_top.detach(),
+        "query_dirs": U_top.T.detach(),  # (k, N)
+        "key_dirs": Vh_top.detach(),      # (k, N)
+        "effective_rank": effective_rank,
+        "top_query_idx": top_query_idx,
+        "top_key_idx": top_key_idx,
+    }
+
+
+def extract_z_delta_svd(
+    layer_z_dict: dict[int, torch.Tensor],
+    layer_idx: int,
+    interface_mask: torch.Tensor | None = None,
+    top_k: int = 5,
+) -> dict:
+    """SVD-decompose the z update at a specific layer.
+
+    Computes Δz = z_layer - z_{layer-1}, reshapes to (N*N, token_z),
+    and decomposes to find the principal update directions in pair space.
+
+    Parameters
+    ----------
+    layer_z_dict : dict[int, torch.Tensor]
+        Mapping ``{layer_idx: z}`` from captured_z.  Must contain
+        ``layer_idx`` and ``layer_idx - 1``.
+    layer_idx : int
+        The layer whose update to analyze (must be >= 0).
+    interface_mask : torch.Tensor, optional
+        Boolean mask ``(B, N, N)`` — if provided, only interface pairs
+        contribute to the SVD.
+    top_k : int
+        Number of singular triplets to return.
+
+    Returns
+    -------
+    dict
+        - ``singular_values``: top-k singular values
+        - ``channel_dirs``: (top_k, token_z) — principal directions in
+          pair-representation channel space.  Compare with OV output
+          directions from weight SVD.
+        - ``spatial_dirs``: (top_k, N*N) — which (i,j) pairs received the
+          largest updates along each principal direction.
+        - ``effective_rank``: how many directions carry the update
+        - ``top_pair_idx``: list[(i, j)] — pair with largest weight in
+          each principal spatial direction
+    """
+    prev_key = layer_idx - 1
+    if prev_key not in layer_z_dict or layer_idx not in layer_z_dict:
+        raise ValueError(
+            f"layer_z_dict must contain keys {prev_key} and {layer_idx}. "
+            f"Available: {sorted(layer_z_dict.keys())}"
+        )
+
+    z_curr = layer_z_dict[layer_idx][0].float()   # (N, N, token_z)
+    z_prev = layer_z_dict[prev_key][0].float()     # (N, N, token_z)
+    delta = z_curr - z_prev                         # (N, N, token_z)
+
+    N = delta.shape[0]
+
+    # Optionally restrict to interface pairs only.
+    if interface_mask is not None:
+        mask_2d = interface_mask[0].bool()  # (N, N)
+        delta_flat = delta[mask_2d]  # (n_pairs, token_z)
+        pair_indices = mask_2d.nonzero(as_tuple=False)  # (n_pairs, 2)
+    else:
+        delta_flat = delta.reshape(N * N, -1)  # (N*N, token_z)
+        pair_indices = None
+
+    if delta_flat.shape[0] == 0:
+        return {
+            "singular_values": torch.zeros(0),
+            "channel_dirs": torch.zeros(0, delta.shape[-1]),
+            "spatial_dirs": torch.zeros(0, delta_flat.shape[0]),
+            "effective_rank": 0.0,
+            "top_pair_idx": [],
+        }
+
+    # SVD: delta_flat = U S Vh
+    # U columns: spatial directions (which pairs update most)
+    # Vh rows: channel directions (what direction in token_z space)
+    U, S, Vh = torch.linalg.svd(delta_flat, full_matrices=False)
+
+    k = min(top_k, len(S))
+    S_top = S[:k]
+    U_top = U[:, :k]    # (n_pairs, k)
+    Vh_top = Vh[:k, :]   # (k, token_z)
+
+    s_sum = S.sum()
+    s_sq_sum = (S ** 2).sum()
+    effective_rank = (s_sum ** 2 / s_sq_sum.clamp(min=1e-12)).item()
+
+    # Find which (i, j) pair has largest weight in each spatial direction.
+    top_pair_flat = U_top.abs().argmax(dim=0).tolist()  # k entries
+    if pair_indices is not None:
+        top_pair_idx = [
+            (pair_indices[idx, 0].item(), pair_indices[idx, 1].item())
+            for idx in top_pair_flat
+        ]
+    else:
+        top_pair_idx = [(idx // N, idx % N) for idx in top_pair_flat]
+
+    return {
+        "singular_values": S_top.detach(),
+        "channel_dirs": Vh_top.detach(),   # (k, token_z) — compare with weight SVD
+        "spatial_dirs": U_top.T.detach(),  # (k, n_pairs)
+        "effective_rank": effective_rank,
+        "top_pair_idx": top_pair_idx,
+    }

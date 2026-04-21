@@ -233,7 +233,8 @@ if [[ "$SKIP_ANALYSIS" -eq 0 ]]; then
                 --output_dir    "$RESULTS_DIR" \
                 --run_logit_lens \
                 --run_svd \
-                --device cpu 2>&1; then
+                --run_activation_svd \
+                --device "$DEVICE" 2>&1; then
             ANALYZED_OK=$((ANALYZED_OK + 1))
         else
             echo "    FAILED: $COMPLEX_NAME"
