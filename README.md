@@ -57,7 +57,7 @@ When using the `--use_msa_server` option with a server that requires authenticat
 
 ## Affinity Rescoring & Multi-Pocket Pipeline
 
-This repository includes an extended affinity rescoring module (`boltz rescore`) that adds four extra workflows on top of the standard `boltz predict` pipeline:
+This repository includes an extended affinity rescoring module (`boltz rescore`) that adds four extra workflows on top of the standard `boltz predict` pipeline — all affinity-only, no diffusion is re-run except in `multipocket`:
 
 | Command | Description |
 |---------|-------------|
@@ -66,11 +66,11 @@ This repository includes an extended affinity rescoring module (`boltz rescore`)
 | `boltz rescore receptor` | Virtual screening: score many MOL2 ligand poses against one receptor |
 | `boltz rescore multipocket` | **Alternative binding mode discovery**: run a full Boltz-2 prediction with N simultaneous ligand copies, extract each binding pocket, and score with the affinity head |
 
-### Quick Start
+The first run will auto-download the `boltz2_aff.ckpt` checkpoint (~1.5 GB) to `~/.boltz/`.
 
-#### Single Complex (`boltz rescore pdb`)
+### Single Complex (`boltz rescore pdb`)
 
-Score a pre-docked protein-ligand complex directly from a PDB or CIF file — no diffusion is run.
+Score a pre-docked protein-ligand complex directly from a PDB or CIF file.
 
 ```bash
 # Auto-detect protein/ligand chains and print scores
@@ -85,11 +85,16 @@ boltz rescore pdb --input complex.pdb \
 boltz rescore pdb --input complex.pdb \
   --ligand-smiles '{"B": "CCO"}' \
   --output result.json
+
+# Provide the full biological sequence (for structures with missing loops)
+boltz rescore pdb --input complex.pdb \
+  --reference-sequence '{"A": "MKTLLILTLVVA...FULL_SEQ_HERE"}'
+
+# Dry run — validate inputs without loading the model
+boltz rescore pdb --input complex.pdb --dry-run
 ```
 
-Output: affinity score (`affinity_pred_value`) and binding probability (`affinity_probability_binary`).
-
-#### Batch Scoring (`boltz rescore batch`)
+### Batch Scoring (`boltz rescore batch`)
 
 Score every PDB/CIF file in a directory in one pass.
 
@@ -102,9 +107,7 @@ boltz rescore batch --input-dir ./structures/ \
   --recursive --output results.xlsx --output-format excel
 ```
 
-Output: one row per complex with affinity scores and metadata.
-
-#### Virtual Screening (`boltz rescore receptor`)
+### Virtual Screening (`boltz rescore receptor`)
 
 Score many docked ligand poses from a MOL2 file against a single receptor structure.
 
@@ -124,14 +127,20 @@ boltz rescore receptor \
   --sort-by affinity_score
 ```
 
-Output: ranked CSV with per-ligand affinity scores and confidence metrics.
+### Manifest Mode (`boltz rescore manifest`)
 
-#### Multi-Pocket — Alternative Binding Mode Discovery (`boltz rescore multipocket`)
+Score complexes listed in a YAML manifest file.
+
+```bash
+boltz rescore manifest --manifest complexes.yaml --output-dir ./scores/
+```
+
+### Multi-Pocket — Alternative Binding Mode Discovery (`boltz rescore multipocket`)
 
 Run a full Boltz-2 structure prediction with N simultaneous ligand copies, extract each predicted binding pocket, and score each with the affinity head.
 
 ```bash
-# Predict 5 alternative binding poses and score each
+# Predict 5 alternative binding poses and score each (from PDB)
 boltz rescore multipocket \
   --receptor receptor.pdb \
   --ligand-smiles 'CC1=CC=CC=C1' \
@@ -146,12 +155,14 @@ boltz rescore multipocket \
   --output-dir ./mp_results/ \
   --use-msa-server
 
-# Rank by binding probability instead of predicted affinity
+# Rank by binding probability; use pre-downloaded checkpoints
 boltz rescore multipocket \
   --receptor receptor.pdb \
   --ligand-smiles 'CC1=CC=CC=C1' \
-  --n-pockets 5 \
+  --n-pockets 8 \
   --output-dir ./mp_results/ \
+  --checkpoint /path/to/boltz2_conf.ckpt \
+  --affinity-checkpoint /path/to/boltz2_aff.ckpt \
   --sort-by affinity_probability_binary
 ```
 
@@ -160,7 +171,92 @@ Output:
 - `mp_results/multipocket_scores.csv` — per-pocket affinity scores and confidence metrics
 - `mp_results/multipocket_report.html` — self-contained ranked HTML report
 
-For full documentation and Python API usage see [src/boltz/affinity_rescoring/README.md](src/boltz/affinity_rescoring/README.md).
+### Common Options
+
+All `boltz rescore` subcommands accept these flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--device` | `auto` | `cpu`, `cuda`, `mps`, or `auto` |
+| `--validation` | `moderate` | `strict`, `moderate`, or `lenient` |
+| `--checkpoint` | auto-download | Path to a custom `.ckpt` file |
+| `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
+
+### Python API
+
+```python
+from boltz.affinity_rescoring import AffinityRescorer
+
+rescorer = AffinityRescorer(device="auto")
+
+# Single complex
+result = rescorer.rescore_pdb("complex.pdb")
+print(f"Predicted pKd: {result.affinity_pred:.2f}")
+print(f"Binding probability: {result.affinity_probability_binary:.2f}")
+
+# Batch
+results = rescorer.rescore_directory("structures/", recursive=True)
+rescorer.export_results(results, "output.csv", format="csv")
+
+# Virtual screening
+scores = rescorer.rescore_receptor(
+    receptor_path="receptor.pdb",
+    ligands_path="ligands.mol2",
+    output_path="scores.csv",
+    sort_by="affinity_score",
+)
+
+# Multi-pocket
+from boltz.affinity_rescoring import MultiPocketPipeline
+
+pipeline = MultiPocketPipeline(affinity_checkpoint="auto", device="auto")
+report = pipeline.run(
+    receptor="receptor.pdb",
+    ligand_smiles="CC1=CC=CC=C1",
+    n_pockets=5,
+    output_dir="./mp_results/",
+    sort_by="affinity_pred",
+)
+for p in report.pockets:
+    print(
+        f"pocket {p.pocket_id}: pKd={p.affinity_pred:.2f}, "
+        f"P(bind)={p.affinity_probability_binary:.2f}"
+    )
+```
+
+### Configuration
+
+Persistent settings can be placed in `~/.boltz/rescore_config.yaml` or passed via `--config`:
+
+```yaml
+model:
+  device: auto
+  checkpoint: auto
+
+inference:
+  recycling_steps: 5
+  affinity_mw_correction: true
+
+validation:
+  level: moderate   # strict | moderate | lenient
+
+output:
+  format: csv
+  include_metadata: true
+```
+
+Environment variable overrides: `BOLTZ_RESCORE_CHECKPOINT`, `BOLTZ_RESCORE_DEVICE`, `BOLTZ_RESCORE_VALIDATION`, `BOLTZ_RESCORE_OUTPUT_FORMAT`.
+
+### Output Formats
+
+| Format | Extension | Use Case |
+|--------|-----------|----------|
+| JSON | `.json` | Full structured output with metadata |
+| JSONL | `.jsonl` | Streaming / line-by-line processing |
+| CSV | `.csv` | Spreadsheet analysis |
+| Parquet | `.parquet` | Large-scale data analysis |
+| SQLite | `.db` | Queryable database |
+| Excel | `.xlsx` | Reports with multiple sheets |
 
 ## Evaluation
 
