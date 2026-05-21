@@ -18,24 +18,114 @@ Boltz is a family of models for biomolecular interaction prediction. Boltz-1 was
 
 All the code and weights are provided under MIT license, making them freely available for both academic and commercial uses. For more information about the model, see the [Boltz-1](https://doi.org/10.1101/2024.11.19.624167) and [Boltz-2](https://doi.org/10.1101/2025.06.14.659707) technical reports. To discuss updates, tools and applications join our [Slack channel](https://boltz.bio/join-slack).
 
-## Installation
+## Installation & Getting Started
 
-> Note: we recommend installing boltz in a fresh python environment
+### Prerequisites
 
-Install boltz with PyPI (recommended):
+- Python 3.10–3.12
+- CUDA-capable GPU recommended (CPU works but is significantly slower)
+- [conda](https://docs.conda.io/en/latest/) or [venv](https://docs.python.org/3/library/venv.html) for environment isolation
 
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/jilimcaoco/Boltz_affinity.git
+cd Boltz_affinity
 ```
+
+### 2. Create a fresh Python environment
+
+```bash
+# conda (recommended)
+conda create -n boltz python=3.11 -y
+conda activate boltz
+
+# or venv
+python -m venv .venv && source .venv/bin/activate
+```
+
+### 3. Install the package
+
+**With CUDA support (recommended for GPU users):**
+
+```bash
+pip install -e ".[cuda]"
+```
+
+**CPU-only or non-CUDA GPU (e.g. Apple Silicon):**
+
+```bash
+pip install -e .
+```
+
+### 4. Verify the installation
+
+```bash
+boltz --help        # should print the CLI help
+boltz rescore --help
+```
+
+### 5. Download model weights
+
+Weights are downloaded automatically on first use to `~/.boltz/`. To trigger the download explicitly:
+
+```bash
+# Structure prediction checkpoint (~3 GB)
+boltz predict --help   # triggers lazy download check
+
+# Affinity rescoring checkpoint (~1.5 GB) — downloaded on first rescore call
+boltz rescore pdb --help
+```
+
+To use a custom cache directory, set `BOLTZ_CACHE_DIR` before running any command.
+
+### 6. Run your first prediction
+
+**Structure prediction from a YAML input:**
+
+```bash
+boltz predict examples/prot.yaml --use_msa_server --output-dir ./output/
+```
+
+**Affinity prediction (protein + ligand SMILES):**
+
+```bash
+boltz predict examples/affinity.yaml --use_msa_server --output-dir ./output/
+```
+
+The `examples/affinity.yaml` file looks like this — adapt it for your own system:
+
+```yaml
+version: 1
+sequences:
+  - protein:
+      id: A
+      sequence: MVTPEGNVSLVDESLLVG...   # your protein sequence
+  - ligand:
+      id: B
+      smiles: 'N[C@@H](Cc1ccc(O)cc1)C(=O)O'
+properties:
+  - affinity:
+      binder: B
+```
+
+**Rescore a pre-docked complex (no diffusion):**
+
+```bash
+boltz rescore pdb --input complex.pdb
+```
+
+See the [Affinity Rescoring & Multi-Pocket Pipeline](#affinity-rescoring--multi-pocket-pipeline) section below for all rescoring workflows.
+
+---
+
+### Installing from PyPI (upstream Boltz-2 only)
+
+If you only need the base Boltz-2 model without the affinity rescoring extensions in this repo:
+
+```bash
 pip install boltz[cuda] -U
 ```
-
-or directly from GitHub for daily updates:
-
-```
-git clone https://github.com/jwohlwend/boltz.git
-cd boltz; pip install -e .[cuda]
-```
-
-If you are installing on CPU-only or non-CUDA GPus hardware, remove `[cuda]` from the above commands. Note that the CPU version is significantly slower than the GPU version.
 
 ## Inference
 
