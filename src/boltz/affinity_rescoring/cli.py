@@ -535,3 +535,168 @@ def rescore_manifest(
     rescorer.export_results(results, output_file, format=output_format)
 
     click.echo(f"Processed {len(results)} complexes. Results: {output_file}")
+
+
+# ─── Multi-Pocket Command ────────────────────────────────────────────────────
+
+
+@rescore_cli.command("multipocket")
+@click.option(
+    "--receptor", "-r", default=None, type=click.Path(exists=True),
+    help="Receptor PDB/CIF file. Mutually exclusive with --receptor-sequence.",
+)
+@click.option(
+    "--receptor-sequence", default=None, type=str,
+    help=(
+        "Plain amino-acid sequence of the receptor (single-letter codes). "
+        "Use instead of --receptor when no PDB is available; Boltz will "
+        "fold the receptor from scratch together with the ligand copies. "
+        "Mutually exclusive with --receptor."
+    ),
+)
+@click.option(
+    "--ligand-smiles", "-s", required=True, type=str,
+    help="Ligand SMILES string (one ligand, replicated N times).",
+)
+@click.option(
+    "--n-pockets", "-n", default=5, type=int,
+    help="Number of ligand copies / candidate binding pockets (1..25).",
+)
+@click.option(
+    "--output-dir", "-o", required=True, type=click.Path(),
+    help="Output directory for structures, CSV, and HTML report.",
+)
+@click.option(
+    "--protein-chain", default=None,
+    help=(
+        "Protein chain ID. Auto-detected from PDB when --receptor is used. "
+        "Defaults to 'A' when using --receptor-sequence."
+    ),
+)
+@click.option(
+    "--reference-sequence", default=None,
+    help="Full protein sequence override for PDB inputs with missing loops.",
+)
+@click.option(
+    "--device", default="auto",
+    type=click.Choice(["auto", "cuda", "cpu", "mps"]),
+    help="Device for inference.",
+)
+@click.option(
+    "--checkpoint", "structure_checkpoint", default=None,
+    type=click.Path(exists=True),
+    help="Boltz-2 structure checkpoint (default: auto-download).",
+)
+@click.option(
+    "--affinity-checkpoint", default="auto",
+    help="Affinity checkpoint or 'auto' to download.",
+)
+@click.option(
+    "--cache-dir", default=None, type=click.Path(),
+    help="Boltz cache directory (default: ~/.boltz or $BOLTZ_CACHE).",
+)
+@click.option(
+    "--recycling-steps", default=3, type=int,
+    help="Trunk recycling steps for Boltz prediction.",
+)
+@click.option(
+    "--sampling-steps", default=200, type=int,
+    help="Diffusion sampling steps for Boltz prediction.",
+)
+@click.option(
+    "--msa", "msa_path", default=None, required=False,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to a pre-computed MSA file (.a3m or .csv) for the receptor. "
+         "If omitted, the MSA is generated automatically via the ColabFold "
+         "MMseqs2 server (affinity_rescoring/mmseqs2.py) and cached in "
+         "<output-dir>/receptor_msa.a3m.",
+)
+@click.option(
+    "--sort-by", default="affinity_pred",
+    type=click.Choice([
+        "affinity_pred", "affinity_probability_binary",
+        "interface_iptm", "boltz_confidence_score",
+    ]),
+    help="Column for ranking pockets in report.",
+)
+@click.option(
+    "--ascending/--descending", default=False,
+    help="Sort direction (default: descending = best first).",
+)
+@click.option(
+    "--keep-boltz-outputs/--no-keep-boltz-outputs", default=True,
+    help="Keep raw boltz prediction directory.",
+)
+@click.option(
+    "--log-level", default="INFO",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
+    help="Logging level.",
+)
+def multipocket(
+    receptor: Optional[str],
+    receptor_sequence: Optional[str],
+    ligand_smiles: str,
+    n_pockets: int,
+    output_dir: str,
+    protein_chain: Optional[str],
+    reference_sequence: Optional[str],
+    device: str,
+    structure_checkpoint: Optional[str],
+    affinity_checkpoint: str,
+    cache_dir: Optional[str],
+    recycling_steps: int,
+    sampling_steps: int,
+    msa_path: str,
+    sort_by: str,
+    ascending: bool,
+    keep_boltz_outputs: bool,
+    log_level: str,
+):
+    """Predict N binding pockets for a ligand and score each with the affinity head.
+
+    Provide the receptor as either a PDB/CIF file (--receptor) or a plain
+    amino-acid sequence (--receptor-sequence); exactly one is required.
+    """
+    setup_logging(log_level)
+
+    if receptor and receptor_sequence:
+        raise click.UsageError(
+            "--receptor and --receptor-sequence are mutually exclusive. "
+            "Provide exactly one."
+        )
+    if not receptor and not receptor_sequence:
+        raise click.UsageError(
+            "Provide either --receptor (PDB/CIF file) or "
+            "--receptor-sequence (amino-acid string)."
+        )
+
+    from boltz.affinity_rescoring.multipocket import MultiPocketPipeline
+
+    pipeline = MultiPocketPipeline(
+        affinity_checkpoint=affinity_checkpoint,
+        structure_checkpoint=structure_checkpoint,
+        device=device,
+        cache_dir=cache_dir,
+    )
+
+    report = pipeline.run(
+        receptor=receptor,
+        receptor_sequence=receptor_sequence,
+        ligand_smiles=ligand_smiles,
+        n_pockets=n_pockets,
+        output_dir=output_dir,
+        protein_chain=protein_chain,
+        recycling_steps=recycling_steps,
+        sampling_steps=sampling_steps,
+        msa_path=msa_path,
+        sort_by=sort_by,
+        ascending=ascending,
+        keep_boltz_outputs=keep_boltz_outputs,
+        reference_sequence=reference_sequence,
+    )
+
+    click.echo(f"\nMulti-pocket pipeline complete in {report.total_time_s:.1f}s")
+    click.echo(f"  Pockets extracted: {report.n_pockets_extracted}")
+    click.echo(f"  CSV:  {report.csv_path}")
+    click.echo(f"  HTML: {report.html_path}")
+    click.echo(f"  Structures: {report.structures_dir}")

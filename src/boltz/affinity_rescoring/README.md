@@ -1,14 +1,15 @@
 # Boltz Affinity Rescoring
 
-Affinity-only rescoring for protein-ligand complexes using the Boltz-2 affinity module. **Diffusion and confidence modules are intentionally disabled** — all predictions use pre-existing 3D coordinates fed directly through the trunk + affinity head.
+Affinity-only rescoring for protein-ligand complexes using the Boltz-2 affinity module, plus a full-pipeline mode for alternative binding pocket discovery.
 
 ## Overview
 
-Three workflows:
+Four workflows:
 
 - **Single Complex**: Score one protein-ligand complex from a PDB/CIF file
 - **Batch Processing**: Score all complexes in a directory  
 - **Virtual Screening**: Score multiple ligands (MOL2) against a single receptor
+- **Multi-Pocket**: Run the full Boltz-2 structure prediction with N simultaneous ligand copies to discover alternative binding modes, then score each pocket with the affinity head
 
 ## Installation
 
@@ -81,6 +82,47 @@ boltz rescore receptor \
 # Score complexes listed in a YAML manifest
 boltz rescore manifest --manifest complexes.yaml --output-dir ./scores/
 
+# ─── Multi-pocket (alternative binding mode discovery) ──────────
+# Run full Boltz-2 structure prediction with N ligand copies;
+# extract each predicted binding pose and score it.
+
+# From a PDB file (receptor structure known)
+boltz rescore multipocket \
+  --receptor receptor.pdb \
+  --ligand-smiles 'CC1=CC=CC=C1' \
+  --n-pockets 5 \
+  --output-dir ./mp_results/
+
+# From a sequence only (no structure needed — Boltz folds it)
+boltz rescore multipocket \
+  --receptor-sequence 'MKTLLILTLVVVTIVCLDLGYT...' \
+  --ligand-smiles 'CC1=CC=CC=C1' \
+  --n-pockets 5 \
+  --output-dir ./mp_seq_results/ \
+  --protein-chain A \
+  --use-msa-server
+
+# Override protein chain, use pre-downloaded checkpoints
+boltz rescore multipocket \
+  --receptor receptor.pdb \
+  --ligand-smiles 'CC1=CC=CC=C1' \
+  --n-pockets 8 \
+  --output-dir ./mp_results/ \
+  --protein-chain A \
+  --checkpoint /path/to/boltz2_conf.ckpt \
+  --affinity-checkpoint /path/to/boltz2_aff.ckpt \
+  --device cuda \
+  --sort-by affinity_probability_binary
+
+# Use MSA server for better structure quality; skip keeping raw Boltz outputs
+boltz rescore multipocket \
+  --receptor receptor.pdb \
+  --ligand-smiles 'CC1=CC=CC=C1' \
+  --n-pockets 5 \
+  --output-dir ./mp_results/ \
+  --use-msa-server \
+  --no-keep-boltz-outputs
+
 # ─── Common options (apply to all commands) ────────────────────
 #   --device cpu|cuda|mps|auto      Device (default: auto)
 #   --validation strict|moderate|lenient  (default: moderate)
@@ -128,6 +170,33 @@ for s in scores:
 # ─── Dry run (validate only) ─────────────────────────────────
 report = rescorer.dry_run("complex.pdb")
 print(report)  # chains, atom counts, validation issues
+
+# ─── Multi-pocket pipeline ────────────────────────────────────
+from boltz.affinity_rescoring import MultiPocketPipeline
+
+pipeline = MultiPocketPipeline(
+    affinity_checkpoint="auto",
+    device="auto",
+)
+report = pipeline.run(
+    receptor="receptor.pdb",
+    ligand_smiles="CC1=CC=CC=C1",
+    n_pockets=5,
+    output_dir="./mp_results/",
+    sort_by="affinity_pred",
+)
+
+# Summarise results
+print(f"Pockets extracted: {report.n_pockets_extracted}")
+for p in report.pockets:
+    print(
+        f"  pocket {p.pocket_id} (chain {p.chain_id}): "
+        f"pKd={p.affinity_pred:.2f}, P(bind)={p.affinity_probability_binary:.2f}, "
+        f"iPTM={p.interface_iptm:.3f}"
+    )
+# Outputs: mp_results/multipocket_scores.csv
+#          mp_results/multipocket_report.html
+#          mp_results/structures/pocket_NN_X.pdb  (one per pocket)
 ```
 
 ## Architecture
@@ -141,7 +210,8 @@ src/boltz/affinity_rescoring/
 ├── mol2_parser.py       # MOL2 multi-molecule parser
 ├── inference.py         # Model loading & inference engine
 ├── export.py            # Multi-format results export
-├── rescorer.py          # Main orchestrator
+├── rescorer.py          # Main orchestrator (single / batch / receptor)
+├── multipocket.py       # Multi-pocket prediction + scoring pipeline
 ├── cli.py               # Click CLI commands
 └── config.py            # YAML configuration management
 ```
@@ -152,9 +222,10 @@ src/boltz/affinity_rescoring/
 |-------|--------|---------|
 | **Input** | `parsers.py`, `mol2_parser.py` | Parse structure files |
 | **Validation** | `validation.py` | Validate atoms, chains, coordinates |
-| **Core** | `rescorer.py` | Orchestrate the pipeline |
+| **Core** | `rescorer.py` | Orchestrate single / batch / receptor rescoring |
+| **Multi-Pocket** | `multipocket.py` | Full prediction + pocket extraction + scoring |
 | **Inference** | `inference.py` | Device management, model loading, prediction |
-| **Output** | `export.py` | JSON, CSV, JSONL, Parquet, SQLite, Excel |
+| **Output** | `export.py` | JSON, CSV, JSONL, Parquet, SQLite, Excel, HTML |
 | **Config** | `config.py` | YAML + env var configuration |
 | **CLI** | `cli.py` | Command-line interface |
 
@@ -248,6 +319,74 @@ Main orchestrator class.
 | `dry_run(path)` | Validate without inference |
 | `export_results(results, path)` | Export to file |
 
+### `MultiPocketPipeline`
+
+Full Boltz-2 structure prediction + per-pocket rescoring.
+
+```python
+from boltz.affinity_rescoring import MultiPocketPipeline
+
+pipeline = MultiPocketPipeline(
+    affinity_checkpoint="auto",   # or path to boltz2_aff.ckpt
+    structure_checkpoint=None,    # or path to boltz2_conf.ckpt
+    device="auto",
+    cache_dir=None,               # defaults to ~/.boltz
+)
+
+# ── From a PDB file ────────────────────────────────────────────────
+report = pipeline.run(
+    receptor="receptor.pdb",
+    ligand_smiles="CC1=CC=CC=C1",
+    n_pockets=5,
+    output_dir="./mp_results/",
+    sort_by="affinity_pred",
+)
+
+# ── From a sequence (no PDB needed) ──────────────────────────────
+report = pipeline.run(
+    receptor_sequence="MKTLLILTLVVVTIVCLDLGYT...",
+    ligand_smiles="CC1=CC=CC=C1",
+    n_pockets=5,
+    output_dir="./mp_seq_results/",
+    protein_chain="A",            # defaults to 'A' when no PDB given
+    use_msa_server=True,
+)
+```
+
+**`run()` parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `receptor` | `str / Path / None` | PDB or CIF file. Either this or `receptor_sequence` required. |
+| `receptor_sequence` | `str / None` | Plain amino-acid sequence. Mutually exclusive with `receptor`. |
+| `ligand_smiles` | `str` | SMILES of the ligand (replicated N times). |
+| `n_pockets` | `int` | Number of ligand copies (1..25). |
+| `output_dir` | `str / Path` | Output directory. |
+| `protein_chain` | `str / None` | Chain ID; auto-detected from PDB, defaults to `'A'` for sequence input. |
+| `recycling_steps` | `int` | Trunk recycling iterations (default 3). |
+| `sampling_steps` | `int` | Diffusion steps (default 200). |
+| `use_msa_server` | `bool` | Query MMseqs2 server for MSA. |
+| `sort_by` | `str` | Ranking column. |
+| `ascending` | `bool` | Sort direction. |
+| `keep_boltz_outputs` | `bool` | Keep raw Boltz prediction dir. |
+| `reference_sequence` | `str / None` | Full-sequence override for PDB with gaps. |
+
+**`run()` returns a `MultiPocketReport`:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `receptor` | `str` | Path to source receptor (or `"sequence-only"`) |
+| `ligand_smiles` | `str` | Ligand SMILES used |
+| `n_pockets_requested` | `int` | N requested |
+| `n_pockets_extracted` | `int` | N successfully extracted |
+| `protein_chain` | `str` | Identified protein chain |
+| `pockets` | `List[PocketResult]` | Per-pocket results, sorted |
+| `csv_path` | `str` | Path to ranked CSV |
+| `html_path` | `str` | Path to HTML report |
+| `structures_dir` | `str` | Directory of extracted PDB files |
+| `boltz_prediction_dir` | `str` | Raw Boltz output directory |
+| `total_time_s` | `float` | Wall-clock time |
+
 ### `AffinityResult`
 
 Dataclass holding prediction results.
@@ -273,12 +412,52 @@ Dataclass for virtual screening results.
 | `confidence` | `float` | Prediction confidence |
 | `n_atoms` | `int` | Heavy atom count |
 
+### `PocketResult`
+
+Dataclass for one predicted binding pocket (multi-pocket pipeline).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pocket_id` | `int` | 0-based pocket index |
+| `chain_id` | `str` | Ligand chain ID in prediction |
+| `structure_path` | `str` | Path to extracted pocket PDB |
+| `affinity_pred` | `float` | Affinity-rescored pKd |
+| `affinity_std` | `float` | Prediction uncertainty |
+| `affinity_probability_binary` | `float` | Binding probability |
+| `boltz_confidence_score` | `float` | Boltz-2 overall confidence score |
+| `interface_iptm` | `float` | Per-pocket interface iPTM from Boltz |
+| `plddt_mean` | `float` | Mean pLDDT across pocket |
+| `n_ligand_atoms` | `int` | Heavy atom count |
+| `confidence_json_path` | `str` | Path to raw Boltz confidence JSON |
+| `validation_status` | `ValidationStatus` | SUCCESS/FAILED |
+
+## Multi-Pocket: How It Works
+
+The multi-pocket pipeline is fundamentally different from the rescoring workflows above:
+
+1. **Full Boltz-2 prediction** — `boltz predict` is called via subprocess with the receptor sequence and N copies of the ligand specified by identical SMILES but distinct chain IDs. The diffusion module places all N copies simultaneously, allowing the model to find N distinct plausible binding sites (pockets).
+2. **Pocket extraction** — `gemmi` reads the predicted PDB and writes one new PDB per ligand chain (`pocket_00_B.pdb`, `pocket_01_C.pdb`, …), each containing the full protein and a single ligand copy.
+3. **Affinity rescoring** — `AffinityRescorer` (trunk + affinity head, no diffusion) scores each pocket PDB with the ligand SMILES provided. The affinity model is loaded once and reused for all N pockets.
+4. **Confidence annotation** — the `pair_chains_iptm` value for the `[protein, ligand_chain]` pair is extracted from the Boltz confidence JSON and recorded as `interface_iptm`, providing a structure-quality metric independent of the affinity score.
+5. **Ranked outputs** — results are sorted by `--sort-by` and written as:
+   - `multipocket_scores.csv` — one row per pocket, all metrics
+   - `multipocket_report.html` — self-contained ranked table with links to structure files
+   - `structures/pocket_NN_X.pdb` — one extracted complex per pocket
+
+> **Note on pocket diversity**: N simultaneous copies encourage the model to explore different sites. However, for highly symmetric or single-site binders, multiple copies may converge to the same pocket. Visual inspection of the extracted PDB files is recommended.
+
+> **Chain ID limit**: A maximum of 25 ligand copies is supported (single-character chain IDs `A`–`Z`, minus the protein chain).
+
 ## Troubleshooting
 
 **Checkpoint download fails**: Set `BOLTZ_RESCORE_CHECKPOINT=/path/to/boltz2_aff.ckpt` or download manually from HuggingFace.
 
-**GPU out of memory**: Use `--device cpu` or reduce complex size. The affinity cropper limits to 256 tokens / 2048 atoms.
+**GPU out of memory**: Use `--device cpu` or reduce complex size. The affinity cropper limits to 256 tokens / 2048 atoms. For multi-pocket with large receptors, start with `--n-pockets 3` before scaling up.
 
 **MOL2 parsing errors**: Ensure MOL2 follows standard Tripos format with `@<TRIPOS>MOLECULE`, `@<TRIPOS>ATOM`, and `@<TRIPOS>BOND` sections.
 
 **Empty results**: Check validation report with `--dry-run`. Common issues: missing HETATM records, single-chain structures, non-standard residue names.
+
+**Multi-pocket: `boltz predict` fails**: Check `boltz_prediction/` for Boltz logs. Common issues: invalid SMILES, sequence too long, missing MSA (use `--use-msa-server`), or GPU out of memory.
+
+**Multi-pocket: prediction directory not found**: Boltz output directory naming follows `boltz_results_{target_id}/predictions/{target_id}/`. If the receptor filename contains special characters, these are sanitized to `[A-Za-z0-9-_]`. Check `--output-dir/boltz_prediction/` for the actual directory created.

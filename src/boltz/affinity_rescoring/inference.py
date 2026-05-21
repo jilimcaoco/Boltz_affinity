@@ -208,6 +208,32 @@ class AffinityModelManager:
                             f"Stripped unsupported checkpoint hparam: "
                             f"diffusion_process_args.{key}"
                         )
+            # ── Force v2 pairformer/MSA paths ──────────────────────
+            # The Boltz-2 affinity checkpoint was trained with the v2
+            # attention/MSA blocks but stores `pairformer_args` /
+            # `msa_args` without the `v2: True` flag.  Rebuilding the
+            # model from these hparams without the flag picks the v1
+            # AttentionPairBias (with an extra `norm_s` LayerNorm) and
+            # produces a state-dict mismatch.  Force v2 here.
+            # Note: hparams are typically stored as omegaconf DictConfig,
+            # so we use duck-typing rather than isinstance(dict).
+            for _args_key in ("pairformer_args", "msa_args"):
+                _args = hp.get(_args_key)
+                if _args is None:
+                    continue
+                try:
+                    _has_v2 = bool(_args.get("v2", False)) if hasattr(_args, "get") else False
+                    if not _has_v2:
+                        _args["v2"] = True
+                        patched = True
+                        logger.info(
+                            f"Forced checkpoint hparam {_args_key}.v2 = True "
+                            f"(Boltz-2 uses v2 attention blocks)"
+                        )
+                except Exception as _e:  # pragma: no cover
+                    logger.warning(
+                        f"Could not patch {_args_key}.v2 in checkpoint hparams: {_e}"
+                    )
 
         if patched:
             # Save patched checkpoint to a temp file for loading

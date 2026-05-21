@@ -191,6 +191,7 @@ class AffinityRescorer:
         ligand_smiles: Optional[Dict[str, str]] = None,
         use_msa_server: bool = False,
         reference_sequences: Optional[Dict[str, str]] = None,
+        msa_paths: Optional[Dict[str, str]] = None,
     ) -> AffinityResult:
         """
         Rescore a single PDB/CIF complex.
@@ -219,6 +220,11 @@ class AffinityRescorer:
             both ATOM-derived and SEQRES-derived sequences when
             provided, ensuring the model sees the complete biological
             sequence even if the PDB has missing loops.
+        msa_paths : dict, optional
+            Map of chain_id → path to a pre-computed MSA file (.a3m
+            or .csv).  When provided, the path is injected into the
+            generated YAML so ``process_input`` skips MSA generation
+            and the MSA server is never contacted.
 
         Returns
         -------
@@ -323,6 +329,7 @@ class AffinityRescorer:
                         ligand_smiles=ligand_smiles,
                         use_msa_server=use_msa_server,
                         pdb_atoms=atoms,  # pass PDB atoms for direct inference
+                        msa_paths=msa_paths,
                     )
 
                 result.inference_time_ms = inference_timer.elapsed_ms
@@ -749,7 +756,7 @@ class AffinityRescorer:
                 if chain_id in msa_paths:
                     continue
 
-            # ── 2. Generate MSA via server ────────────────────────────
+            # ── 2. Generate MSA via affinity_rescoring mmseqs2 ───────────
             if use_msa_server:
                 # Create a persistent cache dir so the MSA survives
                 # across ligand iterations.
@@ -764,29 +771,22 @@ class AffinityRescorer:
                 msa_dir.mkdir(parents=True, exist_ok=True)
 
                 logger.info(
-                    f"Generating MSA for chain {chain_id} via server "
-                    f"(this only happens once)…"
+                    f"Generating MSA for chain {chain_id} via ColabFold "
+                    f"MMseqs2 server (this only happens once)…"
                 )
                 try:
-                    from boltz.main import compute_msa
+                    from boltz.affinity_rescoring.mmseqs2 import precompute_msa
 
-                    target_id = f"receptor_{chain_id}"
-                    data = {target_id: sequences[chain_id]}
-                    compute_msa(
-                        data=data,
-                        target_id=target_id,
-                        msa_dir=msa_dir,
-                        msa_server_url="https://api.colabfold.com",
-                        msa_pairing_strategy="paired+unpaired",
+                    out_file = msa_dir / f"{chain_id}.a3m"
+                    precompute_msa(
+                        sequence=sequences[chain_id],
+                        out_path=out_file,
                     )
-
-                    # compute_msa writes <name>.csv files
-                    csv_out = msa_dir / f"{target_id}.csv"
-                    if csv_out.exists():
-                        msa_paths[chain_id] = str(csv_out.resolve())
+                    if out_file.exists():
+                        msa_paths[chain_id] = str(out_file.resolve())
                         logger.info(
                             f"MSA for chain {chain_id}: generated and "
-                            f"cached at {csv_out}"
+                            f"cached at {out_file}"
                         )
                     else:
                         logger.warning(

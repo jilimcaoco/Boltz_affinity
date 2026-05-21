@@ -288,6 +288,71 @@ class BatchSummary:
     throughput_complexes_per_second: float = 0.0
 
 
+# ─── Multi-Pocket Result ─────────────────────────────────────────────────────
+
+
+@dataclass
+class PocketResult:
+    """Score and metadata for one of N predicted ligand binding pockets."""
+
+    pocket_id: int  # 0-indexed pocket rank
+    chain_id: str  # ligand chain ID assigned in the multi-copy YAML
+    structure_path: str  # extracted pocket PDB (protein + this ligand copy)
+
+    # Affinity rescoring
+    affinity_pred: float = float("nan")
+    affinity_std: float = float("nan")
+    affinity_probability_binary: float = float("nan")
+
+    # Boltz-2 confidence (from full prediction confidence JSON)
+    boltz_confidence_score: float = float("nan")
+    interface_iptm: float = float("nan")  # pair_chains_iptm[protein][ligand]
+    plddt_mean: float = float("nan")
+
+    # Structure metadata
+    n_ligand_atoms: int = 0
+    confidence_json_path: str = ""
+
+    # Status
+    validation_status: ValidationStatus = ValidationStatus.SUCCESS
+    error_message: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "pocket_id": self.pocket_id,
+            "chain_id": self.chain_id,
+            "structure_path": self.structure_path,
+            "affinity_pred": self.affinity_pred,
+            "affinity_std": self.affinity_std,
+            "affinity_probability_binary": self.affinity_probability_binary,
+            "boltz_confidence_score": self.boltz_confidence_score,
+            "interface_iptm": self.interface_iptm,
+            "plddt_mean": self.plddt_mean,
+            "n_ligand_atoms": self.n_ligand_atoms,
+            "confidence_json_path": self.confidence_json_path,
+            "validation_status": self.validation_status.value,
+            "error_message": self.error_message,
+        }
+
+
+@dataclass
+class MultiPocketReport:
+    """Aggregated report from a multi-pocket prediction + rescoring run."""
+
+    receptor: str
+    ligand_smiles: str
+    n_pockets_requested: int
+    n_pockets_extracted: int
+    protein_chain: str
+    timestamp: str
+    pockets: List[PocketResult] = field(default_factory=list)
+    csv_path: str = ""
+    html_path: str = ""
+    structures_dir: str = ""
+    boltz_prediction_dir: str = ""
+    total_time_s: float = 0.0
+
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 
