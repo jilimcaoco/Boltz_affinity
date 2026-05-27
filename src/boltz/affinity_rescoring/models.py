@@ -364,7 +364,7 @@ class RescoreConfig(BaseModel):
     device: DeviceOption = DeviceOption.AUTO
 
     # Inference (affinity-only — no diffusion / confidence)
-    recycling_steps: int = 5
+    recycling_steps: int = 3
     affinity_mw_correction: bool = True
 
     # Validation
@@ -389,6 +389,10 @@ class RescoreConfig(BaseModel):
         if v < 1 or v > 20:
             raise ValueError(f"recycling_steps must be 1-20, got {v}")
         return v
+
+    # Convenience: 1 recycling step for ultra-fast screening throughput.
+    # Accuracy trade-off: ~5-10% degradation vs. the 3-step default.
+    ULTRA_FAST_RECYCLING_STEPS: int = 1
 
     # diffusion_samples and sampling_steps validators removed:
     # those fields no longer exist — this module is affinity-only.

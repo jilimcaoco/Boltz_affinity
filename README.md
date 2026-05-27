@@ -364,6 +364,10 @@ To encourage reproducibility and facilitate comparison with other models, on top
 
 If you're interested in retraining the model, currently for Boltz-1 but soon for Boltz-2, see our [training instructions](docs/training.md).
 
+For parameter-efficient finetuning of the **affinity** stack on your own
+labelled data (LoRA adapters, active-learning loops, custom losses), see
+the [LoRA user guide](docs/lora_userguide.md).
+
 
 ## Contributing
 

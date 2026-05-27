@@ -146,12 +146,21 @@ class AffinityRescorer:
         config: Optional[RescoreConfig] = None,
         cache_dir: Optional[str] = None,
         validation_level: str = "moderate",
+        recycling_steps: Optional[int] = None,
+        fast: bool = False,
+        lora: Optional[str] = None,
     ):
         self.config = config or RescoreConfig(
             checkpoint=checkpoint,
             device=DeviceOption(device),
             validation_level=ValidationLevel(validation_level),
         )
+        # fast=True → 1 recycling step for maximum throughput.
+        # explicit recycling_steps overrides fast.
+        if fast and recycling_steps is None:
+            self.config.recycling_steps = 1
+        elif recycling_steps is not None:
+            self.config.recycling_steps = recycling_steps
 
         self._cache_dir = Path(
             cache_dir or os.environ.get("BOLTZ_CACHE", "~/.boltz")
@@ -170,6 +179,11 @@ class AffinityRescorer:
 
         # Eagerly loaded model for direct inference (loaded on first use)
         self._loaded_model = None
+
+        # Optional LoRA adapter to apply post-load (name or directory path).
+        # Resolved via boltz.lora.default_registry() unless an absolute
+        # directory path is given.
+        self._lora = lora or os.environ.get("BOLTZ_RESCORE_LORA")
 
         # Results cache
         self._last_results: List[AffinityResult] = []
@@ -815,6 +829,17 @@ class AffinityRescorer:
             checkpoint_path=self._checkpoint if self._checkpoint != "auto" else None,
             affinity_mw_correction=self.config.affinity_mw_correction,
         )
+
+        if self._lora:
+            # Lazy import keeps boltz.lora optional at runtime.
+            from boltz.lora import load_adapter_into_model
+
+            adapter = load_adapter_into_model(self._loaded_model, self._lora)
+            logger.info(
+                "Applied LoRA adapter '%s' (rank=%d) to affinity model.",
+                adapter.name, adapter.config.rank,
+            )
+
         return self._loaded_model
 
     def _run_boltz_prediction(

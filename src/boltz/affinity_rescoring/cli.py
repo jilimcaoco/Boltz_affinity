@@ -92,6 +92,19 @@ def rescore_cli():
          'missing loops / incomplete structures.',
 )
 @click.option(
+    "--recycling-steps", default=None, type=int,
+    help="Trunk recycling steps (default: 3). Lower = faster, less accurate.",
+)
+@click.option(
+    "--fast", is_flag=True, default=False,
+    help="Ultra-fast mode: 1 recycling step. ~3x faster, minor accuracy trade-off.",
+)
+@click.option(
+    "--use-lora", "use_lora", default=None,
+    help="Name of a registered LoRA adapter (or path to an adapter directory) "
+         "to apply to the affinity model before scoring.",
+)
+@click.option(
     "--log-level", default="INFO",
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
     help="Logging level.",
@@ -109,6 +122,9 @@ def rescore_pdb(
     dry_run: bool,
     use_msa_server: bool,
     reference_sequence: Optional[str],
+    recycling_steps: Optional[int],
+    fast: bool,
+    use_lora: Optional[str],
     log_level: str,
 ):
     """Rescore a single PDB/CIF protein-ligand complex."""
@@ -120,6 +136,9 @@ def rescore_pdb(
         checkpoint=checkpoint,
         device=device,
         validation_level=validation,
+        recycling_steps=recycling_steps,
+        fast=fast,
+        lora=use_lora,
     )
 
     # Parse ligand chains
@@ -240,6 +259,18 @@ def rescore_pdb(
     "--use-msa-server", is_flag=True, default=False,
 )
 @click.option(
+    "--recycling-steps", default=None, type=int,
+    help="Trunk recycling steps (default: 3). Lower = faster, less accurate.",
+)
+@click.option(
+    "--fast", is_flag=True, default=False,
+    help="Ultra-fast mode: 1 recycling step. ~3x faster, minor accuracy trade-off.",
+)
+@click.option(
+    "--use-lora", "use_lora", default=None,
+    help="LoRA adapter name (or path) to apply before scoring.",
+)
+@click.option(
     "--log-level", default="INFO",
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
 )
@@ -253,6 +284,9 @@ def rescore_batch(
     checkpoint: str,
     ligand_smiles: Optional[str],
     use_msa_server: bool,
+    recycling_steps: Optional[int],
+    fast: bool,
+    use_lora: Optional[str],
     log_level: str,
 ):
     """Rescore all PDB/CIF files in a directory."""
@@ -265,6 +299,9 @@ def rescore_batch(
         checkpoint=checkpoint,
         device=device,
         validation_level=validation,
+        recycling_steps=recycling_steps,
+        fast=fast,
+        lora=use_lora,
     )
 
     smiles_dict = None
@@ -365,6 +402,19 @@ def rescore_batch(
          "Pre-compute on a login node, then pass the directory here.",
 )
 @click.option(
+    "--recycling-steps", default=None, type=int,
+    help="Trunk recycling steps (default: 3). Lower = faster, less accurate.",
+)
+@click.option(
+    "--fast", is_flag=True, default=False,
+    help="Ultra-fast mode: 1 recycling step. ~3x faster. Recommended for "
+         "initial large-scale screening; re-score top hits at default.",
+)
+@click.option(
+    "--use-lora", "use_lora", default=None,
+    help="LoRA adapter name (or path) to apply before scoring.",
+)
+@click.option(
     "--log-level", default="INFO",
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
 )
@@ -381,6 +431,9 @@ def rescore_receptor(
     reference_sequence: Optional[str],
     use_msa_server: bool,
     msa_directory: Optional[str],
+    recycling_steps: Optional[int],
+    fast: bool,
+    use_lora: Optional[str],
     log_level: str,
 ):
     """Score a receptor against multiple ligands from MOL2 file."""
@@ -392,6 +445,9 @@ def rescore_receptor(
         checkpoint=checkpoint,
         device=device,
         validation_level=validation,
+        recycling_steps=recycling_steps,
+        fast=fast,
+        lora=use_lora,
     )
 
     # Parse reference sequences
@@ -466,6 +522,8 @@ def rescore_receptor(
 @click.option("--device", default="auto")
 @click.option("--checkpoint", default="auto")
 @click.option("--use-msa-server", is_flag=True, default=False)
+@click.option("--use-lora", "use_lora", default=None,
+              help="LoRA adapter name (or path) to apply before scoring.")
 @click.option("--log-level", default="INFO")
 def rescore_manifest(
     manifest: str,
@@ -474,6 +532,7 @@ def rescore_manifest(
     device: str,
     checkpoint: str,
     use_msa_server: bool,
+    use_lora: Optional[str],
     log_level: str,
 ):
     """Rescore complexes listed in a YAML manifest."""
@@ -495,6 +554,7 @@ def rescore_manifest(
     rescorer = AffinityRescorer(
         checkpoint=checkpoint,
         device=device,
+        lora=use_lora,
     )
 
     out_dir = Path(output_dir)

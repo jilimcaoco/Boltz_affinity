@@ -31,7 +31,7 @@ DEFAULT_CONFIG = {
         "device": "auto",
     },
     "inference": {
-        "recycling_steps": 5,
+        "recycling_steps": 3,
         "affinity_mw_correction": True,
         # NOTE: diffusion_samples and sampling_steps intentionally removed.
         # This module is affinity-only — no diffusion pipeline.

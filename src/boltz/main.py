@@ -821,6 +821,13 @@ try:
 except ImportError:
     pass  # affinity_rescoring module not installed
 
+# Register the LoRA CLI subcommand
+try:
+    from boltz.lora.cli import lora_cli
+    cli.add_command(lora_cli)
+except ImportError:
+    pass  # boltz.lora module not present
+
 
 @cli.command()
 @click.argument("data", type=click.Path(exists=True))
@@ -1047,6 +1054,13 @@ except ImportError:
     is_flag=True,
     help=" to dump the s and z embeddings into a npz file. Default is False.",
 )
+@click.option(
+    "--use_lora",
+    type=str,
+    default=None,
+    help="LoRA adapter name (registered in $BOLTZ_LORA_DIR) or path to an "
+         "adapter directory; applied to the affinity model post-load.",
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1085,6 +1099,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
     write_embeddings: bool = False,
+    use_lora: Optional[str] = None,
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1333,6 +1348,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         )
         model_module.eval()
 
+        if use_lora:
+            from boltz.lora import load_adapter_into_model
+            load_adapter_into_model(model_module, use_lora)
+
         # Compute structure predictions
         trainer.predict(
             model_module,
@@ -1409,6 +1428,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             affinity_mw_correction=affinity_mw_correction,
         )
         model_module.eval()
+
+        if use_lora:
+            from boltz.lora import load_adapter_into_model
+            load_adapter_into_model(model_module, use_lora)
 
         trainer.callbacks[0] = pred_writer
         trainer.predict(

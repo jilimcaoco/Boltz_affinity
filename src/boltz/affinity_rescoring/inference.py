@@ -363,11 +363,11 @@ def _get_module(model: Any, attr: str) -> Any:
     return mod
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def affinity_forward(
     model: Any,
     feats: Dict[str, Tensor],
-    recycling_steps: int = 5,
+    recycling_steps: int = 3,
 ) -> Dict[str, Any]:
     """Run trunk + affinity head, skipping diffusion and confidence.
 
@@ -570,7 +570,7 @@ def run_direct_affinity_inference(
     work_dir: Optional[Path] = None,
     use_msa_server: bool = False,
     msa_server_url: str = "https://api.colabfold.com",
-    recycling_steps: int = 5,
+    recycling_steps: int = 3,
     device: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the complete direct affinity inference pipeline.
