@@ -356,3 +356,128 @@ def precompute_msa(
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return str(out_path.resolve())
+
+
+# ─── Standalone CLI ─────────────────────────────────────────────────────────
+#
+# Usage:
+#     python -m boltz.affinity_rescoring.mmseqs2 \
+#         --sequence MKTL... --out /shared/msa_cache/<name>.a3m
+#
+# Pre-compute exactly one MSA per unique sequence and stash it in your
+# shared cache. This is the *only* sanctioned way to call the ColabFold
+# MMseqs2 endpoint from this fork — every other pipeline reads the
+# resulting .a3m via boltz.affinity_rescoring.msa_cache.find_msa.
+
+def _cli_main() -> int:  # pragma: no cover - thin wrapper
+    import argparse
+
+    p = argparse.ArgumentParser(
+        description=(
+            "Pre-compute a Boltz MSA for a single sequence via the "
+            "ColabFold MMseqs2 server. Writes a canonical "
+            "<sha256[:16]>.a3m by default and symlinks any user-provided "
+            "filename so downstream code paths discover it."
+        ),
+    )
+    p.add_argument("--sequence", "-s",
+                   help="Amino-acid sequence to search (mutually exclusive "
+                        "with --sequence-file).")
+    p.add_argument("--sequence-file",
+                   help="Path to a file whose contents are the sequence.")
+    p.add_argument("--out", "-o", required=False,
+                   help="Output .a3m path. If omitted, defaults to "
+                        "<cache-dir>/<sha256[:16]>.a3m.")
+    p.add_argument("--cache-dir", "-d", default=None,
+                   help="Directory for the canonical hash-named MSA file. "
+                        "Defaults to the parent of --out (or the first "
+                        "entry of $BOLTZ_MSA_CACHE_DIR).")
+    p.add_argument("--host-url", default="https://api.colabfold.com",
+                   help="ColabFold API endpoint.")
+    p.add_argument("--username", default=None)
+    p.add_argument("--password", default=None)
+    p.add_argument("--chain-id", default=None,
+                   help="Optional chain id used for legacy-name symlinks.")
+    p.add_argument("--target", default=None,
+                   help="Optional target name used for legacy "
+                        "<target>_<chain>.a3m symlinks.")
+    p.add_argument("--force", action="store_true", default=False,
+                   help="Re-fetch even if a cached file already exists.")
+    args = p.parse_args()
+
+    if not (args.sequence or args.sequence_file):
+        p.error("--sequence or --sequence-file is required")
+    if args.sequence and args.sequence_file:
+        p.error("--sequence and --sequence-file are mutually exclusive")
+
+    sequence = args.sequence
+    if args.sequence_file:
+        from pathlib import Path as _P
+        sequence = _P(args.sequence_file).read_text().strip()
+
+    from boltz.affinity_rescoring.msa_cache import (
+        canonical_msa_path,
+        default_cache_dirs,
+        find_msa,
+        write_legacy_symlinks,
+    )
+    from pathlib import Path as _P
+
+    cache_dir = None
+    if args.cache_dir:
+        cache_dir = _P(args.cache_dir)
+    elif args.out:
+        cache_dir = _P(args.out).expanduser().resolve().parent
+    else:
+        dirs = default_cache_dirs()
+        if not dirs:
+            p.error(
+                "No --cache-dir, no --out, and $BOLTZ_MSA_CACHE_DIR is "
+                "unset — nowhere to write the MSA."
+            )
+        cache_dir = dirs[0]
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    canonical = canonical_msa_path(sequence, cache_dir)
+
+    if not args.force:
+        hit = find_msa(
+            sequence=sequence,
+            msa_dirs=[cache_dir],
+            chain_id=args.chain_id,
+            target=args.target,
+        )
+        if hit is not None:
+            print(f"[cached] {hit}")
+            if args.out:
+                out = _P(args.out).expanduser()
+                if not out.exists():
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        out.symlink_to(hit)
+                    except OSError:
+                        out.write_bytes(hit.read_bytes())
+            return 0
+
+    precompute_msa(
+        sequence=sequence,
+        out_path=canonical,
+        host_url=args.host_url,
+        msa_server_username=args.username,
+        msa_server_password=args.password,
+    )
+    write_legacy_symlinks(canonical, chain_id=args.chain_id, target=args.target)
+    if args.out:
+        out = _P(args.out).expanduser()
+        if out.resolve() != canonical.resolve() and not out.exists():
+            out.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                out.symlink_to(canonical)
+            except OSError:
+                out.write_bytes(canonical.read_bytes())
+    print(str(canonical.resolve()))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(_cli_main())

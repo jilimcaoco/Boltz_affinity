@@ -25,6 +25,40 @@ def setup_logging(log_level: str) -> None:
     )
 
 
+def _guard_msa_server_flag(use_msa_server: bool) -> None:
+    """Reject ``--use-msa-server`` early with the canonical error message.
+
+    The ColabFold public MSA server is disabled in this fork — see
+    :mod:`boltz.affinity_rescoring.msa_cache` for the precompute workflow.
+    Each ``rescore *`` subcommand calls this guard so the error surface is
+    identical regardless of which subcommand was invoked.
+    """
+    if not use_msa_server:
+        return
+    from boltz.affinity_rescoring.msa_cache import raise_msa_server_disabled
+    try:
+        raise_msa_server_disabled()
+    except Exception as exc:  # noqa: BLE001
+        raise click.UsageError(str(exc)) from exc
+
+
+def _guard_lora_finetune_flags(
+    use_lora: Optional[str], use_finetune: Optional[str],
+) -> None:
+    """Reject combining ``--use-lora`` with ``--use-finetune``.
+
+    The two are different fine-tuning regimes (low-rank residual vs full
+    weight update) and stacking them is not supported. Surface a clear
+    UsageError before any model is loaded.
+    """
+    if use_lora and use_finetune:
+        msg = (
+            "--use-lora and --use-finetune are mutually exclusive; pick "
+            "one. (Adapter composition is not supported.)"
+        )
+        raise click.UsageError(msg)
+
+
 @click.group("rescore")
 def rescore_cli():
     """Protein-ligand affinity rescoring using the Boltz-2 affinity module."""
@@ -83,7 +117,17 @@ def rescore_cli():
 )
 @click.option(
     "--use-msa-server", is_flag=True, default=False,
-    help="Use MSA server for sequence search.",
+    help="[DISABLED in this fork] Pre-compute MSAs with "
+         "`python -m boltz.affinity_rescoring.mmseqs2` and point "
+         "--msa-directory (or $BOLTZ_MSA_CACHE_DIR) at the cache instead.",
+)
+@click.option(
+    "--msa-directory", default=None,
+    type=click.Path(exists=False),
+    help="Directory with pre-computed MSA files (.a3m or .csv). "
+         "Accepts canonical hash files (<sha256>.a3m) or legacy "
+         "<target>_<chain>.a3m / <chain>.a3m names. "
+         "$BOLTZ_MSA_CACHE_DIR is also searched.",
 )
 @click.option(
     "--reference-sequence", default=None,
@@ -105,6 +149,12 @@ def rescore_cli():
          "to apply to the affinity model before scoring.",
 )
 @click.option(
+    "--use-finetune", "use_finetune", default=None,
+    help="Name of a registered full fine-tune (or path to its directory) "
+         "to apply to the affinity model before scoring. "
+         "Mutually exclusive with --use-lora.",
+)
+@click.option(
     "--log-level", default="INFO",
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
     help="Logging level.",
@@ -121,14 +171,18 @@ def rescore_pdb(
     checkpoint: str,
     dry_run: bool,
     use_msa_server: bool,
+    msa_directory: Optional[str],
     reference_sequence: Optional[str],
     recycling_steps: Optional[int],
     fast: bool,
     use_lora: Optional[str],
+    use_finetune: Optional[str],
     log_level: str,
 ):
     """Rescore a single PDB/CIF protein-ligand complex."""
     setup_logging(log_level)
+    _guard_msa_server_flag(use_msa_server)
+    _guard_lora_finetune_flags(use_lora, use_finetune)
 
     from boltz.affinity_rescoring import AffinityRescorer
 
@@ -139,6 +193,7 @@ def rescore_pdb(
         recycling_steps=recycling_steps,
         fast=fast,
         lora=use_lora,
+        finetune=use_finetune,
     )
 
     # Parse ligand chains
@@ -195,6 +250,7 @@ def rescore_pdb(
         output_format=output_format,
         ligand_smiles=smiles_dict,
         use_msa_server=use_msa_server,
+        msa_directory=msa_directory,
         reference_sequences=ref_seqs,
     )
 
@@ -257,6 +313,15 @@ def rescore_pdb(
 )
 @click.option(
     "--use-msa-server", is_flag=True, default=False,
+    help="[DISABLED in this fork] See `boltz.affinity_rescoring.msa_cache`.",
+)
+@click.option(
+    "--msa-directory", default=None,
+    type=click.Path(exists=False),
+    help="Directory with pre-computed MSA files (.a3m or .csv). "
+         "Used for every complex in the batch. Accepts canonical "
+         "hash files (<sha256>.a3m) or legacy <target>_<chain>.a3m "
+         "/ <chain>.a3m names. $BOLTZ_MSA_CACHE_DIR is also searched.",
 )
 @click.option(
     "--recycling-steps", default=None, type=int,
@@ -269,6 +334,11 @@ def rescore_pdb(
 @click.option(
     "--use-lora", "use_lora", default=None,
     help="LoRA adapter name (or path) to apply before scoring.",
+)
+@click.option(
+    "--use-finetune", "use_finetune", default=None,
+    help="Full fine-tune name (or path) to apply before scoring. "
+         "Mutually exclusive with --use-lora.",
 )
 @click.option(
     "--log-level", default="INFO",
@@ -284,13 +354,17 @@ def rescore_batch(
     checkpoint: str,
     ligand_smiles: Optional[str],
     use_msa_server: bool,
+    msa_directory: Optional[str],
     recycling_steps: Optional[int],
     fast: bool,
     use_lora: Optional[str],
+    use_finetune: Optional[str],
     log_level: str,
 ):
     """Rescore all PDB/CIF files in a directory."""
     setup_logging(log_level)
+    _guard_msa_server_flag(use_msa_server)
+    _guard_lora_finetune_flags(use_lora, use_finetune)
 
     from boltz.affinity_rescoring import AffinityRescorer
     from boltz.affinity_rescoring.export import compute_batch_summary
@@ -302,6 +376,7 @@ def rescore_batch(
         recycling_steps=recycling_steps,
         fast=fast,
         lora=use_lora,
+        finetune=use_finetune,
     )
 
     smiles_dict = None
@@ -319,6 +394,7 @@ def rescore_batch(
         recursive=recursive,
         ligand_smiles=smiles_dict,
         use_msa_server=use_msa_server,
+        msa_directory=msa_directory,
     )
 
     # Print summary
@@ -390,8 +466,8 @@ def rescore_batch(
 )
 @click.option(
     "--use-msa-server", is_flag=True, default=False,
-    help="Use MSA server for sequence search. Only needed when "
-         "--msa-directory is not provided.",
+    help="[DISABLED in this fork] Pre-compute MSAs and pass them via "
+         "--msa-directory (or $BOLTZ_MSA_CACHE_DIR).",
 )
 @click.option(
     "--msa-directory", default=None,
@@ -415,6 +491,11 @@ def rescore_batch(
     help="LoRA adapter name (or path) to apply before scoring.",
 )
 @click.option(
+    "--use-finetune", "use_finetune", default=None,
+    help="Full fine-tune name (or path) to apply before scoring. "
+         "Mutually exclusive with --use-lora.",
+)
+@click.option(
     "--log-level", default="INFO",
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
 )
@@ -434,10 +515,13 @@ def rescore_receptor(
     recycling_steps: Optional[int],
     fast: bool,
     use_lora: Optional[str],
+    use_finetune: Optional[str],
     log_level: str,
 ):
     """Score a receptor against multiple ligands from MOL2 file."""
     setup_logging(log_level)
+    _guard_msa_server_flag(use_msa_server)
+    _guard_lora_finetune_flags(use_lora, use_finetune)
 
     from boltz.affinity_rescoring import AffinityRescorer
 
@@ -448,6 +532,7 @@ def rescore_receptor(
         recycling_steps=recycling_steps,
         fast=fast,
         lora=use_lora,
+        finetune=use_finetune,
     )
 
     # Parse reference sequences
@@ -521,9 +606,13 @@ def rescore_receptor(
 )
 @click.option("--device", default="auto")
 @click.option("--checkpoint", default="auto")
-@click.option("--use-msa-server", is_flag=True, default=False)
+@click.option("--use-msa-server", is_flag=True, default=False,
+              help="[DISABLED in this fork] See msa_cache.py policy.")
 @click.option("--use-lora", "use_lora", default=None,
               help="LoRA adapter name (or path) to apply before scoring.")
+@click.option("--use-finetune", "use_finetune", default=None,
+              help="Full fine-tune name (or path) to apply before scoring. "
+                   "Mutually exclusive with --use-lora.")
 @click.option("--log-level", default="INFO")
 def rescore_manifest(
     manifest: str,
@@ -533,10 +622,13 @@ def rescore_manifest(
     checkpoint: str,
     use_msa_server: bool,
     use_lora: Optional[str],
+    use_finetune: Optional[str],
     log_level: str,
 ):
     """Rescore complexes listed in a YAML manifest."""
     setup_logging(log_level)
+    _guard_msa_server_flag(use_msa_server)
+    _guard_lora_finetune_flags(use_lora, use_finetune)
     import yaml
 
     with open(manifest) as f:
@@ -555,6 +647,7 @@ def rescore_manifest(
         checkpoint=checkpoint,
         device=device,
         lora=use_lora,
+        finetune=use_finetune,
     )
 
     out_dir = Path(output_dir)

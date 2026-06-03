@@ -149,6 +149,7 @@ class AffinityRescorer:
         recycling_steps: Optional[int] = None,
         fast: bool = False,
         lora: Optional[str] = None,
+        finetune: Optional[str] = None,
     ):
         self.config = config or RescoreConfig(
             checkpoint=checkpoint,
@@ -185,6 +186,17 @@ class AffinityRescorer:
         # directory path is given.
         self._lora = lora or os.environ.get("BOLTZ_RESCORE_LORA")
 
+        # Optional full fine-tune to apply post-load. Mutually exclusive
+        # with ``self._lora`` — checked here so the error surfaces before
+        # any model is loaded.
+        self._finetune = finetune or os.environ.get("BOLTZ_RESCORE_FINETUNE")
+        if self._lora and self._finetune:
+            msg = (
+                "AffinityRescorer received both 'lora' and 'finetune'; "
+                "these are mutually exclusive. Pass only one."
+            )
+            raise ValueError(msg)
+
         # Results cache
         self._last_results: List[AffinityResult] = []
 
@@ -206,6 +218,7 @@ class AffinityRescorer:
         use_msa_server: bool = False,
         reference_sequences: Optional[Dict[str, str]] = None,
         msa_paths: Optional[Dict[str, str]] = None,
+        msa_directory: Optional[str | Path] = None,
     ) -> AffinityResult:
         """
         Rescore a single PDB/CIF complex.
@@ -334,6 +347,24 @@ class AffinityRescorer:
 
                 ligand_smiles = resolved_smiles
 
+                # Step 6b: Resolve MSAs from --msa-directory if needed
+                if msa_paths is None and (msa_directory is not None or not use_msa_server):
+                    try:
+                        msa_paths = self._resolve_msa_paths(
+                            sequences=sequences,
+                            protein_chains=chain_assignment.protein_chains,
+                            use_msa_server=use_msa_server,
+                            msa_directory=msa_directory,
+                        )
+                    except Exception as msa_err:
+                        # Surface as a failure so the row reports a clean error
+                        # rather than ColabFold being silently invoked downstream.
+                        result.validation_status = ValidationStatus.FAILED
+                        result.error_message = (
+                            f"MSA resolution failed: {msa_err}"
+                        )
+                        return result
+
                 # Step 7: Create temporary YAML and run prediction
                 with Timer() as inference_timer:
                     affinity_output = self._run_boltz_prediction(
@@ -407,6 +438,7 @@ class AffinityRescorer:
         output_format: str = "csv",
         ligand_smiles: Optional[Dict[str, str]] = None,
         use_msa_server: bool = False,
+        msa_directory: Optional[str | Path] = None,
     ) -> List[AffinityResult]:
         """
         Rescore a batch of PDB/CIF complexes.
@@ -448,6 +480,7 @@ class AffinityRescorer:
                     ligand_chains=ligand_chains,
                     ligand_smiles=ligand_smiles,
                     use_msa_server=use_msa_server,
+                    msa_directory=msa_directory,
                 )
                 results.append(result)
             except Exception as e:
@@ -477,6 +510,7 @@ class AffinityRescorer:
         recursive: bool = False,
         ligand_smiles: Optional[Dict[str, str]] = None,
         use_msa_server: bool = False,
+        msa_directory: Optional[str | Path] = None,
     ) -> List[AffinityResult]:
         """
         Rescore all PDB/CIF files in a directory.
@@ -526,6 +560,7 @@ class AffinityRescorer:
             output_format=output_format,
             ligand_smiles=ligand_smiles,
             use_msa_server=use_msa_server,
+            msa_directory=msa_directory,
         )
 
     # ─── Receptor-Based Rescoring ─────────────────────────────────────────
@@ -703,114 +738,73 @@ class AffinityRescorer:
         use_msa_server: bool = False,
         msa_directory: Optional[str | Path] = None,
     ) -> Optional[Dict[str, str]]:
-        """Pre-compute or locate MSA files for the given protein chains.
+        """Locate pre-computed MSA files for the given protein chains.
 
-        This is called **once** before the per-ligand scoring loop so that
-        the same MSA is reused for every ligand, avoiding redundant MSA
-        server calls.
+        This is called **once** before the per-ligand scoring loop so the
+        same MSA is reused for every ligand.
 
-        Resolution order for each protein chain:
-        1. If ``msa_directory`` is given and contains a matching file
-           (``<chain_id>.a3m``, ``<chain_id>.csv``, or a single .a3m/.csv
-           when only one protein chain exists), use it directly.
-        2. If ``use_msa_server`` is True and no pre-computed file was
-           found, generate the MSA via the server, write it to
-           ``msa_directory`` (or a temp cache), and return its path.
-        3. If neither is available, return ``None`` — ``process_input``
-           will see ``msa: 0`` and decide what to do.
+        Lookup uses :func:`boltz.affinity_rescoring.msa_cache.find_msa`
+        which probes (in order):
 
-        Parameters
-        ----------
-        sequences : dict
-            chain_id → amino acid sequence (protein chains only).
-        protein_chains : list
-            Protein chain IDs to resolve.
-        use_msa_server : bool
-            Whether to use the ColabFold MSA server.
-        msa_directory : str or Path, optional
-            Directory with pre-computed MSA files, or a directory in
-            which to cache the server-generated MSA.
+        1. The canonical sequence-hash filename
+           (``<sha256(seq)[:16]>.a3m``).
+        2. Legacy names: ``<chain_id>.a3m``, ``<chain_id>.csv``.
+        3. For single-chain proteins, any lone ``*.a3m`` / ``*.csv`` in
+           the directory.
+
+        Search directories, in priority order:
+
+        * ``msa_directory`` argument (if provided)
+        * Every entry in ``$BOLTZ_MSA_CACHE_DIR``
+          (``os.pathsep``-separated)
+
+        If ``use_msa_server=True`` is passed, :class:`MSAServerDisabledError`
+        is raised.  Querying the public ColabFold MMseqs2 endpoint is
+        disabled in this fork — see :mod:`boltz.affinity_rescoring.msa_cache`
+        for the precompute workflow.
 
         Returns
         -------
         dict or None
-            chain_id → absolute path to MSA file, or None if no MSA
+            chain_id → absolute path to MSA file, or ``None`` if no MSA
             could be resolved for any chain.
         """
+        from boltz.affinity_rescoring.msa_cache import (
+            find_msa,
+            raise_msa_server_disabled,
+        )
+
+        if use_msa_server:
+            raise_msa_server_disabled()
+
+        search_dirs = [msa_directory] if msa_directory else None
+        single_chain = len(protein_chains) == 1
+
         msa_paths: Dict[str, str] = {}
-        msa_dir = Path(msa_directory) if msa_directory else None
-
         for chain_id in protein_chains:
-            if chain_id not in sequences:
+            sequence = sequences.get(chain_id)
+            if sequence is None:
                 continue
-
-            # ── 1. Check for existing file in msa_directory ───────────
-            if msa_dir is not None:
-                candidates = [
-                    msa_dir / f"{chain_id}.a3m",
-                    msa_dir / f"{chain_id}.csv",
-                ]
-                # If there's only one protein chain and one MSA file,
-                # allow any .a3m or .csv file in the directory.
-                if len(protein_chains) == 1:
-                    for ext in ("*.a3m", "*.csv"):
-                        found = list(msa_dir.glob(ext))
-                        if len(found) == 1:
-                            candidates.insert(0, found[0])
-
-                for cand in candidates:
-                    if cand.exists():
-                        msa_paths[chain_id] = str(cand.resolve())
-                        logger.info(
-                            f"MSA for chain {chain_id}: using pre-computed "
-                            f"{cand}"
-                        )
-                        break
-
-                if chain_id in msa_paths:
-                    continue
-
-            # ── 2. Generate MSA via affinity_rescoring mmseqs2 ───────────
-            if use_msa_server:
-                # Create a persistent cache dir so the MSA survives
-                # across ligand iterations.
-                if msa_dir is None:
-                    msa_dir = Path(
-                        tempfile.mkdtemp(prefix="boltz_msa_cache_")
-                    )
-                    logger.info(
-                        f"No --msa-directory provided; caching MSA in "
-                        f"{msa_dir}"
-                    )
-                msa_dir.mkdir(parents=True, exist_ok=True)
-
+            hit = find_msa(
+                sequence=sequence,
+                msa_dirs=search_dirs,
+                chain_id=chain_id,
+                allow_single_file_fallback=single_chain,
+            )
+            if hit is not None:
+                msa_paths[chain_id] = str(hit)
                 logger.info(
-                    f"Generating MSA for chain {chain_id} via ColabFold "
-                    f"MMseqs2 server (this only happens once)…"
+                    "MSA for chain %s: using pre-computed %s", chain_id, hit
                 )
-                try:
-                    from boltz.affinity_rescoring.mmseqs2 import precompute_msa
-
-                    out_file = msa_dir / f"{chain_id}.a3m"
-                    precompute_msa(
-                        sequence=sequences[chain_id],
-                        out_path=out_file,
-                    )
-                    if out_file.exists():
-                        msa_paths[chain_id] = str(out_file.resolve())
-                        logger.info(
-                            f"MSA for chain {chain_id}: generated and "
-                            f"cached at {out_file}"
-                        )
-                    else:
-                        logger.warning(
-                            f"MSA generation for chain {chain_id} "
-                            f"completed but output file not found."
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"MSA generation failed for chain {chain_id}: {e}"
-                    )
+            else:
+                logger.warning(
+                    "No pre-computed MSA found for chain %s (sequence length "
+                    "%d). Searched: %s. Pre-compute with "
+                    "`python -m boltz.affinity_rescoring.mmseqs2` or set "
+                    "BOLTZ_MSA_CACHE_DIR.",
+                    chain_id, len(sequence),
+                    msa_directory or "<BOLTZ_MSA_CACHE_DIR only>",
+                )
 
         return msa_paths if msa_paths else None
 
@@ -838,6 +832,20 @@ class AffinityRescorer:
             logger.info(
                 "Applied LoRA adapter '%s' (rank=%d) to affinity model.",
                 adapter.name, adapter.config.rank,
+            )
+
+        if self._finetune:
+            from boltz.finetune import load_finetune_into_model
+
+            record = load_finetune_into_model(
+                self._loaded_model, self._finetune,
+            )
+            logger.info(
+                "Applied affinity fine-tune '%s' (target=%s, %.2fM params) "
+                "to affinity model.",
+                record.name,
+                record.config.target_spec,
+                record.config.num_trainable_params / 1e6,
             )
 
         return self._loaded_model

@@ -81,16 +81,26 @@ To use a custom cache directory, set `BOLTZ_CACHE_DIR` before running any comman
 
 ### 6. Run your first prediction
 
-**Structure prediction from a YAML input:**
+> **MSA policy.** `--use_msa_server` is **disabled** in this fork because
+> querying the public ColabFold MMseqs2 endpoint per ligand/receptor pair
+> kills jobs at scale. Pre-compute one `.a3m` per unique sequence with
+> `python -m boltz.affinity_rescoring.mmseqs2` (or
+> `fineturning_experiment/precompute_msas.py`) and either embed the path
+> under each protein chain's `msa:` key or expose it via
+> `$BOLTZ_MSA_CACHE_DIR`. See
+> [docs/prediction.md#pre-computing-msas](docs/prediction.md#pre-computing-msas).
+
+**Structure prediction from a YAML input** (with a pre-computed MSA):
 
 ```bash
-boltz predict examples/prot.yaml --use_msa_server --output-dir ./output/
+export BOLTZ_MSA_CACHE_DIR=/shared/msa_cache
+boltz predict examples/prot.yaml --output-dir ./output/
 ```
 
 **Affinity prediction (protein + ligand SMILES):**
 
 ```bash
-boltz predict examples/affinity.yaml --use_msa_server --output-dir ./output/
+boltz predict examples/affinity.yaml --output-dir ./output/
 ```
 
 The `examples/affinity.yaml` file looks like this — adapt it for your own system:
@@ -132,10 +142,10 @@ pip install boltz[cuda] -U
 You can run inference using Boltz with:
 
 ```
-boltz predict input_path --use_msa_server
+boltz predict input_path
 ```
 
-`input_path` should point to a YAML file, or a directory of YAML files for batched processing, describing the biomolecules you want to model and the properties you want to predict (e.g. affinity). To see all available options: `boltz predict --help` and for more information on these input formats, see our [prediction instructions](docs/prediction.md). By default, the `boltz` command will run the latest version of the model.
+`input_path` should point to a YAML file, or a directory of YAML files for batched processing, describing the biomolecules you want to model and the properties you want to predict (e.g. affinity). Each protein chain in the YAML must reference a pre-computed `.a3m` MSA (see [Pre-computing MSAs](docs/prediction.md#pre-computing-msas)); `--use_msa_server` is disabled. To see all available options: `boltz predict --help`. By default, the `boltz` command will run the latest version of the model.
 
 
 ### Binding Affinity Prediction

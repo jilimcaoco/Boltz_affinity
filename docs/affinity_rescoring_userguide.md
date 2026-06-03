@@ -56,14 +56,26 @@ first use to `~/.boltz/`. To use a local checkpoint, pass `--checkpoint <path>`.
 ## Quick Start
 
 The standard use case is scoring a receptor PDB against multiple ligand poses
-in a multi-molecule MOL2 file:
+in a multi-molecule MOL2 file.
+
+> **MSA policy.** `--use-msa-server` is **disabled** in this fork — every
+> MSA must be pre-computed once and reused (see
+> [Pre-computing MSAs](prediction.md#pre-computing-msas)). Pass the
+> directory containing the cached `.a3m` files via `--msa-directory`
+> (or export `BOLTZ_MSA_CACHE_DIR=/shared/msa_cache`).
 
 ```bash
+# 1. One-time precompute (only needed once per unique sequence):
+python -m boltz.affinity_rescoring.mmseqs2 \
+    --sequence "$(cat receptor_seq.txt)" \
+    --cache-dir /shared/msa_cache
+
+# 2. Routine scoring — never touches the MSA server:
 boltz rescore receptor \
     --receptor protein.pdb \
     --ligands  ligands.mol2 \
     --output   scores.csv \
-    --use-msa-server
+    --msa-directory /shared/msa_cache
 ```
 
 This will:

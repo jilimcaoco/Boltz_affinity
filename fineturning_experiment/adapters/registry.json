@@ -1,0 +1,20 @@
+{
+  "5ht2a_v1": {
+    "created_at": 1780089529.4900866,
+    "num_adapted_layers": 102,
+    "parent_adapter": null,
+    "path": "/nfs/turbo/umms-maom/limcaoco/Boltz_affinity/fineturning_experiment/adapters/5ht2a_v1",
+    "rank": 8,
+    "target_spec": "heads_pairformer",
+    "updated_at": 1780167983.7638896
+  },
+  "drd4_v1": {
+    "created_at": 1780089529.508253,
+    "num_adapted_layers": 102,
+    "parent_adapter": null,
+    "path": "/nfs/turbo/umms-maom/limcaoco/Boltz_affinity/fineturning_experiment/adapters/drd4_v1",
+    "rank": 8,
+    "target_spec": "heads_pairformer",
+    "updated_at": 1780132699.8690019
+  }
+}

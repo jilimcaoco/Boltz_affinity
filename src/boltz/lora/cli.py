@@ -76,8 +76,29 @@ def _train_options(fn):
                      type=click.Choice(["auto", "cuda", "cpu", "mps"])),
         click.option("--checkpoint", default=None, type=str,
                      help="Override path to base affinity checkpoint."),
-        click.option("--use-msa-server", is_flag=True, default=False),
+        click.option(
+            "--use-msa-server", is_flag=True, default=False,
+            help=("[DISABLED in this fork] Pre-compute MSAs and embed "
+                  "their paths in the receptor YAML (or set "
+                  "BOLTZ_MSA_CACHE_DIR). See "
+                  "boltz.affinity_rescoring.msa_cache for the policy."),
+        ),
         click.option("--notes", default=None, type=str),
+        click.option(
+            "--early-stopping-patience", default=5, type=int, show_default=True,
+            help="Stop training if mean loss does not improve by at least "
+                 "--early-stopping-min-delta for this many consecutive epochs. "
+                 "0 = disabled.",
+        ),
+        click.option(
+            "--early-stopping-min-delta", default=0.005, type=float, show_default=True,
+            help="Minimum absolute improvement in mean loss required to reset "
+                 "the early-stopping patience counter.",
+        ),
+        click.option(
+            "--plot-loss-curve/--no-plot-loss-curve", default=True, show_default=True,
+            help="Save loss_curve.png to the adapter directory after training.",
+        ),
         click.option("--log-level", default="INFO"),
     ]
     for dec in reversed(decorators):
@@ -110,10 +131,19 @@ def train_cmd(
     checkpoint: Optional[str],
     use_msa_server: bool,
     notes: Optional[str],
+    early_stopping_patience: int,
+    early_stopping_min_delta: float,
+    plot_loss_curve: bool,
     log_level: str,
 ) -> None:
     """Train a fresh LoRA adapter."""
     _setup_logging(log_level)
+    if use_msa_server:
+        from boltz.affinity_rescoring.msa_cache import raise_msa_server_disabled
+        try:
+            raise_msa_server_disabled()
+        except Exception as exc:  # noqa: BLE001
+            raise click.UsageError(str(exc)) from exc
     from boltz.lora.train import TrainArgs, train_lora
 
     args = TrainArgs(
@@ -123,6 +153,9 @@ def train_cmd(
         weight_decay=weight_decay, gradient_clip=gradient_clip,
         recycling_steps=recycling_steps, device=device, checkpoint=checkpoint,
         use_msa_server=use_msa_server, overwrite=overwrite, notes=notes,
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=early_stopping_min_delta,
+        plot_loss_curve=plot_loss_curve,
     )
     adapter = train_lora(args)
     click.echo(f"Saved adapter '{adapter.name}' "
@@ -159,10 +192,19 @@ def update_cmd(
     checkpoint: Optional[str],
     use_msa_server: bool,
     notes: Optional[str],
+    early_stopping_patience: int,
+    early_stopping_min_delta: float,
+    plot_loss_curve: bool,
     log_level: str,
 ) -> None:
     """Continue training an existing adapter on new (or additional) data."""
     _setup_logging(log_level)
+    if use_msa_server:
+        from boltz.affinity_rescoring.msa_cache import raise_msa_server_disabled
+        try:
+            raise_msa_server_disabled()
+        except Exception as exc:  # noqa: BLE001
+            raise click.UsageError(str(exc)) from exc
     from boltz.lora.registry import default_registry
     from boltz.lora.train import TrainArgs, prepare_update, train_lora
 
@@ -185,6 +227,9 @@ def update_cmd(
         use_msa_server=use_msa_server,
         overwrite=(new_name is None),
         notes=notes,
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=early_stopping_min_delta,
+        plot_loss_curve=plot_loss_curve,
     )
     adapter = train_lora(
         args,

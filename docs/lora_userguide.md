@@ -112,8 +112,14 @@ Useful options:
 - `--rank` — 4–16 covers most use cases. Higher rank ⇒ more capacity ⇒
   more risk of overfitting on small data.
 - `--gradient-clip` — defaults to 1.0; loosen for very small losses.
-- `--use-msa-server` — if your receptor YAML hasn't been pre-computed
-  with MSAs, enable this to call the MSA server on the fly.
+- `--use-msa-server` — **DISABLED in this fork.** Pre-compute MSAs
+  with `python -m boltz.affinity_rescoring.mmseqs2` (or
+  `fineturning_experiment/precompute_msas.py`) and either embed the
+  `.a3m` path under each protein chain's `msa:` key in the receptor
+  YAML or expose the cache via `$BOLTZ_MSA_CACHE_DIR`. The trainer
+  auto-resolves missing MSAs from the cache before featurizing each
+  row, so a single cache satisfies prediction, rescoring, and LoRA
+  training.
 - `--checkpoint` — override the base affinity checkpoint (defaults to
   the cached `boltz2_aff.ckpt`).
 

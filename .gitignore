@@ -174,4 +174,21 @@ AA2AR_receptor.pdb
 boltz_affinity.yaml
 submit_boltz.py
 experiment_files/
-slurm_scripts/
+
+# Generated fine-tuning experiment outputs
+fineturning_experiment/predict_inputs/
+fineturning_experiment/logs/
+fineturning_experiment/msa/
+fineturning_experiment/poses/
+fineturning_experiment/manifests/
+fineturning_experiment/scaling/
+fineturning_experiment/data/
+fineturning_experiment/decoys/
+fineturning_experiment/validation_data/
+fineturning_experiment/analysis/labels/
+fineturning_experiment/analysis/leakage/
+fineturning_experiment/analysis/metrics/
+fineturning_experiment/analysis/plots/
+fineturning_experiment/analysis/poses/
+fineturning_experiment/analysis/poses_inputs/
+fineturning_experiment/analysis/scores/

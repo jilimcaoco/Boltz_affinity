@@ -5,7 +5,10 @@ Once `boltz` is installed, you can run predictions with:
 `boltz predict <INPUT_PATH> [OPTIONS]`
 
 * `<INPUT_PATH>` can be either a single .yaml or .fasta file (YAML is preferred; FASTA is deprecated), or a directory, in which case predictions will be run on all `.yaml` and `.fasta` files inside.
-* If you include `--use_msa_server`, the MSA will be generated automatically via the mmseqs2 server. Without this flag, you must provide a pre-computed MSA.
+* **`--use_msa_server` is DISABLED in this fork.** Querying the public
+  ColabFold MMseqs2 endpoint at inference time kills jobs at scale, so
+  every MSA must be pre-computed once and reused. See
+  [Pre-computing MSAs](#pre-computing-msas) below.
 * If you include `--use_potentials`, Boltz will apply inference-time potentials to improve the physical plausibility of the predicted poses.
 * Without the `--override` options, Boltz will try to use the cached preprocessed files and existing predictions, if any are present in your output directory (name of your input by default). Add the `--override` flag to run the prediction from scratch, e.g. if you change some parameters or complex details without changing the output directory.
 
@@ -71,10 +74,44 @@ The sequences section has one entry per unique chain or molecule.
 * `CHAIN_ID`: unique identifier for each chain/molecule. If multiple identical entities exist, set id as a list (e.g. `[A, B]`).
 
 For proteins:
-* By default, an `msa` must be provided.
-* If `--use_msa_server` is set, the MSA is auto-generated (so `msa` can be omitted).
+* An `msa` **must** be provided. `--use_msa_server` is disabled in this fork
+  (see [Pre-computing MSAs](#pre-computing-msas)).
 * To use a precomputed custom MSA, set `msa: MSA_PATH` pointing to a `.a3m` file. If you have more than one protein chain, use a CSV format instead of a3m with two columns: `sequence` (protein sequence) and `key` (a unique identifier for matching rows across chains). Sequences with the same key are mutually aligned.
 * To force single-sequence mode (not recommended, as it reduces accuracy), set `msa: empty`.
+
+## Pre-computing MSAs
+
+This fork's policy is that *every* MSA is pre-computed once per unique
+sequence and reused across `boltz predict`, `boltz rescore`, and
+`boltz lora train`. The single sanctioned entry-point to the ColabFold
+MMseqs2 server is:
+
+```bash
+python -m boltz.affinity_rescoring.mmseqs2 \
+    --sequence MKTL... \
+    --cache-dir /shared/msa_cache
+# writes /shared/msa_cache/<sha256[:16]>.a3m
+```
+
+Or for batch precompute across a whole receptor set:
+
+```bash
+python fineturning_experiment/precompute_msas.py \
+    --drd4-receptor receptors/DRD4.yaml \
+    --ht2a-receptor receptors/5HT2A.yaml \
+    --msa-dir /shared/msa_cache
+```
+
+Every downstream consumer looks up MSAs via
+`boltz.affinity_rescoring.msa_cache.find_msa`, which probes:
+
+1. `<sha256(sequence)[:16]>.a3m` — the canonical sequence-hash name
+2. `<target>_<chain>.a3m`, `<chain>.a3m` — legacy names
+3. The single `*.a3m` in the directory (for single-chain inputs)
+
+Search directories, in priority order: explicit `--msa-directory`
+arguments, then every path in the `$BOLTZ_MSA_CACHE_DIR`
+(`os.pathsep`-separated) environment variable.
 
 The `modifications` field is optional and allows specification of modified residues in polymers (`protein`, `dna`, or `rna`).  
 - `position`: index of the residue (starting from 1)  

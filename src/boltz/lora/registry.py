@@ -62,9 +62,21 @@ class LoRARegistry:
             return {}
 
     def _write_index(self, data: dict[str, dict[str, Any]]) -> None:
-        tmp = self.index_path.with_suffix(".json.tmp")
+        # Use a process- and time-unique tmp file so concurrent writers (e.g.
+        # parallel SLURM jobs sharing the same BOLTZ_LORA_DIR) don't race on
+        # the same ``registry.json.tmp`` path and crash with FileNotFoundError
+        # when one process's os.replace consumes another's tmp file.
+        tmp = self.index_path.with_suffix(
+            f".json.tmp.{os.getpid()}.{time.time_ns()}"
+        )
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-        tmp.replace(self.index_path)
+        try:
+            tmp.replace(self.index_path)
+        except FileNotFoundError:
+            # Another writer beat us to it and already moved an equivalent
+            # bootstrap file into place. Safe to ignore.
+            if not self.index_path.exists():
+                raise
 
     # -- path helpers ----------------------------------------------------
     def adapter_dir(self, name: str) -> Path:
