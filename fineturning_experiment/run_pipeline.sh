@@ -5,10 +5,14 @@
 #   01_pull_chembl
 #     → 02_precompute_msas
 #       → 03_predict_poses
-#           ├── 04a_manifest_drd4  → 05a_train_drd4   (DRD4 chain)
-#           └── 04b_manifest_5ht2a → 05b_train_5ht2a  (5HT2A chain)
+#           ├── 04a_manifest_drd4  → 05a_train_drd4      (DRD4 LoRA)
+#           │                      → 05c_finetune_drd4   (DRD4 full FT control)
+#           └── 04b_manifest_5ht2a → 05b_train_5ht2a     (5HT2A LoRA)
+#                                  → 05d_finetune_5ht2a  (5HT2A full FT control)
 #
-# The two receptor chains always run in parallel with each other.
+# The two receptor chains always run in parallel.  Within each receptor the
+# LoRA and full-finetune jobs share the same manifest and run in parallel
+# too — so head-to-head comparison is a single submission.
 #
 # Run from inside fineturning_experiment/:
 #
@@ -16,7 +20,7 @@
 #     ./run_pipeline.sh --from 02        # skip ChEMBL pull
 #     ./run_pipeline.sh --from 03        # skip pull + MSA precompute
 #     ./run_pipeline.sh --from 04        # manifest build + train only
-#     ./run_pipeline.sh --from 05        # retrain both adapters only
+#     ./run_pipeline.sh --from 05        # retrain LoRA + finetune only
 
 set -euo pipefail
 
@@ -56,16 +60,19 @@ JID_MAN_DRD4=""
 [[ "${FROM_STEP}" < "05" || "${FROM_STEP}" == "04" ]] && \
     JID_MAN_DRD4=$(submit_dep "${JID_PRED}" 04a_prepare_manifest_drd4.slurm "04a_manifest_drd4")
 
-JID_TRAIN_DRD4=$(submit_dep "${JID_MAN_DRD4}" 05a_train_drd4.slurm "05a_train_drd4")
+JID_TRAIN_DRD4=$(submit_dep    "${JID_MAN_DRD4}" 05a_train_drd4.slurm     "05a_train_drd4")
+JID_FT_DRD4=$(submit_dep       "${JID_MAN_DRD4}" 05c_finetune_drd4.slurm  "05c_finetune_drd4")
 
 # ─── Fork: 5HT2A chain ────────────────────────────────────────────────────────
 JID_MAN_HT2A=""
 [[ "${FROM_STEP}" < "05" || "${FROM_STEP}" == "04" ]] && \
     JID_MAN_HT2A=$(submit_dep "${JID_PRED}" 04b_prepare_manifest_5ht2a.slurm "04b_manifest_5ht2a")
 
-JID_TRAIN_HT2A=$(submit_dep "${JID_MAN_HT2A}" 05b_train_5ht2a.slurm "05b_train_5ht2a")
+JID_TRAIN_HT2A=$(submit_dep    "${JID_MAN_HT2A}" 05b_train_5ht2a.slurm     "05b_train_5ht2a")
+JID_FT_HT2A=$(submit_dep       "${JID_MAN_HT2A}" 05d_finetune_5ht2a.slurm  "05d_finetune_5ht2a")
 
 echo ""
 echo "Track progress with:  squeue -u $USER"
 echo "Logs:                 ${LOG_DIR}/"
-echo "Adapters (when done): ${ADAPTERS_DIR}/${DRD4_LORA_NAME}/  ${HT2A_LORA_NAME}/"
+echo "LoRA adapters:        ${ADAPTERS_DIR}/${DRD4_LORA_NAME}/  ${HT2A_LORA_NAME}/"
+echo "Full finetunes:       ${FINETUNES_DIR}/${DRD4_FINETUNE_NAME}/  ${HT2A_FINETUNE_NAME}/"

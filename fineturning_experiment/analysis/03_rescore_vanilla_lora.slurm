@@ -12,9 +12,10 @@
 #SBATCH --partition=maom-h200
 #SBATCH --output=../logs/analysis_03_rescore_%j.log
 #
-# Step 3 (analysis): rescore each validation pose with BOTH the vanilla
-# affinity head and the per-target LoRA adapter. Same poses, two scorers
-# → any ranking delta is attributable purely to the LoRA-modified head.
+# Step 3 (analysis): rescore each validation pose with the vanilla affinity
+# head, the per-target LoRA adapter, AND the per-target full fine-tune.
+# Same poses, three scorers → ranking deltas vs the vanilla baseline are
+# attributable purely to the head modification (LoRA residual vs full FT).
 
 set -euo pipefail
 
@@ -38,12 +39,12 @@ conda activate "${CONDA_ENV}"
 # `import numpy`.  Force the env's libs to win.
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 
-export BOLTZ_CACHE BOLTZ_LORA_DIR BOLTZ_MSA_CACHE_DIR
+export BOLTZ_CACHE BOLTZ_LORA_DIR BOLTZ_FINETUNE_DIR BOLTZ_MSA_CACHE_DIR
 
 nvidia-smi || true
 
 run_pair() {
-    local tgt="$1" lora="$2"
+    local tgt="$1" lora="$2" finetune="$3"
     local in_dir="${VAL_POSES_DIR}/${tgt}"
     if [[ ! -d "${in_dir}" ]] || [[ -z "$(ls -A "${in_dir}" 2>/dev/null)" ]]; then
         echo "[$(date)] WARNING: no poses for ${tgt} at ${in_dir}; skipping."
@@ -68,10 +69,20 @@ run_pair() {
         --msa-directory "${MSA_DIR}" \
         --use-lora    "${lora}" \
         --log-level   INFO
+
+    echo "[$(date)] rescore ${tgt} FINETUNE=${finetune}"
+    boltz rescore batch \
+        --input-dir   "${in_dir}" \
+        --output      "${SCORES_DIR}/${tgt}_finetune.csv" \
+        --output-format csv \
+        --device      cuda \
+        --msa-directory "${MSA_DIR}" \
+        --use-finetune "${finetune}" \
+        --log-level   INFO
 }
 
-run_pair DRD4   "${DRD4_LORA_NAME}"
-run_pair 5HT2A  "${HT2A_LORA_NAME}"
+run_pair DRD4   "${DRD4_LORA_NAME}"  "${DRD4_FINETUNE_NAME}"
+run_pair 5HT2A  "${HT2A_LORA_NAME}"  "${HT2A_FINETUNE_NAME}"
 
 echo "[$(date)] Done.  Score files:"
 ls -lh "${SCORES_DIR}"
