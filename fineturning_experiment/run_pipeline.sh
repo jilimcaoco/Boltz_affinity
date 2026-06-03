@@ -29,9 +29,17 @@ source ./config.env
 mkdir -p "${LOG_DIR}" logs
 
 FROM_STEP="01"
-if [[ "${1:-}" == "--from" && -n "${2:-}" ]]; then
-    FROM_STEP="$2"
-fi
+FORCE="false"
+while [[ $# -gt 0 ]]; do
+    case "${1}" in
+        --from)  FROM_STEP="${2}"; shift 2 ;;
+        --force) FORCE="true";     shift   ;;
+        *) echo "Unknown flag: ${1}" >&2; exit 1 ;;
+    esac
+done
+# Export so sbatch jobs (which inherit the calling env) see the flag.
+export FORCE_RETRAIN="${FORCE}"
+export FORCE_RESCORE="${FORCE}"
 
 # submit_dep <dep_jid|""> <script> <label>
 # Submits a job, optionally with afterok dependency.  Echoes the new job ID.

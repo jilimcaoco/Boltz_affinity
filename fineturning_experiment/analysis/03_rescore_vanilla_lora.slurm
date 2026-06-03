@@ -43,6 +43,17 @@ export BOLTZ_CACHE BOLTZ_LORA_DIR BOLTZ_FINETUNE_DIR BOLTZ_MSA_CACHE_DIR
 
 nvidia-smi || true
 
+# Returns 0 (proceed) when the output does not exist or FORCE_RESCORE=true.
+_should_rescore() {
+    local out="$1" tag="$2"
+    if [[ -f "${out}" && "${FORCE_RESCORE:-false}" != "true" ]]; then
+        echo "[$(date)] SKIP ${tag}: output already exists: ${out}"
+        echo "  (set FORCE_RESCORE=true or pass --force to run_pipeline.sh to re-run)"
+        return 1
+    fi
+    return 0
+}
+
 run_pair() {
     local tgt="$1" lora="$2" finetune="$3"
     local in_dir="${VAL_POSES_DIR}/${tgt}"
@@ -51,34 +62,40 @@ run_pair() {
         return
     fi
 
-    echo "[$(date)] rescore ${tgt} VANILLA"
-    boltz rescore batch \
-        --input-dir   "${in_dir}" \
-        --output      "${SCORES_DIR}/${tgt}_vanilla.csv" \
-        --output-format csv \
-        --device      cuda \
-        --msa-directory "${MSA_DIR}" \
-        --log-level   INFO
+    if _should_rescore "${SCORES_DIR}/${tgt}_vanilla.csv" "${tgt} VANILLA"; then
+        echo "[$(date)] rescore ${tgt} VANILLA"
+        boltz rescore batch \
+            --input-dir   "${in_dir}" \
+            --output      "${SCORES_DIR}/${tgt}_vanilla.csv" \
+            --output-format csv \
+            --device      cuda \
+            --msa-directory "${MSA_DIR}" \
+            --log-level   INFO
+    fi
 
-    echo "[$(date)] rescore ${tgt} LoRA=${lora}"
-    boltz rescore batch \
-        --input-dir   "${in_dir}" \
-        --output      "${SCORES_DIR}/${tgt}_lora.csv" \
-        --output-format csv \
-        --device      cuda \
-        --msa-directory "${MSA_DIR}" \
-        --use-lora    "${lora}" \
-        --log-level   INFO
+    if _should_rescore "${SCORES_DIR}/${tgt}_lora.csv" "${tgt} LoRA=${lora}"; then
+        echo "[$(date)] rescore ${tgt} LoRA=${lora}"
+        boltz rescore batch \
+            --input-dir   "${in_dir}" \
+            --output      "${SCORES_DIR}/${tgt}_lora.csv" \
+            --output-format csv \
+            --device      cuda \
+            --msa-directory "${MSA_DIR}" \
+            --use-lora    "${lora}" \
+            --log-level   INFO
+    fi
 
-    echo "[$(date)] rescore ${tgt} FINETUNE=${finetune}"
-    boltz rescore batch \
-        --input-dir   "${in_dir}" \
-        --output      "${SCORES_DIR}/${tgt}_finetune.csv" \
-        --output-format csv \
-        --device      cuda \
-        --msa-directory "${MSA_DIR}" \
-        --use-finetune "${finetune}" \
-        --log-level   INFO
+    if _should_rescore "${SCORES_DIR}/${tgt}_finetune.csv" "${tgt} FINETUNE=${finetune}"; then
+        echo "[$(date)] rescore ${tgt} FINETUNE=${finetune}"
+        boltz rescore batch \
+            --input-dir   "${in_dir}" \
+            --output      "${SCORES_DIR}/${tgt}_finetune.csv" \
+            --output-format csv \
+            --device      cuda \
+            --msa-directory "${MSA_DIR}" \
+            --use-finetune "${finetune}" \
+            --log-level   INFO
+    fi
 }
 
 run_pair DRD4   "${DRD4_LORA_NAME}"  "${DRD4_FINETUNE_NAME}"
