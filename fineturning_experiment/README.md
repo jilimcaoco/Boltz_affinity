@@ -5,6 +5,21 @@ held-out human GPCR data (dopamine D4 + serotonin 5-HT2A) curated from
 ChEMBL.  **No external docking step required** — Boltz itself generates the
 complex structures used as training inputs.
 
+In addition to the LoRA adapters, the pipeline trains a **full fine-tune
+control** per target (`05c_finetune_drd4.slurm`, `05d_finetune_5ht2a.slurm`)
+on the same manifests with the same loss. This gives a three-way comparison
+at evaluation time:
+
+| Model | Parameter footprint | Where artefacts land |
+|---|---|---|
+| `vanilla` | 0 (frozen Boltz-2)            | — |
+| `lora`    | ~rank · 2 · d (small adapter) | `$BOLTZ_LORA_DIR` (= `adapters/`) |
+| `finetune`| every weight under `--target-spec` | `$BOLTZ_FINETUNE_DIR` (= `finetunes/`) |
+
+The full-FT job acts as a strict capacity ceiling for the LoRA adapter:
+same data, same loss, same target sub-tree — only the parameterisation
+differs.
+
 ## Files
 
 | File | Purpose |

@@ -2,9 +2,14 @@
 """Evaluate fine-tuned LoRA adapters vs vanilla Boltz-2 on held-out validation data.
 
 Inputs (per target):
-    scores/{TARGET}_vanilla.csv   — output of `boltz rescore batch` (no LoRA)
-    scores/{TARGET}_lora.csv      — output of `boltz rescore batch --use-lora ...`
-    labels/labels_{TARGET}.csv    — produced by prepare_validation_inputs.py
+    scores/{TARGET}_vanilla.csv     — output of `boltz rescore batch` (no LoRA / no FT)
+    scores/{TARGET}_lora.csv        — output of `boltz rescore batch --use-lora ...`
+    scores/{TARGET}_finetune.csv    — (optional) `boltz rescore batch --use-finetune ...`
+    labels/labels_{TARGET}.csv      — produced by prepare_validation_inputs.py
+
+The ``finetune`` (full fine-tune control) column is auto-detected per target;
+if the CSV is absent the evaluator falls back to the original vanilla-vs-LoRA
+comparison.
 
 Outputs:
     metrics/metrics_summary.csv
@@ -191,12 +196,33 @@ def _load_scores(path: Path, model_tag: str) -> pd.DataFrame:
     return df
 
 
-def _merge(target: str, scores_dir: Path, labels_dir: Path) -> pd.DataFrame:
+# Per-model display colours (used by every plot).
+_MODEL_COLORS = {
+    "vanilla":  "tab:gray",
+    "lora":     "tab:red",
+    "finetune": "tab:blue",
+}
+
+
+def _discover_models(target: str, scores_dir: Path) -> list[str]:
+    """Return the ordered list of model tags that have a CSV for ``target``.
+
+    ``vanilla`` and ``lora`` are required (the script raises if missing); the
+    ``finetune`` full-FT control is optional and auto-included when present.
+    """
+    models = ["vanilla", "lora"]
+    if (scores_dir / f"{target}_finetune.csv").exists():
+        models.append("finetune")
+    return models
+
+
+def _merge(target: str, scores_dir: Path, labels_dir: Path,
+           models: list[str]) -> pd.DataFrame:
     labels = pd.read_csv(labels_dir / f"labels_{target}.csv")
-    vanilla = _load_scores(scores_dir / f"{target}_vanilla.csv", "vanilla")
-    lora    = _load_scores(scores_dir / f"{target}_lora.csv",    "lora")
-    df = labels.merge(vanilla, left_on="name", right_on="id", how="inner").drop(columns=["id"])
-    df = df.merge(lora,    left_on="name", right_on="id", how="inner").drop(columns=["id"])
+    df = labels
+    for tag in models:
+        scores = _load_scores(scores_dir / f"{target}_{tag}.csv", tag)
+        df = df.merge(scores, left_on="name", right_on="id", how="inner").drop(columns=["id"])
     return df
 
 
@@ -217,9 +243,12 @@ def _safe_corr(fn, x, y):
     return float(r.correlation) if hasattr(r, "correlation") else float(r[0])
 
 
-def compute_metrics(df: pd.DataFrame, target: str, n_boot: int = 1000) -> pd.DataFrame:
+def compute_metrics(df: pd.DataFrame, target: str, n_boot: int = 1000,
+                    models: Optional[list[str]] = None) -> pd.DataFrame:
     rows: list[dict] = []
-    for model in ("vanilla", "lora"):
+    if models is None:
+        models = ["vanilla", "lora"]
+    for model in models:
         pred_col = f"pred_pIC50_{model}"
         score = _ranker(df[pred_col].to_numpy(float))
 
@@ -306,14 +335,17 @@ def compute_metrics(df: pd.DataFrame, target: str, n_boot: int = 1000) -> pd.Dat
 # Plots
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _scatter(df: pd.DataFrame, target: str, plots: Path) -> None:
+def _scatter(df: pd.DataFrame, target: str, plots: Path,
+             models: list[str]) -> None:
     mask = df["exp_activity"].notna()
     if mask.sum() < 3:
         return
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.5), sharey=True)
+    n = len(models)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 4.5), sharey=True, squeeze=False)
+    axes = axes[0]
     obs = df.loc[mask, "exp_activity"].to_numpy(float)
     binder = df.loc[mask, "is_binder"].fillna(-1).astype(int).to_numpy()
-    for ax, model in zip(axes, ("vanilla", "lora")):
+    for ax, model in zip(axes, models):
         pred = -df.loc[mask, f"pred_pIC50_{model}"].to_numpy(float)
         rho = _safe_corr(stats.spearmanr, obs, pred)
         for cls, color, label in [(1, "tab:red", "binder"),
@@ -327,19 +359,21 @@ def _scatter(df: pd.DataFrame, target: str, plots: Path) -> None:
         ax.grid(alpha=0.3)
         ax.legend(fontsize=8, loc="best")
     axes[0].set_ylabel("predicted score (−Boltz pIC50, higher = stronger)")
-    fig.suptitle(f"{target}: vanilla vs LoRA — predicted vs experimental")
+    fig.suptitle(f"{target}: {' vs '.join(models)} — predicted vs experimental")
     fig.tight_layout()
     fig.savefig(plots / f"scatter_{target}.png", dpi=180)
     plt.close(fig)
 
 
-def _roc(df: pd.DataFrame, target: str, plots: Path) -> None:
+def _roc(df: pd.DataFrame, target: str, plots: Path,
+         models: list[str]) -> None:
     m = df["is_binder"].notna()
     if m.sum() < 5 or df.loc[m, "is_binder"].nunique() != 2:
         return
     y = df.loc[m, "is_binder"].to_numpy(int)
     fig, ax = plt.subplots(figsize=(5, 5))
-    for model, color in [("vanilla", "tab:gray"), ("lora", "tab:red")]:
+    for model in models:
+        color = _MODEL_COLORS.get(model, "tab:green")
         sc = -df.loc[m, f"pred_pIC50_{model}"].to_numpy(float)
         fpr, tpr, auc = roc_curve(y, sc)
         ax.plot(fpr, tpr, color=color, lw=2, label=f"{model} (AUC={auc:.3f})")
@@ -350,13 +384,15 @@ def _roc(df: pd.DataFrame, target: str, plots: Path) -> None:
     fig.tight_layout(); fig.savefig(plots / f"roc_{target}.png", dpi=180); plt.close(fig)
 
 
-def _pr(df: pd.DataFrame, target: str, plots: Path) -> None:
+def _pr(df: pd.DataFrame, target: str, plots: Path,
+        models: list[str]) -> None:
     m = df["is_binder"].notna()
     if m.sum() < 5 or df.loc[m, "is_binder"].nunique() != 2:
         return
     y = df.loc[m, "is_binder"].to_numpy(int)
     fig, ax = plt.subplots(figsize=(5, 5))
-    for model, color in [("vanilla", "tab:gray"), ("lora", "tab:red")]:
+    for model in models:
+        color = _MODEL_COLORS.get(model, "tab:green")
         sc = -df.loc[m, f"pred_pIC50_{model}"].to_numpy(float)
         rec, prec, ap = pr_curve(y, sc)
         ax.plot(rec, prec, color=color, lw=2, label=f"{model} (AP={ap:.3f})")
@@ -368,7 +404,8 @@ def _pr(df: pd.DataFrame, target: str, plots: Path) -> None:
     fig.tight_layout(); fig.savefig(plots / f"pr_{target}.png", dpi=180); plt.close(fig)
 
 
-def _enrichment(df: pd.DataFrame, target: str, plots: Path) -> None:
+def _enrichment(df: pd.DataFrame, target: str, plots: Path,
+                models: list[str]) -> None:
     m = df["is_binder"].notna()
     if m.sum() < 5 or df.loc[m, "is_binder"].nunique() != 2:
         return
@@ -376,7 +413,8 @@ def _enrichment(df: pd.DataFrame, target: str, plots: Path) -> None:
     N = len(y); n = int(y.sum())
     fig, ax = plt.subplots(figsize=(5.5, 4.5))
     fracs = np.linspace(1 / N, 1.0, N)
-    for model, color in [("vanilla", "tab:gray"), ("lora", "tab:red")]:
+    for model in models:
+        color = _MODEL_COLORS.get(model, "tab:green")
         sc = -df.loc[m, f"pred_pIC50_{model}"].to_numpy(float)
         order = np.argsort(-sc, kind="mergesort")
         hits_cum = np.cumsum(y[order]) / n
@@ -390,7 +428,8 @@ def _enrichment(df: pd.DataFrame, target: str, plots: Path) -> None:
     fig.tight_layout(); fig.savefig(plots / f"enrichment_{target}.png", dpi=180); plt.close(fig)
 
 
-def _bars(metrics: pd.DataFrame, target: str, plots: Path) -> None:
+def _bars(metrics: pd.DataFrame, target: str, plots: Path,
+          models: list[str]) -> None:
     sub = metrics[metrics["target"] == target].set_index("model")
     fields = [
         ("spearman", "spearman_lo", "spearman_hi", "Spearman ρ"),
@@ -402,8 +441,9 @@ def _bars(metrics: pd.DataFrame, target: str, plots: Path) -> None:
     ]
     fig, ax = plt.subplots(figsize=(8, 4.5))
     x = np.arange(len(fields))
-    w = 0.35
-    for i, model in enumerate(("vanilla", "lora")):
+    n_mod = len(models)
+    w = 0.8 / max(n_mod, 1)
+    for i, model in enumerate(models):
         if model not in sub.index:
             continue
         vals = [sub.loc[model, k] for k, _, _, _ in fields]
@@ -411,53 +451,75 @@ def _bars(metrics: pd.DataFrame, target: str, plots: Path) -> None:
         his  = [sub.loc[model, h] for _, _, h, _ in fields]
         err_lo = [v - lo if np.isfinite(lo) else 0 for v, lo in zip(vals, los)]
         err_hi = [hi - v if np.isfinite(hi) else 0 for v, hi in zip(vals, his)]
-        ax.bar(x + (i - 0.5) * w, vals, w,
+        offset = (i - (n_mod - 1) / 2.0) * w
+        ax.bar(x + offset, vals, w,
                yerr=[err_lo, err_hi], capsize=3,
-               label=model, color=("tab:gray" if model == "vanilla" else "tab:red"))
+               label=model, color=_MODEL_COLORS.get(model, "tab:green"))
     ax.set_xticks(x); ax.set_xticklabels([f[3] for f in fields], rotation=15)
     ax.set_title(f"{target}: ranking metrics (bootstrap 95 % CI)")
     ax.legend(); ax.grid(alpha=0.3, axis="y")
     fig.tight_layout(); fig.savefig(plots / f"metrics_bars_{target}.png", dpi=180); plt.close(fig)
 
 
-def _delta_hist(df: pd.DataFrame, target: str, plots: Path) -> None:
-    # ΔpIC50 in "stronger is more positive" convention.
-    delta = (-df["pred_pIC50_lora"]) - (-df["pred_pIC50_vanilla"])
-    fig, ax = plt.subplots(figsize=(6, 4))
-    if "is_binder" in df.columns and df["is_binder"].notna().any():
-        for cls, color, label in [(1, "tab:red", "binders"), (0, "tab:gray", "non-binders")]:
-            sel = df["is_binder"] == cls
-            if sel.any():
-                ax.hist(delta[sel].dropna(), bins=25, alpha=0.6, color=color, label=label)
-    else:
-        ax.hist(delta.dropna(), bins=25, color="tab:blue")
-    ax.axvline(0, color="k", lw=1)
-    ax.set_xlabel("Δ predicted score (LoRA − vanilla, higher = LoRA more activates)")
-    ax.set_ylabel("count")
-    ax.set_title(f"{target}: per-compound ΔpIC50 (LoRA − vanilla)")
-    ax.legend(); ax.grid(alpha=0.3)
-    fig.tight_layout(); fig.savefig(plots / f"delta_hist_{target}.png", dpi=180); plt.close(fig)
+def _delta_hist(df: pd.DataFrame, target: str, plots: Path,
+                models: list[str]) -> None:
+    """One ΔpIC50 panel per non-vanilla model (vs vanilla)."""
+    others = [m for m in models if m != "vanilla"]
+    if not others:
+        return
+    fig, axes = plt.subplots(1, len(others), figsize=(6 * len(others), 4),
+                             sharey=True, squeeze=False)
+    axes = axes[0]
+    for ax, model in zip(axes, others):
+        delta = (-df[f"pred_pIC50_{model}"]) - (-df["pred_pIC50_vanilla"])
+        if "is_binder" in df.columns and df["is_binder"].notna().any():
+            for cls, color, label in [(1, "tab:red", "binders"),
+                                      (0, "tab:gray", "non-binders")]:
+                sel = df["is_binder"] == cls
+                if sel.any():
+                    ax.hist(delta[sel].dropna(), bins=25, alpha=0.6,
+                            color=color, label=label)
+        else:
+            ax.hist(delta.dropna(), bins=25, color="tab:blue")
+        ax.axvline(0, color="k", lw=1)
+        ax.set_xlabel(f"Δ score ({model} − vanilla)")
+        ax.set_title(f"{target}: Δ ({model} − vanilla)")
+        ax.legend(); ax.grid(alpha=0.3)
+    axes[0].set_ylabel("count")
+    fig.tight_layout()
+    fig.savefig(plots / f"delta_hist_{target}.png", dpi=180)
+    plt.close(fig)
 
 
-def _rank_rank(df: pd.DataFrame, target: str, plots: Path) -> None:
+def _rank_rank(df: pd.DataFrame, target: str, plots: Path,
+               models: list[str]) -> None:
+    """Rank-rank scatter of every non-vanilla model against vanilla."""
+    others = [m for m in models if m != "vanilla"]
+    if not others:
+        return
     rv = _rank_desc(-df["pred_pIC50_vanilla"].to_numpy(float))
-    rl = _rank_desc(-df["pred_pIC50_lora"].to_numpy(float))
-    fig, ax = plt.subplots(figsize=(5.5, 5.5))
+    fig, axes = plt.subplots(1, len(others), figsize=(5.5 * len(others), 5.5),
+                             squeeze=False)
+    axes = axes[0]
     binder = df["is_binder"].fillna(-1).astype(int).to_numpy() if "is_binder" in df.columns \
         else np.full(len(df), -1)
-    for cls, color, label in [(1, "tab:red", "binder"),
-                              (0, "tab:gray", "non-binder"),
-                              (-1, "tab:blue", "unlabeled")]:
-        sel = binder == cls
-        if sel.any():
-            ax.scatter(rv[sel], rl[sel], s=18, alpha=0.7, c=color, label=label)
-    lim = max(rv.max(), rl.max())
-    ax.plot([1, lim], [1, lim], color="k", ls="--", lw=1)
-    ax.set_xlabel("vanilla rank (1 = best)")
-    ax.set_ylabel("LoRA rank (1 = best)")
-    ax.set_title(f"{target}: rank-rank")
-    ax.legend(); ax.grid(alpha=0.3)
-    fig.tight_layout(); fig.savefig(plots / f"rank_rank_{target}.png", dpi=180); plt.close(fig)
+    for ax, model in zip(axes, others):
+        rl = _rank_desc(-df[f"pred_pIC50_{model}"].to_numpy(float))
+        for cls, color, label in [(1, "tab:red", "binder"),
+                                  (0, "tab:gray", "non-binder"),
+                                  (-1, "tab:blue", "unlabeled")]:
+            sel = binder == cls
+            if sel.any():
+                ax.scatter(rv[sel], rl[sel], s=18, alpha=0.7, c=color, label=label)
+        lim = max(rv.max(), rl.max())
+        ax.plot([1, lim], [1, lim], color="k", ls="--", lw=1)
+        ax.set_xlabel("vanilla rank (1 = best)")
+        ax.set_ylabel(f"{model} rank (1 = best)")
+        ax.set_title(f"{target}: vanilla vs {model}")
+        ax.legend(); ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(plots / f"rank_rank_{target}.png", dpi=180)
+    plt.close(fig)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -466,8 +528,10 @@ def _rank_rank(df: pd.DataFrame, target: str, plots: Path) -> None:
 
 def run_target(target: str, scores_dir: Path, labels_dir: Path,
                metrics_dir: Path, plots_dir: Path, n_boot: int) -> Optional[pd.DataFrame]:
+    models = _discover_models(target, scores_dir)
+    print(f"[{target}] models: {models}")
     try:
-        df = _merge(target, scores_dir, labels_dir)
+        df = _merge(target, scores_dir, labels_dir, models)
     except FileNotFoundError as e:
         print(f"[{target}] SKIP: {e}")
         return None
@@ -476,14 +540,14 @@ def run_target(target: str, scores_dir: Path, labels_dir: Path,
         return None
     df.to_csv(metrics_dir / f"per_compound_{target}.csv", index=False)
 
-    metrics = compute_metrics(df, target, n_boot=n_boot)
-    _scatter(df, target, plots_dir)
-    _roc(df, target, plots_dir)
-    _pr(df, target, plots_dir)
-    _enrichment(df, target, plots_dir)
-    _delta_hist(df, target, plots_dir)
-    _rank_rank(df, target, plots_dir)
-    _bars(metrics, target, plots_dir)
+    metrics = compute_metrics(df, target, n_boot=n_boot, models=models)
+    _scatter(df, target, plots_dir, models)
+    _roc(df, target, plots_dir, models)
+    _pr(df, target, plots_dir, models)
+    _enrichment(df, target, plots_dir, models)
+    _delta_hist(df, target, plots_dir, models)
+    _rank_rank(df, target, plots_dir, models)
+    _bars(metrics, target, plots_dir, models)
     return metrics
 
 

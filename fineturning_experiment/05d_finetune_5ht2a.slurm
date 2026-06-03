@@ -23,6 +23,17 @@ source ./config.env
 
 mkdir -p "${FINETUNES_DIR}" "${LOG_DIR}"
 
+# ── Skip guard ──────────────────────────────────────────────────────────────
+_SENTINEL="${BOLTZ_FINETUNE_DIR}/${HT2A_FINETUNE_NAME}/meta.json"
+if [[ -f "${_SENTINEL}" && "${FORCE_RETRAIN:-false}" != "true" ]]; then
+    echo "[$(date)] Full finetune '${HT2A_FINETUNE_NAME}' already exists; skipping."
+    echo "  sentinel  : ${_SENTINEL}"
+    echo "  To retrain: pass --force to run_pipeline.sh (or set FORCE_RETRAIN=true before sbatch)."
+    boltz finetune show "${HT2A_FINETUNE_NAME}" || true
+    exit 0
+fi
+_OVR=(); [[ "${FORCE_RETRAIN:-false}" == "true" ]] && _OVR=("--overwrite")
+
 module load cuda/12.8.1 || true
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -41,6 +52,7 @@ echo "  batch_size  : ${FINETUNE_BATCH_SIZE}"
 echo "  lr          : ${FINETUNE_LR}"
 
 boltz finetune train \
+    "${_OVR[@]}" \
     --name          "${HT2A_FINETUNE_NAME}" \
     --csv           "${HT2A_LORA_MANIFEST}" \
     --loss          "${FINETUNE_LOSS}" \
@@ -53,7 +65,6 @@ boltz finetune train \
     --early-stopping-patience  "${FINETUNE_EARLY_STOPPING_PATIENCE}" \
     --early-stopping-min-delta "${FINETUNE_EARLY_STOPPING_MIN_DELTA}" \
     --device        auto \
-    --overwrite \
     --notes         "5HT2A ChEMBL full FT control vs LoRA, $(date +%Y-%m-%d)"
 
 echo "[$(date)] Done."

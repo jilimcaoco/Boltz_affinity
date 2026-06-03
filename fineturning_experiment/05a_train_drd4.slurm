@@ -22,6 +22,17 @@ source ./config.env
 
 mkdir -p "${ADAPTERS_DIR}" "${LOG_DIR}"
 
+# ── Skip guard ──────────────────────────────────────────────────────────────
+_SENTINEL="${BOLTZ_LORA_DIR}/${DRD4_LORA_NAME}/meta.json"
+if [[ -f "${_SENTINEL}" && "${FORCE_RETRAIN:-false}" != "true" ]]; then
+    echo "[$(date)] LoRA adapter '${DRD4_LORA_NAME}' already exists; skipping."
+    echo "  sentinel  : ${_SENTINEL}"
+    echo "  To retrain: pass --force to run_pipeline.sh (or set FORCE_RETRAIN=true before sbatch)."
+    boltz lora show "${DRD4_LORA_NAME}" || true
+    exit 0
+fi
+_OVR=(); [[ "${FORCE_RETRAIN:-false}" == "true" ]] && _OVR=("--overwrite")
+
 module load cuda/12.8.1 || true
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -40,6 +51,7 @@ echo "  epochs     : ${LORA_EPOCHS}"
 echo "  batch_size : ${LORA_BATCH_SIZE}"
 
 boltz lora train \
+    "${_OVR[@]}" \
     --name          "${DRD4_LORA_NAME}" \
     --csv           "${DRD4_LORA_MANIFEST}" \
     --loss          "${LORA_LOSS}" \
