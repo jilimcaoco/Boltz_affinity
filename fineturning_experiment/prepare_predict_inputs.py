@@ -21,55 +21,24 @@ from typing import Any, Optional
 import pandas as pd
 import yaml
 
-from rdkit import Chem, RDLogger
-from rdkit.Chem.MolStandardize import rdMolStandardize
+from rdkit import RDLogger
+
+from boltz.data.parse.smiles_standardize import try_standardize
 
 # Silence noisy RDKit parse warnings; we log our own rejection counts.
 RDLogger.DisableLog("rdApp.*")
 
-_LARGEST_FRAGMENT_CHOOSER = rdMolStandardize.LargestFragmentChooser()
-
 
 def sanitize_smiles(smiles: str) -> Optional[str]:
-    """Return a canonical, fully-sanitized SMILES, or ``None`` if invalid.
+    """Return a canonical, fully-standardized SMILES, or ``None`` if invalid.
 
-    Mirrors Boltz's ``standardize()`` (src/boltz/data/parse/schema.py) but with
-    RDKit sanitization *enabled*, so the resulting SMILES round-trips cleanly
-    through Boltz's ``Chem.MolFromSmiles(..., sanitize=False)`` +
-    ``LargestFragmentChooser`` call without hitting the
-    ``getNumImplicitHs() called without preceding call to calcImplicitValence()``
-    precondition violation.
-
-    Steps:
-      1. Parse with full sanitization (computes implicit valences).
-      2. Pick the largest covalent fragment (drops salts/counter-ions).
-      3. Emit canonical isomeric SMILES.
-      4. Re-parse with ``sanitize=False`` to verify Boltz's parser will accept it.
+    Thin wrapper around the package-canonical
+    :func:`boltz.data.parse.smiles_standardize.try_standardize`, so this
+    pre-processing step applies exactly the same standardization Boltz performs
+    internally when parsing an affinity ligand.  A ``None`` result therefore
+    means Boltz would also reject the molecule.
     """
-    if not isinstance(smiles, str) or not smiles.strip():
-        return None
-    try:
-        mol = Chem.MolFromSmiles(smiles)  # sanitize=True by default
-        if mol is None:
-            return None
-        mol = _LARGEST_FRAGMENT_CHOOSER.choose(mol)
-        if mol is None or mol.GetNumAtoms() == 0:
-            return None
-        canon = Chem.MolToSmiles(mol, isomericSmiles=True, canonical=True)
-        if not canon:
-            return None
-        # Final sanity check: this is exactly what Boltz will do internally.
-        probe = Chem.MolFromSmiles(canon, sanitize=False)
-        if probe is None:
-            return None
-        # Force implicit-valence computation so the probe behaves like the
-        # mol object Boltz will hand to LargestFragmentChooser.
-        for atom in probe.GetAtoms():
-            atom.UpdatePropertyCache(strict=False)
-        Chem.GetSSSR(probe)
-        return canon
-    except Exception:
-        return None
+    return try_standardize(smiles)
 
 
 def load_protein_block(receptor_yaml: Path) -> list[dict[str, Any]]:

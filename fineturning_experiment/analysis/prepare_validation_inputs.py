@@ -30,29 +30,24 @@ from typing import Any, Optional
 
 import pandas as pd
 import yaml
-from rdkit import Chem, RDLogger
-from rdkit.Chem.MolStandardize import rdMolStandardize
+from rdkit import RDLogger
+
+from boltz.data.parse.smiles_standardize import try_standardize
 
 RDLogger.DisableLog("rdApp.*")
-_LARGEST = rdMolStandardize.LargestFragmentChooser()
 
 # 5HT2A binder cutoff: ≤50% radioligand remaining = bound (active displacer).
 HT2A_PERCENT_BOUND_CUTOFF = 50.0
 
 
 def sanitize_smiles(smiles: str) -> Optional[str]:
-    if not isinstance(smiles, str) or not smiles.strip():
-        return None
-    try:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return None
-        mol = _LARGEST.choose(mol)
-        if mol is None or mol.GetNumAtoms() == 0:
-            return None
-        return Chem.MolToSmiles(mol, isomericSmiles=True, canonical=True)
-    except Exception:
-        return None
+    """Canonical, fully-standardized SMILES (or ``None``).
+
+    Delegates to the package-canonical
+    :func:`boltz.data.parse.smiles_standardize.try_standardize` so the labels
+    CSV emitted here carries exactly the SMILES Boltz will accept downstream.
+    """
+    return try_standardize(smiles)
 
 
 def load_protein_block(receptor_yaml: Path) -> list[dict[str, Any]]:

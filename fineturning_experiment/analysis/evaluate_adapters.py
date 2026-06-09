@@ -2,19 +2,25 @@
 """Evaluate fine-tuned LoRA adapters vs vanilla Boltz-2 on held-out validation data.
 
 Inputs (per target):
-    scores/{TARGET}_vanilla.csv     — output of `boltz rescore batch` (no LoRA / no FT)
-    scores/{TARGET}_lora.csv        — output of `boltz rescore batch --use-lora ...`
-    scores/{TARGET}_finetune.csv    — (optional) `boltz rescore batch --use-finetune ...`
-    labels/labels_{TARGET}.csv      — produced by prepare_validation_inputs.py
+    scores/{TARGET}_vanilla.csv       — output of `boltz rescore batch` (no LoRA / no FT)
+    scores/{TARGET}_<adapter>.csv     — one CSV per adapter name (any name is accepted)
+    labels/labels_{TARGET}.csv        — produced by prepare_validation_inputs.py
 
-The ``finetune`` (full fine-tune control) column is auto-detected per target;
-if the CSV is absent the evaluator falls back to the original vanilla-vs-LoRA
-comparison.
+Model discovery is automatic: every ``{TARGET}_*.csv`` present in ``--scores-dir``
+is included.  ``vanilla`` is always listed first; the rest appear in alphabetical
+order.  Adapter names are taken verbatim from the filename stem (strip
+``{target}_`` prefix), so ``DRD4_drd4_v2_rank_64.csv`` → model tag
+``drd4_v2_rank_64``.
 
-Outputs:
-    metrics/metrics_summary.csv
-    metrics/per_compound_{TARGET}.csv
-    plots/<lots of pngs, see README>
+Versioned outputs are written to subdirectories named by ``--run-id`` so that
+results from different adapter sets never overwrite each other:
+
+    metrics/<run_id>/metrics_summary.csv
+    metrics/<run_id>/per_compound_{TARGET}.csv
+    plots/<run_id>/<lots of pngs, see README>
+
+Pass ``--run-id ""`` to write directly into ``--metrics-dir`` / ``--plots-dir``
+(backward-compatible behaviour).
 
 Reports ranking, regression, and retrieval metrics (with bootstrap 95 % CIs)
 plus per-compound delta diagnostics.  No scikit-learn dependency: only numpy,
@@ -196,24 +202,55 @@ def _load_scores(path: Path, model_tag: str) -> pd.DataFrame:
     return df
 
 
-# Per-model display colours (used by every plot).
-_MODEL_COLORS = {
+# Fixed colours for well-known model tags; all others are assigned dynamically.
+_FIXED_COLORS: dict[str, str] = {
     "vanilla":  "tab:gray",
     "lora":     "tab:red",
     "finetune": "tab:blue",
 }
+# Ordered palette for dynamically-named adapters (cycles if > len).
+_DYNAMIC_PALETTE = [
+    "tab:orange", "tab:green", "tab:purple", "tab:brown",
+    "tab:pink",   "tab:olive", "tab:cyan",
+]
+
+
+def _model_color(model: str, all_models: list[str]) -> str:
+    """Return a stable matplotlib color for *model*.
+
+    Known model names get a fixed color; unknown names are assigned a color
+    from ``_DYNAMIC_PALETTE`` in the order they appear in *all_models*.
+    """
+    if model in _FIXED_COLORS:
+        return _FIXED_COLORS[model]
+    dynamic = [m for m in all_models if m not in _FIXED_COLORS]
+    idx = dynamic.index(model) % len(_DYNAMIC_PALETTE)
+    return _DYNAMIC_PALETTE[idx]
 
 
 def _discover_models(target: str, scores_dir: Path) -> list[str]:
-    """Return the ordered list of model tags that have a CSV for ``target``.
+    """Return all model tags that have a score CSV for *target*.
 
-    ``vanilla`` and ``lora`` are required (the script raises if missing); the
-    ``finetune`` full-FT control is optional and auto-included when present.
+    Globs ``{target}_*.csv`` in *scores_dir*, strips the ``{target}_`` prefix
+    to obtain the model tag, and returns the list with ``vanilla`` always
+    first followed by the rest in alphabetical order.
+
+    Raises ``FileNotFoundError`` if no CSVs are found or if
+    ``{target}_vanilla.csv`` is absent.
     """
-    models = ["vanilla", "lora"]
-    if (scores_dir / f"{target}_finetune.csv").exists():
-        models.append("finetune")
-    return models
+    csvs = sorted(scores_dir.glob(f"{target}_*.csv"))
+    if not csvs:
+        raise FileNotFoundError(
+            f"No score CSVs found for target '{target}' in {scores_dir}"
+        )
+    prefix = f"{target}_"
+    tags = [p.stem[len(prefix):] for p in csvs]
+    if "vanilla" not in tags:
+        raise FileNotFoundError(
+            f"Required file '{target}_vanilla.csv' not found in {scores_dir}"
+        )
+    ordered = ["vanilla"] + sorted(t for t in tags if t != "vanilla")
+    return ordered
 
 
 def _merge(target: str, scores_dir: Path, labels_dir: Path,
@@ -373,7 +410,7 @@ def _roc(df: pd.DataFrame, target: str, plots: Path,
     y = df.loc[m, "is_binder"].to_numpy(int)
     fig, ax = plt.subplots(figsize=(5, 5))
     for model in models:
-        color = _MODEL_COLORS.get(model, "tab:green")
+        color = _model_color(model, models)
         sc = -df.loc[m, f"pred_pIC50_{model}"].to_numpy(float)
         fpr, tpr, auc = roc_curve(y, sc)
         ax.plot(fpr, tpr, color=color, lw=2, label=f"{model} (AUC={auc:.3f})")
@@ -392,7 +429,7 @@ def _pr(df: pd.DataFrame, target: str, plots: Path,
     y = df.loc[m, "is_binder"].to_numpy(int)
     fig, ax = plt.subplots(figsize=(5, 5))
     for model in models:
-        color = _MODEL_COLORS.get(model, "tab:green")
+        color = _model_color(model, models)
         sc = -df.loc[m, f"pred_pIC50_{model}"].to_numpy(float)
         rec, prec, ap = pr_curve(y, sc)
         ax.plot(rec, prec, color=color, lw=2, label=f"{model} (AP={ap:.3f})")
@@ -414,7 +451,7 @@ def _enrichment(df: pd.DataFrame, target: str, plots: Path,
     fig, ax = plt.subplots(figsize=(5.5, 4.5))
     fracs = np.linspace(1 / N, 1.0, N)
     for model in models:
-        color = _MODEL_COLORS.get(model, "tab:green")
+        color = _model_color(model, models)
         sc = -df.loc[m, f"pred_pIC50_{model}"].to_numpy(float)
         order = np.argsort(-sc, kind="mergesort")
         hits_cum = np.cumsum(y[order]) / n
@@ -454,7 +491,7 @@ def _bars(metrics: pd.DataFrame, target: str, plots: Path,
         offset = (i - (n_mod - 1) / 2.0) * w
         ax.bar(x + offset, vals, w,
                yerr=[err_lo, err_hi], capsize=3,
-               label=model, color=_MODEL_COLORS.get(model, "tab:green"))
+               label=model, color=_model_color(model, models))
     ax.set_xticks(x); ax.set_xticklabels([f[3] for f in fields], rotation=15)
     ax.set_title(f"{target}: ranking metrics (bootstrap 95 % CI)")
     ax.legend(); ax.grid(alpha=0.3, axis="y")
@@ -559,7 +596,19 @@ def main() -> int:
     p.add_argument("--plots-dir",   required=True, type=Path)
     p.add_argument("--targets", nargs="+", default=["DRD4", "5HT2A"])
     p.add_argument("--n-boot", type=int, default=1000)
+    p.add_argument(
+        "--run-id", default="",
+        help="Optional subdirectory name that namespaces metrics and plots so "
+             "previous results are not overwritten (e.g. 'drd4_v2_vs_v1').  "
+             "Leave empty to write directly into --metrics-dir / --plots-dir.",
+    )
     args = p.parse_args()
+
+    metrics_dir = args.metrics_dir / args.run_id if args.run_id else args.metrics_dir
+    plots_dir   = args.plots_dir   / args.run_id if args.run_id else args.plots_dir
+    # Redirect for the rest of the function.
+    args.metrics_dir = metrics_dir
+    args.plots_dir   = plots_dir
 
     args.metrics_dir.mkdir(parents=True, exist_ok=True)
     args.plots_dir.mkdir(parents=True, exist_ok=True)
