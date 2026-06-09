@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus-per-node=1
 #SBATCH --mem=96G
-#SBATCH --time=7-00:00:00
+#SBATCH --time=4-00:00:00
 #SBATCH --account=maom
 #SBATCH --partition=maom-h200
 #SBATCH --output=logs/05c_finetune_drd4_%j.log
