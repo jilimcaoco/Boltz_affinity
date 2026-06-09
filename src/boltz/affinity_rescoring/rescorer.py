@@ -437,6 +437,7 @@ class AffinityRescorer:
         output_path: Optional[str | Path] = None,
         output_format: str = "csv",
         ligand_smiles: Optional[Dict[str, str]] = None,
+        compound_smiles: Optional[Dict[str, str]] = None,
         use_msa_server: bool = False,
         msa_directory: Optional[str | Path] = None,
     ) -> List[AffinityResult]:
@@ -456,7 +457,15 @@ class AffinityRescorer:
         output_format : str
             Output format for aggregated results
         ligand_smiles : dict, optional
-            Ligand SMILES mapping (applied to all complexes)
+            Ligand SMILES mapping applied to ALL complexes (chain→SMILES).
+            Overridden per-compound by ``compound_smiles`` when both are given.
+        compound_smiles : dict, optional
+            Per-compound SMILES lookup keyed by the PDB file **stem** (filename
+            without extension).  When an entry is found for a given file, it is
+            used as the ligand SMILES (mapped to the first ligand chain, 'B'
+            by default) instead of ``ligand_smiles`` or auto-inference.  This
+            eliminates failures caused by RDKit coordinate-based SMILES
+            perception.
         use_msa_server : bool
             Whether to use MSA server
 
@@ -474,11 +483,21 @@ class AffinityRescorer:
 
         for pdb_file in files_iter:
             try:
+                # Resolve per-compound SMILES when available.  The labels CSV
+                # uses the file stem as the compound id and always places the
+                # ligand in chain B (set by prepare_validation_inputs.py via
+                # _next_chain_id, which picks the first unused letter after A).
+                stem = Path(pdb_file).stem
+                per_compound = None
+                if compound_smiles and stem in compound_smiles:
+                    per_compound = {"B": compound_smiles[stem]}
+                effective_smiles = per_compound if per_compound is not None else ligand_smiles
+
                 result = self.rescore_pdb(
                     pdb_file,
                     protein_chain=protein_chain,
                     ligand_chains=ligand_chains,
-                    ligand_smiles=ligand_smiles,
+                    ligand_smiles=effective_smiles,
                     use_msa_server=use_msa_server,
                     msa_directory=msa_directory,
                 )
@@ -509,6 +528,7 @@ class AffinityRescorer:
         output_format: str = "csv",
         recursive: bool = False,
         ligand_smiles: Optional[Dict[str, str]] = None,
+        compound_smiles: Optional[Dict[str, str]] = None,
         use_msa_server: bool = False,
         msa_directory: Optional[str | Path] = None,
     ) -> List[AffinityResult]:
@@ -526,7 +546,10 @@ class AffinityRescorer:
         recursive : bool
             Scan subdirectories
         ligand_smiles : dict, optional
-            Ligand SMILES mapping
+            Ligand SMILES mapping applied to ALL complexes (chain→SMILES).
+        compound_smiles : dict, optional
+            Per-compound SMILES lookup keyed by file stem.  Overrides
+            ``ligand_smiles`` and auto-inference for matched entries.
         use_msa_server : bool
             Whether to use MSA server
 
@@ -559,6 +582,7 @@ class AffinityRescorer:
             output_path=output_path,
             output_format=output_format,
             ligand_smiles=ligand_smiles,
+            compound_smiles=compound_smiles,
             use_msa_server=use_msa_server,
             msa_directory=msa_directory,
         )

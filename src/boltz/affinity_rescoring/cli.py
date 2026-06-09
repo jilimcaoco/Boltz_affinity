@@ -312,6 +312,15 @@ def rescore_pdb(
          'Optional — auto-inferred from coordinates if not provided.',
 )
 @click.option(
+    "--smiles-csv", "smiles_csv", default=None,
+    type=click.Path(exists=True),
+    help="CSV file with per-compound SMILES (columns: 'name' and 'smiles'). "
+         "The 'name' column must match PDB file stems.  Per-compound entries "
+         "override --ligand-smiles and bypass coordinate-based SMILES "
+         "auto-inference, which is the most common source of rescoring "
+         "failures when working with boltz-predicted PDB poses.",
+)
+@click.option(
     "--use-msa-server", is_flag=True, default=False,
     help="[DISABLED in this fork] See `boltz.affinity_rescoring.msa_cache`.",
 )
@@ -353,6 +362,7 @@ def rescore_batch(
     validation: str,
     checkpoint: str,
     ligand_smiles: Optional[str],
+    smiles_csv: Optional[str],
     use_msa_server: bool,
     msa_directory: Optional[str],
     recycling_steps: Optional[int],
@@ -387,12 +397,38 @@ def rescore_batch(
             click.echo("Error: --ligand-smiles must be valid JSON.", err=True)
             sys.exit(1)
 
+    # Build per-compound SMILES lookup from CSV (name→smiles).
+    # This is the primary fix for PDB rescoring failures: the labels CSV
+    # produced by prepare_validation_inputs.py already has canonical SMILES
+    # for every compound.  Passing it here completely bypasses RDKit
+    # coordinate-based SMILES auto-inference.
+    compound_smiles: Optional[dict] = None
+    if smiles_csv:
+        import csv as _csv
+        compound_smiles = {}
+        with open(smiles_csv, newline="") as fh:
+            reader = _csv.DictReader(fh)
+            if reader.fieldnames is None or "name" not in reader.fieldnames or "smiles" not in reader.fieldnames:
+                click.echo(
+                    "Error: --smiles-csv must have 'name' and 'smiles' columns. "
+                    f"Found: {reader.fieldnames}",
+                    err=True,
+                )
+                sys.exit(1)
+            for row in reader:
+                name = (row.get("name") or "").strip()
+                smi  = (row.get("smiles") or "").strip()
+                if name and smi:
+                    compound_smiles[name] = smi
+        click.echo(f"[smiles-csv] loaded {len(compound_smiles)} SMILES entries from {smiles_csv}")
+
     results = rescorer.rescore_directory(
         input_dir,
         output_path=output_path,
         output_format=output_format,
         recursive=recursive,
         ligand_smiles=smiles_dict,
+        compound_smiles=compound_smiles,
         use_msa_server=use_msa_server,
         msa_directory=msa_directory,
     )

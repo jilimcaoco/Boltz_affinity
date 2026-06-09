@@ -1848,6 +1848,16 @@ def standardize(smiles: str) -> Optional[str]:
     if exclude:
         raise ValueError("Molecule is excluded")
 
+    # sanitize=False skips implicit-valence calculation, which causes
+    # LargestFragmentChooser to raise "getNumImplicitHs() called without
+    # preceding call to calcImplicitValence()".  UpdatePropertyCache with
+    # strict=False fills in valences without hard-failing on exotic valence
+    # states (those will be caught by the Chem.MolFromSmiles round-trip below).
+    try:
+        mol.UpdatePropertyCache(strict=False)
+    except Exception:
+        pass
+
     # Standardize with ChEMBL data curation pipeline. During standardization, the molecule may be broken
     # Choose molecule with largest component
     mol = LARGEST_FRAGMENT_CHOOSER.choose(mol)
