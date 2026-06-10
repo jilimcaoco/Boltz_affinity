@@ -46,6 +46,7 @@ from boltz.lora.train import (
     _affinity_forward_trainable,
     _extract_row_from_batch,
     _featurize_row,
+    _load_base_model,
     _pick_device,
     _plot_loss_curve,
 )
@@ -111,19 +112,8 @@ def _freeze_all_then_unfreeze(
 
 
 # ── Base-model loader ────────────────────────────────────────────────────────
-
-
-def _load_base_model(
-    checkpoint: Optional[str], device: torch.device
-) -> tuple[Any, str, str]:
-    """Load the Boltz2 affinity checkpoint via the existing manager."""
-    from boltz.affinity_rescoring.inference import AffinityModelManager
-
-    mgr = AffinityModelManager(device=str(device))
-    model = mgr.load_model(checkpoint_path=checkpoint or "auto")
-    ckpt_path = str(getattr(mgr, "_checkpoint_path", checkpoint or ""))
-    ckpt_sha = str(getattr(mgr, "_checkpoint_sha256", ""))
-    return model, ckpt_path, ckpt_sha
+# `_load_base_model` is imported from boltz.lora.train above to avoid a
+# byte-for-byte duplicate; both trainers share the same loader contract.
 
 
 # ── Trainer ─────────────────────────────────────────────────────────────────

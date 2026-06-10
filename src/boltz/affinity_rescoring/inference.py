@@ -13,15 +13,12 @@ Boltz-2 affinity module.
 
 from __future__ import annotations
 
-import json
 import logging
-import math
 import os
-import pickle
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -363,11 +360,323 @@ def _get_module(model: Any, attr: str) -> Any:
     return mod
 
 
+def _affinity_input_embed_with_ablation(
+    model: Any,
+    feats: Dict[str, Tensor],
+    *,
+    zero_atom_encoder: bool = False,
+    zero_msa_profile: bool = False,
+    zero_res_type: bool = False,
+) -> Tensor:
+    """Compute ``model.input_embedder(feats, affinity=True)`` with optional
+    sub-component ablations.
+
+    The InputEmbedder additively combines three paths:
+
+        s = atom_encoder(feats) + res_type_encoding(res_type)
+              + msa_profile_encoding(profile, deletion_mean)
+
+    Each ``zero_*`` flag subtracts the corresponding contribution from
+    the recomputed ``s_inputs`` tensor so that channel is zeroed before
+    being passed to the affinity head.
+    """
+    s_inputs = model.input_embedder(feats, affinity=True)
+
+    if not (zero_atom_encoder or zero_msa_profile or zero_res_type):
+        return s_inputs
+
+    embedder = model.input_embedder
+    if hasattr(embedder, "_orig_mod"):
+        embedder = embedder._orig_mod  # noqa: SLF001
+
+    if zero_res_type:
+        contrib = embedder.res_type_encoding(feats["res_type"].float())
+        s_inputs = s_inputs - contrib
+
+    if zero_msa_profile:
+        profile = feats["profile_affinity"]
+        deletion_mean = feats["deletion_mean_affinity"].unsqueeze(-1)
+        contrib = embedder.msa_profile_encoding(
+            torch.cat([profile, deletion_mean], dim=-1)
+        )
+        s_inputs = s_inputs - contrib
+
+    if zero_atom_encoder:
+        # Recompute the atom-encoder contribution exactly as InputEmbedder
+        # does, then subtract it. This avoids replicating the full forward
+        # pass while still cleanly removing that pathway.
+        q, c, p, to_keys = embedder.atom_encoder(feats)
+        atom_enc_bias = embedder.atom_enc_proj_z(p)
+        a, _, _, _ = embedder.atom_attention_encoder(
+            feats=feats,
+            q=q,
+            c=c,
+            atom_enc_bias=atom_enc_bias,
+            to_keys=to_keys,
+        )
+        s_inputs = s_inputs - a
+
+    return s_inputs
+
+
+@torch.inference_mode()
+def affinity_trunk_forward(
+    model: Any,
+    feats: Dict[str, Tensor],
+    recycling_steps: int = 3,
+) -> Dict[str, Tensor]:
+    """Run only the trunk (input embedder + recycled msa/pairformer) and
+    return the intermediate tensors needed by the affinity head.
+
+    This is the front half of :func:`affinity_forward`; useful when the
+    same trunk output should be reused across many affinity-head
+    invocations (e.g. residue leave-one-out studies).
+
+    Returns
+    -------
+    dict
+        ``{"z": Tensor, "s": Tensor, "use_kernels": bool}`` where
+        ``z`` has shape ``(B, N, N, token_z)`` and ``s`` has shape
+        ``(B, N, token_s)`` from the trunk's last recycling iteration.
+    """
+    if "coords" not in feats:
+        raise RuntimeError(
+            "AFFINITY-ONLY MODE: 'coords' not found in features. "
+            "PDB coordinates must be injected before calling "
+            "affinity_trunk_forward(). This function does NOT run diffusion."
+        )
+    model.eval()
+
+    s_inputs = model.input_embedder(feats)
+    s_init = model.s_init(s_inputs)
+    z_init = (
+        model.z_init_1(s_inputs)[:, :, None]
+        + model.z_init_2(s_inputs)[:, None, :]
+    )
+    relative_position_encoding = model.rel_pos(feats)
+    z_init = z_init + relative_position_encoding
+    z_init = z_init + model.token_bonds(feats["token_bonds"].float())
+    if model.bond_type_feature:
+        z_init = z_init + model.token_bonds_type(feats["type_bonds"].long())
+    z_init = z_init + model.contact_conditioning(feats)
+
+    s = torch.zeros_like(s_init)
+    z = torch.zeros_like(z_init)
+
+    mask = feats["token_pad_mask"].float()
+    pair_mask = mask[:, :, None] * mask[:, None, :]
+
+    use_kernels = model.use_kernels
+
+    msa_module = _get_module(model, "msa_module")
+    pairformer_module = _get_module(model, "pairformer_module")
+
+    for _ in range(recycling_steps + 1):
+        s = s_init + model.s_recycle(model.s_norm(s))
+        z = z_init + model.z_recycle(model.z_norm(z))
+        if model.use_templates:
+            template_module = _get_module(model, "template_module")
+            z = z + template_module(z, feats, pair_mask, use_kernels=use_kernels)
+        z = z + msa_module(z, s_inputs, feats, use_kernels=use_kernels)
+        s, z = pairformer_module(
+            s, z, mask=mask, pair_mask=pair_mask, use_kernels=use_kernels,
+        )
+
+    return {"z": z, "s": s, "use_kernels": use_kernels}
+
+
+def _build_cross_pair_mask(feats: Dict[str, Tensor]) -> Tensor:
+    """Construct the (N, N) cross-pair mask used by the affinity head."""
+    pad_token_mask = feats["token_pad_mask"][0]
+    rec_mask = (feats["mol_type"][0] == 0) * pad_token_mask
+    lig_mask = feats["affinity_token_mask"][0].to(torch.bool) * pad_token_mask
+    return (
+        lig_mask[:, None] * rec_mask[None, :]
+        + rec_mask[:, None] * lig_mask[None, :]
+        + lig_mask[:, None] * lig_mask[None, :]
+    )
+
+
+@torch.inference_mode()
+def affinity_head_forward(
+    model: Any,
+    feats: Dict[str, Tensor],
+    trunk_out: Dict[str, Tensor],
+    *,
+    z_token_mask: Optional[Tensor] = None,
+    zero_z_trunk: bool = False,
+    zero_s_inputs: bool = False,
+    disable_distogram: bool = False,
+    pose_noise_sigma: float = 0.0,
+    pose_noise_seed: Optional[int] = None,
+    pose_noise_target: str = "ligand",
+    zero_atom_encoder: bool = False,
+    zero_msa_profile: bool = False,
+    zero_res_type: bool = False,
+) -> Dict[str, Any]:
+    """Run only the affinity head, given pre-computed trunk outputs.
+
+    Parameters
+    ----------
+    model, feats : see :func:`affinity_forward`.
+    trunk_out : dict
+        Output of :func:`affinity_trunk_forward` (must contain ``z`` and
+        ``use_kernels``).
+    z_token_mask : Tensor or None
+        Optional per-token multiplicative mask of shape ``(N_tokens,)``
+        applied to ``z`` as an outer product ``mask[:,None] * mask[None,:]``
+        before passing into the affinity head. Used by the leave-one-out
+        residue saliency analysis to zero a single residue's row/col.
+    Other kwargs : same as :func:`affinity_forward`.
+    """
+    z = trunk_out["z"]
+    use_kernels = trunk_out["use_kernels"]
+
+    cross_pair_mask = _build_cross_pair_mask(feats)
+    z_affinity = z * cross_pair_mask[None, :, :, None]
+
+    if z_token_mask is not None:
+        z_token_mask = z_token_mask.to(z_affinity.device, z_affinity.dtype)
+        loo_mask = z_token_mask[:, None] * z_token_mask[None, :]
+        z_affinity = z_affinity * loo_mask[None, :, :, None]
+
+    if zero_z_trunk:
+        z_affinity = torch.zeros_like(z_affinity)
+
+    coords_affinity = feats["coords"].detach()
+    if coords_affinity.dim() == 3:
+        coords_affinity = coords_affinity[None]
+    elif coords_affinity.dim() == 4 and coords_affinity.shape[1] > 1:
+        coords_affinity = coords_affinity[:, :1]
+
+    if pose_noise_sigma > 0.0:
+        atom_to_token = feats["atom_to_token"]
+        if pose_noise_target == "ligand":
+            tok_mask = feats["affinity_token_mask"][0].to(torch.bool)
+        elif pose_noise_target == "receptor":
+            pad_tok = feats["token_pad_mask"][0]
+            tok_mask = ((feats["mol_type"][0] == 0) * pad_tok).to(torch.bool)
+        elif pose_noise_target == "all":
+            tok_mask = feats["token_pad_mask"][0].to(torch.bool)
+        else:
+            raise ValueError(
+                f"Unknown pose_noise_target={pose_noise_target!r}"
+            )
+        n_tok_mask = tok_mask.shape[0]
+        a2t = atom_to_token[0][..., :n_tok_mask].to(torch.bool)
+        atom_mask = a2t.any(dim=-1) & (a2t & tok_mask.unsqueeze(0)).any(dim=-1)
+        atom_mask_b = atom_mask.view(1, 1, -1, 1).to(coords_affinity.dtype)
+        if pose_noise_seed is not None:
+            gen = torch.Generator(device=coords_affinity.device)
+            gen.manual_seed(int(pose_noise_seed))
+            noise = torch.randn(
+                coords_affinity.shape,
+                generator=gen,
+                device=coords_affinity.device,
+                dtype=coords_affinity.dtype,
+            )
+        else:
+            noise = torch.randn_like(coords_affinity)
+        coords_affinity = coords_affinity + atom_mask_b * (
+            noise * float(pose_noise_sigma)
+        )
+
+    s_inputs = _affinity_input_embed_with_ablation(
+        model, feats,
+        zero_atom_encoder=zero_atom_encoder,
+        zero_msa_profile=zero_msa_profile,
+        zero_res_type=zero_res_type,
+    )
+    if zero_s_inputs:
+        s_inputs = torch.zeros_like(s_inputs)
+
+    module_kwargs = {"disable_distogram": disable_distogram}
+    results: Dict[str, Any] = {}
+
+    with torch.autocast("cuda", enabled=False):
+        if model.affinity_ensemble:
+            affinity_module1 = _get_module(model, "affinity_module1")
+            affinity_module2 = _get_module(model, "affinity_module2")
+
+            out1 = affinity_module1(
+                s_inputs=s_inputs.detach(),
+                z=z_affinity.detach(),
+                x_pred=coords_affinity,
+                feats=feats,
+                multiplicity=1,
+                use_kernels=use_kernels,
+                **module_kwargs,
+            )
+            out1["affinity_probability_binary"] = torch.nn.functional.sigmoid(
+                out1["affinity_logits_binary"]
+            )
+            out2 = affinity_module2(
+                s_inputs=s_inputs.detach(),
+                z=z_affinity.detach(),
+                x_pred=coords_affinity,
+                feats=feats,
+                multiplicity=1,
+                use_kernels=use_kernels,
+                **module_kwargs,
+            )
+            out2["affinity_probability_binary"] = torch.nn.functional.sigmoid(
+                out2["affinity_logits_binary"]
+            )
+            avg_pred = (out1["affinity_pred_value"] + out2["affinity_pred_value"]) / 2
+            avg_prob = (
+                out1["affinity_probability_binary"]
+                + out2["affinity_probability_binary"]
+            ) / 2
+            if model.affinity_mw_correction:
+                model_coef = 1.03525938
+                mw_coef = -0.59992683
+                bias = 2.83288489
+                mw = feats["affinity_mw"][0] ** 0.3
+                avg_pred = model_coef * avg_pred + mw_coef * mw + bias
+            results["affinity_pred_value"] = avg_pred.item()
+            results["affinity_probability_binary"] = avg_prob.item()
+            results["affinity_pred_value1"] = out1["affinity_pred_value"].item()
+            results["affinity_pred_value2"] = out2["affinity_pred_value"].item()
+            results["affinity_probability_binary1"] = out1[
+                "affinity_probability_binary"
+            ].item()
+            results["affinity_probability_binary2"] = out2[
+                "affinity_probability_binary"
+            ].item()
+        else:
+            affinity_module = _get_module(model, "affinity_module")
+            out = affinity_module(
+                s_inputs=s_inputs.detach(),
+                z=z_affinity.detach(),
+                x_pred=coords_affinity,
+                feats=feats,
+                multiplicity=1,
+                use_kernels=use_kernels,
+                **module_kwargs,
+            )
+            results["affinity_pred_value"] = out["affinity_pred_value"].item()
+            results["affinity_probability_binary"] = torch.nn.functional.sigmoid(
+                out["affinity_logits_binary"]
+            ).item()
+
+    return results
+
+
 @torch.inference_mode()
 def affinity_forward(
     model: Any,
     feats: Dict[str, Tensor],
     recycling_steps: int = 3,
+    *,
+    zero_z_trunk: bool = False,
+    zero_s_inputs: bool = False,
+    disable_distogram: bool = False,
+    pose_noise_sigma: float = 0.0,
+    pose_noise_seed: Optional[int] = None,
+    pose_noise_target: str = "ligand",
+    zero_atom_encoder: bool = False,
+    zero_msa_profile: bool = False,
+    zero_res_type: bool = False,
 ) -> Dict[str, Any]:
     """Run trunk + affinity head, skipping diffusion and confidence.
 
@@ -389,6 +698,30 @@ def affinity_forward(
         (tokenize → crop → featurize) with PDB coordinates.
     recycling_steps : int
         Number of recycling iterations for the trunk.
+    zero_z_trunk : bool
+        If True, zero the pair representation ``z`` passed to the affinity
+        head (ablation: removes trunk pair signal).
+    zero_s_inputs : bool
+        If True, zero the single representation ``s_inputs`` passed to the
+        affinity head (ablation: removes per-token single signal).
+    disable_distogram : bool
+        If True, skip the distogram contribution inside the affinity
+        module (ablation: removes pose-distance signal).
+    pose_noise_sigma : float
+        Gaussian noise standard deviation (Å) added to atom coordinates
+        before the affinity head. ``0`` disables noise.
+    pose_noise_seed : int or None
+        RNG seed for reproducibility of the noise. If ``None``, draws
+        from the global torch RNG.
+    pose_noise_target : {"ligand", "all", "receptor"}
+        Which atoms to perturb. Default ``"ligand"`` perturbs only atoms
+        belonging to the ligand (affinity binder).
+    zero_atom_encoder, zero_msa_profile, zero_res_type : bool
+        Sub-component ablations of the affinity-pass ``InputEmbedder``
+        output. Each one zeroes one of the three additive paths inside
+        ``InputEmbedder.forward`` (atom encoder, MSA profile, residue
+        type). Implemented by recomputing the affinity-pass embedding
+        with the targeted feature tensor in ``feats`` zeroed.
 
     Returns
     -------
@@ -402,163 +735,25 @@ def affinity_forward(
         If ``feats`` does not contain ``coords`` (PDB coordinates must
         be injected before calling this function).
     """
-    # ── Safety check: PDB coordinates must be present ─────────────
-    if "coords" not in feats:
-        raise RuntimeError(
-            "AFFINITY-ONLY MODE: 'coords' not found in features. "
-            "PDB coordinates must be injected before calling "
-            "affinity_forward(). This function does NOT run diffusion."
-        )
-    model.eval()
-
-    # ── Trunk ─────────────────────────────────────────────────────────
-    s_inputs = model.input_embedder(feats)
-
-    # Initialize sequence embeddings
-    s_init = model.s_init(s_inputs)
-
-    # Initialize pairwise embeddings
-    z_init = (
-        model.z_init_1(s_inputs)[:, :, None]
-        + model.z_init_2(s_inputs)[:, None, :]
+    # Single source of truth: run the trunk, then the head.  The two
+    # split helpers below carry the actual implementation; this entry
+    # point is preserved for backward compatibility and stays the
+    # canonical call for one-shot trunk + head inference.
+    trunk_out = affinity_trunk_forward(
+        model, feats, recycling_steps=recycling_steps,
     )
-    relative_position_encoding = model.rel_pos(feats)
-    z_init = z_init + relative_position_encoding
-    z_init = z_init + model.token_bonds(feats["token_bonds"].float())
-    if model.bond_type_feature:
-        z_init = z_init + model.token_bonds_type(feats["type_bonds"].long())
-    z_init = z_init + model.contact_conditioning(feats)
-
-    # Recycling
-    s = torch.zeros_like(s_init)
-    z = torch.zeros_like(z_init)
-
-    mask = feats["token_pad_mask"].float()
-    pair_mask = mask[:, :, None] * mask[:, None, :]
-
-    use_kernels = model.use_kernels
-
-    msa_module = _get_module(model, "msa_module")
-    pairformer_module = _get_module(model, "pairformer_module")
-
-    for _i in range(recycling_steps + 1):
-        s = s_init + model.s_recycle(model.s_norm(s))
-        z = z_init + model.z_recycle(model.z_norm(z))
-
-        # Templates (if model uses them)
-        if model.use_templates:
-            template_module = _get_module(model, "template_module")
-            z = z + template_module(z, feats, pair_mask, use_kernels=use_kernels)
-
-        z = z + msa_module(z, s_inputs, feats, use_kernels=use_kernels)
-
-        s, z = pairformer_module(
-            s, z,
-            mask=mask,
-            pair_mask=pair_mask,
-            use_kernels=use_kernels,
-        )
-
-    # ── Affinity Head ─────────────────────────────────────────────────
-    # Build cross-pair mask (ligand × receptor + receptor × ligand + ligand × ligand)
-    pad_token_mask = feats["token_pad_mask"][0]
-    rec_mask = feats["mol_type"][0] == 0
-    rec_mask = rec_mask * pad_token_mask
-    lig_mask = feats["affinity_token_mask"][0].to(torch.bool)
-    lig_mask = lig_mask * pad_token_mask
-    cross_pair_mask = (
-        lig_mask[:, None] * rec_mask[None, :]
-        + rec_mask[:, None] * lig_mask[None, :]
-        + lig_mask[:, None] * lig_mask[None, :]
+    return affinity_head_forward(
+        model, feats, trunk_out,
+        zero_z_trunk=zero_z_trunk,
+        zero_s_inputs=zero_s_inputs,
+        disable_distogram=disable_distogram,
+        pose_noise_sigma=pose_noise_sigma,
+        pose_noise_seed=pose_noise_seed,
+        pose_noise_target=pose_noise_target,
+        zero_atom_encoder=zero_atom_encoder,
+        zero_msa_profile=zero_msa_profile,
+        zero_res_type=zero_res_type,
     )
-    z_affinity = z * cross_pair_mask[None, :, :, None]
-
-    # Use PDB coordinates directly as x_pred
-    # feats["coords"] shape: (B, N_atoms, 3) — the injected PDB coords
-    coords_affinity = feats["coords"].detach()
-    if coords_affinity.dim() == 3:
-        coords_affinity = coords_affinity[None]  # add ensemble dim → (1, B, N, 3)
-    elif coords_affinity.dim() == 4 and coords_affinity.shape[1] > 1:
-        # Multiple ensembles; take the first
-        coords_affinity = coords_affinity[:, :1]
-
-    # Re-embed with affinity=True
-    s_inputs = model.input_embedder(feats, affinity=True)
-
-    results: Dict[str, Any] = {}
-
-    with torch.autocast("cuda", enabled=False):
-        if model.affinity_ensemble:
-            affinity_module1 = _get_module(model, "affinity_module1")
-            affinity_module2 = _get_module(model, "affinity_module2")
-
-            out1 = affinity_module1(
-                s_inputs=s_inputs.detach(),
-                z=z_affinity.detach(),
-                x_pred=coords_affinity,
-                feats=feats,
-                multiplicity=1,
-                use_kernels=use_kernels,
-            )
-            out1["affinity_probability_binary"] = torch.nn.functional.sigmoid(
-                out1["affinity_logits_binary"]
-            )
-
-            out2 = affinity_module2(
-                s_inputs=s_inputs.detach(),
-                z=z_affinity.detach(),
-                x_pred=coords_affinity,
-                feats=feats,
-                multiplicity=1,
-                use_kernels=use_kernels,
-            )
-            out2["affinity_probability_binary"] = torch.nn.functional.sigmoid(
-                out2["affinity_logits_binary"]
-            )
-
-            # Ensemble average
-            avg_pred = (out1["affinity_pred_value"] + out2["affinity_pred_value"]) / 2
-            avg_prob = (
-                out1["affinity_probability_binary"]
-                + out2["affinity_probability_binary"]
-            ) / 2
-
-            # MW correction
-            if model.affinity_mw_correction:
-                model_coef = 1.03525938
-                mw_coef = -0.59992683
-                bias = 2.83288489
-                mw = feats["affinity_mw"][0] ** 0.3
-                avg_pred = model_coef * avg_pred + mw_coef * mw + bias
-
-            results["affinity_pred_value"] = avg_pred.item()
-            results["affinity_probability_binary"] = avg_prob.item()
-            results["affinity_pred_value1"] = out1["affinity_pred_value"].item()
-            results["affinity_pred_value2"] = out2["affinity_pred_value"].item()
-            results["affinity_probability_binary1"] = out1[
-                "affinity_probability_binary"
-            ].item()
-            results["affinity_probability_binary2"] = out2[
-                "affinity_probability_binary"
-            ].item()
-        else:
-            affinity_module = _get_module(model, "affinity_module")
-
-            out = affinity_module(
-                s_inputs=s_inputs.detach(),
-                z=z_affinity.detach(),
-                x_pred=coords_affinity,
-                feats=feats,
-                multiplicity=1,
-                use_kernels=use_kernels,
-            )
-
-            results["affinity_pred_value"] = out["affinity_pred_value"].item()
-            results["affinity_probability_binary"] = torch.nn.functional.sigmoid(
-                out["affinity_logits_binary"]
-            ).item()
-
-    return results
 
 
 def run_direct_affinity_inference(
@@ -623,7 +818,7 @@ def run_direct_affinity_inference(
     from boltz.data.mol import load_canonicals, load_molecules
     from boltz.data.module.inferencev2 import load_input
     from boltz.data.tokenize.boltz2 import Boltz2Tokenizer
-    from boltz.data.types import Manifest, Record, StructureV2
+    from boltz.data.types import Record, StructureV2
     from boltz.main import process_input
 
     if cache_dir is None:

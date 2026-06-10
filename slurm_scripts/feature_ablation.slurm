@@ -20,7 +20,7 @@ module load cuda/12.8.1
 cd /home/limcaoco/turbo/limcaoco/Boltz_affinity
 export BOLTZ_CACHE=/home/limcaoco/turbo/limcaoco/.boltz
 
-mkdir -p experiment_files/results/ablation logs
+mkdir -p ablation_experiment/results/ablation logs
 
 # ── Configuration ────────────────────────────────────────────────────
 # Uncomment ONE of the run modes below, or customise as needed.
@@ -43,7 +43,7 @@ mkdir -p experiment_files/results/ablation logs
 # --- Mode 4: Single receptor quick test (default) ---
 #MAX_LIGANDS=10
 #EXPERIMENTS=""
-#INPUT_FLAG="--receptor experiment_files/receptors/AA2AR_receptor.pdb --ligands experiment_files/DOCK3.8_poses/AA2AR_poses.mol2"
+#INPUT_FLAG="--receptor ablation_experiment/receptors/AA2AR_receptor.pdb --ligands ablation_experiment/DOCK3.8_poses/AA2AR_poses.mol2"
 
 # ── Run ──────────────────────────────────────────────────────────────
 echo "Starting feature ablation at $(date)"
@@ -51,12 +51,27 @@ echo "Input: ${INPUT_FLAG}"
 echo "Max ligands: ${MAX_LIGANDS}"
 echo "Experiments: ${EXPERIMENTS:-all}"
 
-python experiment_files/experiment_scripts/run_feature_ablation.py \
+python ablation_experiment/experiment_scripts/run_feature_ablation.py \
     ${INPUT_FLAG} \
     --max-ligands ${MAX_LIGANDS} \
     ${EXPERIMENTS} \
     --use-msa-server \
-    --output experiment_files/results/ablation/feature_ablation_results.csv \
+    --output ablation_experiment/results/ablation/feature_ablation_results.csv \
     --log-level INFO
 
 echo "Feature ablation finished at $(date) with exit code $?"
+
+# ── Post-processing ───────────────────────────────────────────────────
+# Bootstrap logAUC (existing analysis).
+python ablation_experiment/analysis_scripts/compute_ablation_bootstrap.py \
+    || echo "compute_ablation_bootstrap.py failed (continuing)"
+
+# Distribution stats per ablation (proposal #3): mean/std/AUROC/Cohen's d
+# split by actives vs decoys; produces bar charts + ridgeline.
+python ablation_experiment/analysis_scripts/compute_distribution_stats.py \
+    --input ablation_experiment/results/ablation/feature_ablation_results.csv \
+    --output-dir ablation_experiment/analysis_data/distribution_stats \
+    --ridgeline \
+    || echo "compute_distribution_stats.py failed (continuing)"
+
+echo "Post-processing finished at $(date)"

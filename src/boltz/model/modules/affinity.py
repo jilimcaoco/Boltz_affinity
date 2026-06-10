@@ -82,6 +82,8 @@ class AffinityModule(nn.Module):
         feats,
         multiplicity=1,
         use_kernels=False,
+        *,
+        disable_distogram: bool = False,
     ):
         z = self.z_linear(self.z_norm(z))
         z = z.repeat_interleave(multiplicity, 0)
@@ -102,12 +104,25 @@ class AffinityModule(nn.Module):
             B = BM // multiplicity
             mult = multiplicity
         x_pred_repr = torch.bmm(token_to_rep_atom.float(), x_pred)
-        d = torch.cdist(x_pred_repr, x_pred_repr)
 
-        distogram = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
-        distogram = self.dist_bin_pairwise_embed(distogram)
-
-        z = z + self.pairwise_conditioner(z_trunk=z, token_rel_pos_feats=distogram)
+        if disable_distogram:
+            # Ablation: skip the distogram contribution entirely. We still
+            # need a zero-valued tensor of the right shape to keep the
+            # PairwiseConditioner signature happy.
+            distogram = torch.zeros(
+                z.shape[0], z.shape[1], z.shape[2], z.shape[-1],
+                device=z.device, dtype=z.dtype,
+            )
+            z = z + self.pairwise_conditioner(
+                z_trunk=z, token_rel_pos_feats=distogram
+            )
+        else:
+            d = torch.cdist(x_pred_repr, x_pred_repr)
+            distogram = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
+            distogram = self.dist_bin_pairwise_embed(distogram)
+            z = z + self.pairwise_conditioner(
+                z_trunk=z, token_rel_pos_feats=distogram
+            )
 
         pad_token_mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
         rec_mask = (feats["mol_type"] == 0).repeat_interleave(multiplicity, 0)
