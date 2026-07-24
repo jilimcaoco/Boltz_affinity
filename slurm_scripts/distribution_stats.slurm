@@ -11,7 +11,7 @@
 #SBATCH --mail-user=limcaoco@umich.edu
 #SBATCH --output=logs/distribution_stats_%j.log
 
-source ~/opt/anaconda3/etc/profile.d/conda.sh
+source ~/miniconda3/etc/profile.d/conda.sh
 conda activate boltz_affinity
 
 cd /home/limcaoco/turbo/limcaoco/Boltz_affinity

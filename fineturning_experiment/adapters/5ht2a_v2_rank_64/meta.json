@@ -1,0 +1,110 @@
+{
+  "name": "5ht2a_v2_rank_64",
+  "created_at": 1782820521.5412385,
+  "boltz_version": null,
+  "base_checkpoint_sha256": null,
+  "base_checkpoint_path": null,
+  "config": {
+    "rank": 32,
+    "alpha": 64.0,
+    "dropout": 0.0,
+    "target_spec": "heads_pairformer",
+    "target_patterns": []
+  },
+  "adapted_layers": [],
+  "history": [
+    {
+      "started_at": 1781286357.01029,
+      "finished_at": 1782820521.5412195,
+      "data_manifest": "/nfs/turbo/umms-maom/limcaoco/Boltz_affinity/fineturning_experiment/manifests/lora_manifest_5HT2A.csv",
+      "data_sha256": null,
+      "data_rows": null,
+      "mode": "rescore",
+      "loss_spec": "boltz2_affinity",
+      "epochs": 20,
+      "learning_rate": 0.0001,
+      "batch_size": 32,
+      "metrics": [
+        {
+          "epoch": 0.0,
+          "loss": 1.6773704040403985
+        },
+        {
+          "epoch": 1.0,
+          "loss": 1.6035125221989373
+        },
+        {
+          "epoch": 2.0,
+          "loss": 1.5607240693677555
+        },
+        {
+          "epoch": 3.0,
+          "loss": 1.535220618573102
+        },
+        {
+          "epoch": 4.0,
+          "loss": 1.5374117307771336
+        },
+        {
+          "epoch": 5.0,
+          "loss": 1.542658720964735
+        },
+        {
+          "epoch": 6.0,
+          "loss": 1.5384226142276418
+        },
+        {
+          "epoch": 7.0,
+          "loss": 1.504188032649796
+        },
+        {
+          "epoch": 8.0,
+          "loss": 1.4857181547988545
+        },
+        {
+          "epoch": 9.0,
+          "loss": 1.5002837676351721
+        },
+        {
+          "epoch": 10.0,
+          "loss": 1.4759630952233618
+        },
+        {
+          "epoch": 11.0,
+          "loss": 1.4975919248841025
+        },
+        {
+          "epoch": 12.0,
+          "loss": 1.4947156728939577
+        },
+        {
+          "epoch": 13.0,
+          "loss": 1.4686346486481754
+        },
+        {
+          "epoch": 14.0,
+          "loss": 1.4590351293777877
+        },
+        {
+          "epoch": 15.0,
+          "loss": 1.4494479366764426
+        },
+        {
+          "epoch": 16.0,
+          "loss": 1.463865658044815
+        },
+        {
+          "epoch": 17.0,
+          "loss": 1.4613776662132956
+        },
+        {
+          "epoch": 18.0,
+          "loss": 1.4460045659271155
+        }
+      ],
+      "notes": "5HT2A LoRA rank=32 alpha=64 \u2014 meta.json recovered from checkpoint after FileExistsError bug (checkpoint dir pre-existed registry.save)"
+    }
+  ],
+  "parent_adapter": null,
+  "format_version": 1
+}

@@ -1,0 +1,4 @@
+name,adapter_type,target,rank,lr,batch_size,loss_spec,data_rows,total_epochs_run,best_epoch,initial_loss,best_loss,final_loss,pct_loss_reduction,total_hours
+5ht2a_v1,lora,5HT2A,8.0,0.0001,8,boltz2_affinity,4726,5,5.0,1.64062,1.47973,1.47973,9.81,21.79
+drd4_v1,lora,DRD4,8.0,0.0001,8,boltz2_affinity,2668,5,3.0,1.64911,1.42674,1.44984,13.48,11.99
+drd4_full_v1,finetune,DRD4,,1e-05,32,boltz2_affinity,2668,11,8.0,2.28412,1.50649,1.53271,34.04,30.74

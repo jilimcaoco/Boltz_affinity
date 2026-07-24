@@ -1,0 +1,123 @@
+#!/bin/bash
+#SBATCH --job-name=dudez_ablation
+#SBATCH --account=maom0
+#SBATCH --partition=spgpu
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem-per-gpu=48000m
+#SBATCH --time=72:00:00
+#SBATCH --mail-type=FAIL,END
+#SBATCH --mail-user=limcaoco@umich.edu
+#SBATCH --chdir=/home/limcaoco/turbo/limcaoco/Boltz_affinity
+#SBATCH --output=/home/limcaoco/turbo/limcaoco/Boltz_affinity/ablation_experiment/logs/dudez_ablation_%A_%a.log
+#
+# DUDEZ feature-ablation pipeline — one SLURM array task per receptor.
+# Each task:
+#   1. Untars combined_structures.tar.gz if the directory isn't already
+#      populated (idempotent — skipped on retry).
+#   2. Runs ablation_experiment/experiment_scripts/run_feature_ablation_dudez.py
+#      against that single receptor.
+#   3. Writes per-receptor CSV under
+#      ablation_experiment/results/dudez_ablation/<RECEPTOR>_dudez_ablation.csv
+#
+# Submission helper:
+#   ablation_experiment/experiment_scripts/submit_feature_ablation_dudez.sh
+# resolves the receptor list, writes it to the manifest and submits this
+# script as an array indexed into the manifest.
+
+set -euo pipefail
+
+# ── Environment ──────────────────────────────────────────────────────
+#module load cuda/12.8.1
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate boltz_affinity
+
+# Ensure conda's C/C++ runtime is preferred over system libstdc++ on compute nodes.
+if [[ -n "${CONDA_PREFIX:-}" ]]; then
+    export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+fi
+
+cd /home/limcaoco/turbo/limcaoco/Boltz_affinity
+export BOLTZ_CACHE=/home/limcaoco/turbo/limcaoco/.boltz
+
+echo "[$(date)] env sanity: CONDA_PREFIX=${CONDA_PREFIX:-unset}"
+echo "[$(date)] env sanity: python=$(which python)"
+echo "[$(date)] env sanity: LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-unset}"
+
+mkdir -p ablation_experiment/logs ablation_experiment/results/dudez_ablation
+
+# ── Receptor selection ──────────────────────────────────────────────
+# Manifest is 1 line per receptor; SLURM_ARRAY_TASK_ID picks the row.
+MANIFEST="${MANIFEST:-ablation_experiment/results/dudez_ablation/_receptor_manifest.txt}"
+if [[ ! -f "${MANIFEST}" ]]; then
+    echo "ERROR: receptor manifest not found at ${MANIFEST}." >&2
+    echo "Submit via submit_feature_ablation_dudez.sh, which builds it." >&2
+    exit 2
+fi
+
+RECEPTOR=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "${MANIFEST}")
+if [[ -z "${RECEPTOR}" ]]; then
+    echo "ERROR: empty receptor at line ${SLURM_ARRAY_TASK_ID} of ${MANIFEST}" >&2
+    exit 3
+fi
+
+echo "[$(date)] task ${SLURM_ARRAY_TASK_ID} receptor=${RECEPTOR}"
+
+# ── Paths ───────────────────────────────────────────────────────────
+BOLTZ_OUTPUTS_ROOT="${BOLTZ_OUTPUTS_ROOT:-/scratch/maom_root/maom/limcaoco/Boltz_outputs}"
+DUDEZ_INPUTS_ROOT="${DUDEZ_INPUTS_ROOT:-/home/limcaoco/turbo/limcaoco/boltz_benchmark/input_files/DUDEZ_benchmark}"
+MSA_DIR="${MSA_DIR:-/home/limcaoco/turbo/limcaoco/boltz_benchmark/input_files/msa}"
+
+RECEPTOR_DIR="${BOLTZ_OUTPUTS_ROOT}/${RECEPTOR}"
+STRUCTURES_DIR="${RECEPTOR_DIR}/combined_structures"
+TARBALL="${RECEPTOR_DIR}/combined_structures.tar.gz"
+SMILES_CSV="${DUDEZ_INPUTS_ROOT}/${RECEPTOR}_combined_ids.csv"
+MSA_PATH="${MSA_DIR}/${RECEPTOR}_mmseqs2.a3m"
+OUTPUT="ablation_experiment/results/dudez_ablation/${RECEPTOR}_dudez_ablation.csv"
+
+# ── Untar combined_structures if missing ────────────────────────────
+# Treat "directory exists with at least one .cif" as already-extracted.
+needs_untar=1
+if [[ -d "${STRUCTURES_DIR}" ]]; then
+    if compgen -G "${STRUCTURES_DIR}/*.cif" > /dev/null; then
+        needs_untar=0
+    fi
+fi
+if [[ "${needs_untar}" == "1" ]]; then
+    if [[ ! -f "${TARBALL}" ]]; then
+        echo "ERROR: tarball not found: ${TARBALL}" >&2
+        exit 4
+    fi
+    echo "[$(date)] extracting ${TARBALL} ..."
+    mkdir -p "${RECEPTOR_DIR}"
+    tar -xf "${TARBALL}" -C "${RECEPTOR_DIR}"
+    if ! compgen -G "${STRUCTURES_DIR}/*.cif" > /dev/null; then
+        echo "ERROR: extraction did not produce CIFs in ${STRUCTURES_DIR}" >&2
+        exit 5
+    fi
+    echo "[$(date)] extraction OK."
+else
+    echo "[$(date)] reusing existing structures dir."
+fi
+
+# ── Sanity-check inputs ─────────────────────────────────────────────
+for p in "${SMILES_CSV}" "${MSA_PATH}"; do
+    if [[ ! -f "${p}" ]]; then
+        echo "ERROR: required input missing: ${p}" >&2
+        exit 6
+    fi
+done
+
+# ── Run ─────────────────────────────────────────────────────────────
+EXTRA_ARGS=("${@}")
+echo "[$(date)] launching run_feature_ablation_dudez.py"
+python ablation_experiment/experiment_scripts/run_feature_ablation_dudez.py \
+    --receptor "${RECEPTOR}" \
+    --boltz-outputs-root "${BOLTZ_OUTPUTS_ROOT}" \
+    --dudez-inputs-root "${DUDEZ_INPUTS_ROOT}" \
+    --msa-dir "${MSA_DIR}" \
+    --output "${OUTPUT}" \
+    --log-level INFO \
+    "${EXTRA_ARGS[@]}"
+
+echo "[$(date)] task ${SLURM_ARRAY_TASK_ID} (${RECEPTOR}) finished with $?"

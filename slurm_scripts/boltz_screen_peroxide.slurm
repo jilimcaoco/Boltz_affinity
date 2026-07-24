@@ -16,7 +16,7 @@
 #mkdir -p logs
 
 # Load conda environment
-source ~/opt/anaconda3/etc/profile.d/conda.sh
+source ~/miniconda3/etc/profile.d/conda.sh
 conda activate boltz_affinity
 module load cuda/12.8.1
 # Set working directory

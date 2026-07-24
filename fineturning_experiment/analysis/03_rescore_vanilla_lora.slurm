@@ -54,14 +54,13 @@ _should_rescore() {
     return 0
 }
 
-run_pair() {
-    local tgt="$1" lora="$2" finetune="$3"
+rescore_vanilla() {
+    local tgt="$1"
     local in_dir="${VAL_POSES_DIR}/${tgt}"
     if [[ ! -d "${in_dir}" ]] || [[ -z "$(ls -A "${in_dir}" 2>/dev/null)" ]]; then
         echo "[$(date)] WARNING: no poses for ${tgt} at ${in_dir}; skipping."
         return
     fi
-
     if _should_rescore "${SCORES_DIR}/${tgt}_vanilla.csv" "${tgt} VANILLA"; then
         echo "[$(date)] rescore ${tgt} VANILLA"
         boltz rescore batch \
@@ -72,34 +71,69 @@ run_pair() {
             --msa-directory "${MSA_DIR}" \
             --log-level   INFO
     fi
+}
 
-    if _should_rescore "${SCORES_DIR}/${tgt}_lora.csv" "${tgt} LoRA=${lora}"; then
-        echo "[$(date)] rescore ${tgt} LoRA=${lora}"
-        boltz rescore batch \
-            --input-dir   "${in_dir}" \
-            --output      "${SCORES_DIR}/${tgt}_lora.csv" \
-            --output-format csv \
-            --device      cuda \
-            --msa-directory "${MSA_DIR}" \
-            --use-lora    "${lora}" \
-            --log-level   INFO
+rescore_lora() {
+    local tgt="$1" adapter="$2"
+    local in_dir="${VAL_POSES_DIR}/${tgt}"
+    if [[ ! -d "${in_dir}" ]] || [[ -z "$(ls -A "${in_dir}" 2>/dev/null)" ]]; then
+        return
     fi
-
-    if _should_rescore "${SCORES_DIR}/${tgt}_finetune.csv" "${tgt} FINETUNE=${finetune}"; then
-        echo "[$(date)] rescore ${tgt} FINETUNE=${finetune}"
+    if _should_rescore "${SCORES_DIR}/${tgt}_lora_${adapter}.csv" "${tgt} LoRA=${adapter}"; then
+        echo "[$(date)] rescore ${tgt} LoRA=${adapter}"
         boltz rescore batch \
             --input-dir   "${in_dir}" \
-            --output      "${SCORES_DIR}/${tgt}_finetune.csv" \
+            --output      "${SCORES_DIR}/${tgt}_lora_${adapter}.csv" \
             --output-format csv \
             --device      cuda \
             --msa-directory "${MSA_DIR}" \
-            --use-finetune "${finetune}" \
+            --use-lora    "${adapter}" \
             --log-level   INFO
     fi
 }
 
-run_pair DRD4   "${DRD4_LORA_NAME}"  "${DRD4_FINETUNE_NAME}"
-run_pair 5HT2A  "${HT2A_LORA_NAME}"  "${HT2A_FINETUNE_NAME}"
+rescore_finetune() {
+    local tgt="$1" adapter="$2"
+    local in_dir="${VAL_POSES_DIR}/${tgt}"
+    if [[ ! -d "${in_dir}" ]] || [[ -z "$(ls -A "${in_dir}" 2>/dev/null)" ]]; then
+        return
+    fi
+    if _should_rescore "${SCORES_DIR}/${tgt}_finetune_${adapter}.csv" "${tgt} FINETUNE=${adapter}"; then
+        echo "[$(date)] rescore ${tgt} FINETUNE=${adapter}"
+        boltz rescore batch \
+            --input-dir   "${in_dir}" \
+            --output      "${SCORES_DIR}/${tgt}_finetune_${adapter}.csv" \
+            --output-format csv \
+            --device      cuda \
+            --msa-directory "${MSA_DIR}" \
+            --use-finetune "${adapter}" \
+            --log-level   INFO
+    fi
+}
+
+# Score vanilla baseline once per target
+rescore_vanilla DRD4
+rescore_vanilla 5HT2A
+
+# Score all LoRA adapters for each target
+for lora in ${DRD4_LORA_NAMES}; do
+    rescore_lora DRD4 "${lora}"
+done
+for lora in ${HT2A_LORA_NAMES}; do
+    rescore_lora 5HT2A "${lora}"
+done
+
+# Score all finetune adapters (if defined)
+if [[ -n "${DRD4_FINETUNE_NAMES:-}" ]]; then
+    for ft in ${DRD4_FINETUNE_NAMES}; do
+        rescore_finetune DRD4 "${ft}"
+    done
+fi
+if [[ -n "${HT2A_FINETUNE_NAMES:-}" ]]; then
+    for ft in ${HT2A_FINETUNE_NAMES}; do
+        rescore_finetune 5HT2A "${ft}"
+    done
+fi
 
 echo "[$(date)] Done.  Score files:"
 ls -lh "${SCORES_DIR}"

@@ -69,6 +69,10 @@ class TrainArgs:
     early_stopping_min_delta: float = 0.005
     # Loss curve: save loss_curve.png to the adapter directory after training.
     plot_loss_curve: bool = True
+    # Validation: path to a separate validation CSV, or fraction [0,1) of
+    # training rows to hold out.  When both are None/0 no validation is run.
+    val_csv_path: Optional[str] = None
+    val_split: float = 0.0
 
 
 def _pick_device(spec: str) -> torch.device:
@@ -78,15 +82,17 @@ def _pick_device(spec: str) -> torch.device:
 
 
 def _plot_loss_curve(
-    metrics: list[dict],
+    metrics: list[dict],  # must contain at least "epoch" and "loss" keys
     output_path: Path,
     *,
     title: str = "LoRA Training Loss",
 ) -> None:
-    """Save a loss-vs-epoch PNG to *output_path*.
+    """Save a train (+optional val) loss-vs-epoch PNG to *output_path*.
 
     Requires ``matplotlib``. If it is not installed a warning is logged and
     the function returns silently so training is never blocked.
+    When metrics dicts contain a ``val_loss`` key the validation curve is
+    plotted on the same axes alongside the training curve.
     """
     try:
         import matplotlib
@@ -101,36 +107,113 @@ def _plot_loss_curve(
 
     epochs = [int(m["epoch"]) + 1 for m in metrics]
     losses = [m["loss"] for m in metrics]
+    val_losses = [m.get("val_loss") for m in metrics]
+    has_val = any(v is not None for v in val_losses)
 
     fig, ax = plt.subplots(figsize=(7, 4))
+
     ax.plot(
         epochs, losses,
-        marker="o", linewidth=1.8, markersize=5, color="#2979ff", label="mean loss",
+        marker="o", linewidth=1.8, markersize=5, color="#2979ff", label="train loss",
     )
+
+    if has_val:
+        val_y = [v if v is not None else float("nan") for v in val_losses]
+        ax.plot(
+            epochs, val_y,
+            marker="s", linewidth=1.8, markersize=5, color="#e65100",
+            linestyle="--", label="val loss",
+        )
+        # Mark best val epoch
+        finite_val = [(i, v) for i, v in enumerate(val_y) if not (v != v)]  # filter nan
+        if finite_val:
+            best_vi, best_vv = min(finite_val, key=lambda x: x[1])
+            ax.axvline(x=epochs[best_vi], color="#e65100", linestyle=":", linewidth=1, alpha=0.7)
+            ax.annotate(
+                f"val best: {best_vv:.4f}\n(epoch {epochs[best_vi]})",
+                xy=(epochs[best_vi], best_vv),
+                xytext=(8, -18),
+                textcoords="offset points",
+                fontsize=8,
+                color="#e65100",
+            )
+    else:
+        # Annotate the best (minimum) training epoch
+        min_idx = losses.index(min(losses))
+        ax.axvline(x=epochs[min_idx], color="#d32f2f", linestyle="--", linewidth=1, alpha=0.7)
+        ax.annotate(
+            f"best: {losses[min_idx]:.4f}\n(epoch {epochs[min_idx]})",
+            xy=(epochs[min_idx], losses[min_idx]),
+            xytext=(8, 6),
+            textcoords="offset points",
+            fontsize=8,
+            color="#d32f2f",
+        )
+
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Mean Loss")
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
     ax.set_xticks(epochs)
-
-    # Annotate the best (minimum) epoch
-    min_idx = losses.index(min(losses))
-    ax.axvline(x=epochs[min_idx], color="#d32f2f", linestyle="--", linewidth=1, alpha=0.7)
-    ax.annotate(
-        f"best: {losses[min_idx]:.4f}\n(epoch {epochs[min_idx]})",
-        xy=(epochs[min_idx], losses[min_idx]),
-        xytext=(8, 6),
-        textcoords="offset points",
-        fontsize=8,
-        color="#d32f2f",
-    )
-
     ax.legend(fontsize=8)
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
     logger.info("Loss curve saved to %s", output_path)
+
+
+# ── Checkpoint helpers ───────────────────────────────────────────────────────
+
+_CKPT_PREFIX = "checkpoint_epoch_"
+_CKPT_SUFFIX = ".pt"
+
+
+def _checkpoint_path_for_epoch(directory: Path, epoch_completed: int) -> Path:
+    return directory / f"{_CKPT_PREFIX}{epoch_completed + 1:04d}{_CKPT_SUFFIX}"
+
+
+def _iter_checkpoint_paths(directory: Path) -> list[Path]:
+    return sorted(directory.glob(f"{_CKPT_PREFIX}*{_CKPT_SUFFIX}"))
+
+
+def _latest_checkpoint_path(directory: Path) -> Optional[Path]:
+    candidates = _iter_checkpoint_paths(directory)
+    return candidates[-1] if candidates else None
+
+
+def _save_checkpoint(path: Path, data: dict) -> None:
+    """Atomically write a torch-pickled checkpoint at *path*.
+
+    Uses a sibling temp file + POSIX rename so that a crash mid-write never
+    leaves a corrupt checkpoint. Safe on all POSIX filesystems (SLURM scratch,
+    NFS turbo volumes, etc.).
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        torch.save(data, tmp)
+        tmp.replace(path)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
+
+
+def _load_checkpoint(path: Path) -> Optional[dict]:
+    """Load a checkpoint saved by :func:`_save_checkpoint`.
+
+    Returns ``None`` (and logs a warning) when the file is absent or corrupt so
+    that callers can fall back to a clean training start without crashing.
+    """
+    if not path.exists():
+        return None
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)  # noqa: S614
+    except Exception as exc:
+        logger.warning(
+            "Could not load checkpoint %s (%s) — starting from scratch.", path, exc
+        )
+        return None
 
 
 def _extract_row_from_batch(batch: dict[str, Any], i: int) -> dict[str, Any]:
@@ -545,17 +628,61 @@ def train_lora(
 
     dataset = LoRADataset(args.csv_path, mode=args.mode)
 
+    # ── Build train / val datasets ────────────────────────────────────────────
+    # Priority: explicit val CSV > random split > no validation.
+    val_dataset: Optional[LoRADataset] = None
+    if args.val_csv_path:
+        val_dataset = LoRADataset(args.val_csv_path, mode=args.mode)
+        train_dataset = dataset
+        logger.info(
+            "Validation CSV: %d rows (%s)",
+            len(val_dataset), args.val_csv_path,
+        )
+    elif args.val_split and 0.0 < args.val_split < 1.0:
+        import math as _math
+        import copy as _copy
+        n_val = max(1, int(_math.ceil(len(dataset) * args.val_split)))
+        n_train = len(dataset) - n_val
+        if n_train < 1:
+            logger.warning(
+                "val_split=%.2f leaves 0 training rows — ignoring split.",
+                args.val_split,
+            )
+            train_dataset = dataset
+        else:
+            # Deterministic stratified split: last n_val rows become validation.
+            # Rows are already randomised by the sampler each epoch, so order
+            # here is just insertion order from the CSV (stable, reproducible).
+            import torch.utils.data as _tud
+            train_dataset = _tud.Subset(dataset, list(range(n_train)))
+            val_dataset_sub = _tud.Subset(dataset, list(range(n_train, len(dataset))))
+            # Wrap in a thin proxy so __len__ / __getitem__ are consistent
+            val_dataset = val_dataset_sub  # type: ignore[assignment]
+            logger.info(
+                "val_split=%.2f → %d train rows, %d val rows.",
+                args.val_split, n_train, n_val,
+            )
+            train_dataset = train_dataset  # noqa: PLW0127 (assigned above)
+    else:
+        train_dataset = dataset
+
+    # ── Build data loaders ────────────────────────────────────────────────────
     # Use the assay-grouped batch sampler when group_id is populated and
     # batch_size > 1 so that the intra-assay pairwise Huber loss always has
     # same-assay pairs within every mini-batch.
-    has_groups = any(r.group_id for r in dataset.rows)
+    _train_rows = (
+        train_dataset.rows  # LoRADataset
+        if hasattr(train_dataset, "rows")
+        else [dataset.rows[i] for i in train_dataset.indices]  # Subset
+    )
+    has_groups = any(r.group_id for r in _train_rows)
     _sampler: Optional[AssayGroupedSampler] = None
     if args.batch_size > 1 and has_groups:
         _sampler = AssayGroupedSampler(
-            dataset.rows, batch_size=args.batch_size, shuffle=True,
+            _train_rows, batch_size=args.batch_size, shuffle=True,
         )
         loader = DataLoader(
-            dataset, batch_sampler=_sampler,
+            train_dataset, batch_sampler=_sampler,
             collate_fn=lora_collate, num_workers=0,
         )
         logger.info(
@@ -564,7 +691,14 @@ def train_lora(
         )
     else:
         loader = DataLoader(
-            dataset, batch_size=max(1, args.batch_size), shuffle=True,
+            train_dataset, batch_size=max(1, args.batch_size), shuffle=True,
+            collate_fn=lora_collate, num_workers=0,
+        )
+
+    val_loader: Optional[DataLoader] = None
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset, batch_size=1, shuffle=False,
             collate_fn=lora_collate, num_workers=0,
         )
 
@@ -615,13 +749,58 @@ def train_lora(
         notes=args.notes,
     )
 
-    # Early stopping state
+    # Early stopping state — uses val_loss when a val set is present, else train loss.
     _es_best_loss: float = float("inf")
     _es_patience_counter: int = 0
     _es_best_state: Optional[dict[str, torch.Tensor]] = None
     _es_best_epoch: int = 0
 
-    for epoch in range(args.epochs):
+    # ── Checkpoint / resume ────────────────────────────────────────────────────
+    ckpt_dir = registry.adapter_dir(args.name)
+
+    # Guard: refuse to overwrite a *completed* adapter (meta.json present) unless
+    # the user explicitly passed --overwrite.  We check here — before creating the
+    # checkpoint directory — so the error is raised before any work is done.
+    if not args.overwrite and (ckpt_dir / "meta.json").exists():
+        msg = (
+            f"Adapter '{args.name}' already exists at {ckpt_dir}. "
+            "Use --overwrite or `boltz lora update` to continue training."
+        )
+        raise FileExistsError(msg)
+
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    start_epoch = 0
+
+    if args.overwrite:
+        for ckpt_file in _iter_checkpoint_paths(ckpt_dir):
+            ckpt_file.unlink(missing_ok=True)
+        logger.info("Removed existing checkpoints (--overwrite).")
+
+    ckpt_path = _latest_checkpoint_path(ckpt_dir)
+    _ckpt = _load_checkpoint(ckpt_path) if ckpt_path is not None else None
+    if _ckpt is not None:
+        logger.info(
+            "Resuming LoRA training from checkpoint: %d epoch(s) already completed.",
+            _ckpt["epoch_completed"] + 1,
+        )
+        load_lora_state_dict(model, _ckpt["model_state"], strict=False)
+        try:
+            optim.load_state_dict(_ckpt["optim_state"])
+        except Exception as _oe:
+            logger.warning("Could not restore optimizer state (%s) — optimizer reset.", _oe)
+        run.metrics = _ckpt["metrics"]
+        run.started_at = _ckpt.get("started_at", run.started_at)
+        start_epoch = _ckpt["epoch_completed"] + 1
+        _es_best_loss = _ckpt.get("es_best_loss", float("inf"))
+        _es_patience_counter = _ckpt.get("es_patience_counter", 0)
+        _es_best_state = _ckpt.get("es_best_state")
+        _es_best_epoch = _ckpt.get("es_best_epoch", 0)
+        logger.info(
+            "Resumed: start_epoch=%d, es_best_loss=%.5f, es_patience=%d.",
+            start_epoch, _es_best_loss, _es_patience_counter,
+        )
+
+    for epoch in range(start_epoch, args.epochs):
         if _sampler is not None:
             _sampler.set_epoch(epoch)
         epoch_losses: list[float] = []
@@ -703,13 +882,62 @@ def train_lora(
             epoch_losses.append(float(loss.detach().cpu().item()))
 
         mean_loss = sum(epoch_losses) / max(1, len(epoch_losses))
-        logger.info("epoch %d / %d  mean_loss=%.5f", epoch + 1, args.epochs, mean_loss)
-        run.metrics.append({"epoch": float(epoch), "loss": mean_loss})
+        # ── Validation pass (no grad) ──────────────────────────────────────
+        mean_val_loss: Optional[float] = None
+        if val_loader is not None:
+            model.eval()
+            val_epoch_losses: list[float] = []
+            with torch.no_grad():
+                for val_batch in val_loader:
+                    val_target = val_batch["target"].to(device)
+                    try:
+                        val_feats = _featurize_row(
+                            val_batch, cache_dir=cache_dir,
+                            use_msa_server=args.use_msa_server, device=device,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        vname = (
+                            val_batch["name"][0]
+                            if isinstance(val_batch["name"], list)
+                            else val_batch["name"]
+                        )
+                        logger.warning(
+                            "Val: skipping row %r: featurization failed (%s)",
+                            vname, exc,
+                        )
+                        continue
+                    val_pred = _affinity_forward_trainable(
+                        model, val_feats, recycling_steps=args.recycling_steps,
+                    )
+                    val_batch_for_loss = {**val_batch, "target": val_target}
+                    val_loss_val = call_loss(loss_fn, val_pred, val_batch_for_loss, adapter)
+                    val_epoch_losses.append(float(val_loss_val.detach().cpu().item()))
+            model.train()
+            if val_epoch_losses:
+                mean_val_loss = sum(val_epoch_losses) / len(val_epoch_losses)
+
+        # ── Log epoch summary ──────────────────────────────────────────────
+        if mean_val_loss is not None:
+            logger.info(
+                "epoch %d / %d  train_loss=%.5f  val_loss=%.5f",
+                epoch + 1, args.epochs, mean_loss, mean_val_loss,
+            )
+            run.metrics.append({
+                "epoch": float(epoch),
+                "loss": mean_loss,
+                "val_loss": mean_val_loss,
+            })
+        else:
+            logger.info("epoch %d / %d  train_loss=%.5f", epoch + 1, args.epochs, mean_loss)
+            run.metrics.append({"epoch": float(epoch), "loss": mean_loss})
 
         # ── Early stopping ───────────────────────────────────────────────────
+        _es_stop = False
         if args.early_stopping_patience > 0:
-            if mean_loss < _es_best_loss - args.early_stopping_min_delta:
-                _es_best_loss = mean_loss
+            # Use val_loss for early stopping when available, else train loss.
+            _es_monitor = mean_val_loss if mean_val_loss is not None else mean_loss
+            if _es_monitor < _es_best_loss - args.early_stopping_min_delta:
+                _es_best_loss = _es_monitor
                 _es_patience_counter = 0
                 _es_best_epoch = epoch + 1
                 _es_best_state = {
@@ -717,15 +945,17 @@ def train_lora(
                     for k, v in lora_state_dict(model).items()
                 }
                 logger.info(
-                    "Early stopping: new best loss=%.5f at epoch %d",
+                    "Early stopping: new best %s=%.5f at epoch %d",
+                    "val_loss" if mean_val_loss is not None else "train_loss",
                     _es_best_loss, _es_best_epoch,
                 )
             else:
                 _es_patience_counter += 1
                 logger.info(
                     "Early stopping: no improvement for %d/%d epochs "
-                    "(best=%.5f at epoch %d)",
+                    "(best %s=%.5f at epoch %d)",
                     _es_patience_counter, args.early_stopping_patience,
+                    "val_loss" if mean_val_loss is not None else "train_loss",
                     _es_best_loss, _es_best_epoch,
                 )
                 if _es_patience_counter >= args.early_stopping_patience:
@@ -734,7 +964,36 @@ def train_lora(
                         "restoring best weights from epoch %d (loss=%.5f).",
                         epoch + 1, args.epochs, _es_best_epoch, _es_best_loss,
                     )
-                    break
+                    _es_stop = True
+
+        # ── Checkpoint (one file per completed epoch) ───────────────────────────
+        ckpt_path = _checkpoint_path_for_epoch(ckpt_dir, epoch)
+        _save_checkpoint(ckpt_path, {
+            "epoch_completed": epoch,
+            "model_state": {
+                k: v.detach().cpu().clone()
+                for k, v in lora_state_dict(model).items()
+            },
+            "optim_state": optim.state_dict(),
+            "metrics": run.metrics,
+            "started_at": run.started_at,
+            "es_best_loss": _es_best_loss,
+            "es_patience_counter": _es_patience_counter,
+            "es_best_epoch": _es_best_epoch,
+            "es_best_state": _es_best_state,
+        })
+        logger.debug("Checkpoint saved after epoch %d.", epoch + 1)
+
+        # ── Live loss curve (updated after every epoch) ──────────────────────
+        if args.plot_loss_curve:
+            _plot_loss_curve(
+                run.metrics,
+                ckpt_dir / "loss_curve.png",
+                title=f"LoRA Training Loss — {args.name}",
+            )
+
+        if _es_stop:
+            break
 
     # Restore the best-seen weights when early stopping is active
     if args.early_stopping_patience > 0 and _es_best_state is not None:
@@ -744,15 +1003,10 @@ def train_lora(
     adapter.history.append(run)
 
     state = lora_state_dict(model)
-    registry.save(adapter, state, overwrite=args.overwrite)
-
-    # ── Loss curve plot ──────────────────────────────────────────────────────
-    if args.plot_loss_curve and run.metrics:
-        _plot_loss_curve(
-            run.metrics,
-            registry.adapter_dir(args.name) / "loss_curve.png",
-            title=f"LoRA Training Loss — {args.name}",
-        )
+    # The adapter directory already exists (created for checkpoints), so always
+    # pass overwrite=True here.  The guard against stomping a completed adapter
+    # was already enforced above before training started.
+    registry.save(adapter, state, overwrite=True)
 
     return adapter
 

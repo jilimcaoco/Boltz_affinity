@@ -99,6 +99,18 @@ def _train_options(fn):
             "--plot-loss-curve/--no-plot-loss-curve", default=True, show_default=True,
             help="Save loss_curve.png to the adapter directory after training.",
         ),
+        click.option(
+            "--val-csv", "val_csv_path", default=None, type=str,
+            help="Optional path to a held-out validation CSV (same schema as --csv). "
+                 "When provided, val_loss is computed each epoch, used for early stopping, "
+                 "and plotted on the loss curve alongside train_loss. "
+                 "Mutually exclusive with --val-split.",
+        ),
+        click.option(
+            "--val-split", default=0.0, type=float, show_default=True,
+            help="Fraction of training rows to hold out as a validation set [0, 1). "
+                 "0.0 = disabled. Ignored when --val-csv is provided.",
+        ),
         click.option("--log-level", default="INFO"),
     ]
     for dec in reversed(decorators):
@@ -134,6 +146,8 @@ def train_cmd(
     early_stopping_patience: int,
     early_stopping_min_delta: float,
     plot_loss_curve: bool,
+    val_csv_path: Optional[str],
+    val_split: float,
     log_level: str,
 ) -> None:
     """Train a fresh LoRA adapter."""
@@ -156,6 +170,8 @@ def train_cmd(
         early_stopping_patience=early_stopping_patience,
         early_stopping_min_delta=early_stopping_min_delta,
         plot_loss_curve=plot_loss_curve,
+        val_csv_path=val_csv_path,
+        val_split=val_split,
     )
     adapter = train_lora(args)
     click.echo(f"Saved adapter '{adapter.name}' "
@@ -195,6 +211,8 @@ def update_cmd(
     early_stopping_patience: int,
     early_stopping_min_delta: float,
     plot_loss_curve: bool,
+    val_csv_path: Optional[str],
+    val_split: float,
     log_level: str,
 ) -> None:
     """Continue training an existing adapter on new (or additional) data."""
@@ -230,6 +248,8 @@ def update_cmd(
         early_stopping_patience=early_stopping_patience,
         early_stopping_min_delta=early_stopping_min_delta,
         plot_loss_curve=plot_loss_curve,
+        val_csv_path=val_csv_path,
+        val_split=val_split,
     )
     adapter = train_lora(
         args,

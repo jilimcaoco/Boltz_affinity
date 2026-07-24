@@ -47,8 +47,13 @@ from boltz.lora.train import (
     _extract_row_from_batch,
     _featurize_row,
     _load_base_model,
+    _load_checkpoint,
+    _checkpoint_path_for_epoch,
+    _iter_checkpoint_paths,
+    _latest_checkpoint_path,
     _pick_device,
     _plot_loss_curve,
+    _save_checkpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -236,7 +241,46 @@ def train_finetune(
     _es_best_state: Optional[dict[str, torch.Tensor]] = None
     _es_best_epoch: int = 0
 
-    for epoch in range(args.epochs):
+    # ── Checkpoint / resume ───────────────────────────────────────────────────
+    ckpt_dir = registry.adapter_dir(args.name)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    start_epoch = 0
+
+    if args.overwrite:
+        for ckpt_file in _iter_checkpoint_paths(ckpt_dir):
+            ckpt_file.unlink(missing_ok=True)
+        logger.info("Removed existing checkpoints (--overwrite).")
+
+    ckpt_path = _latest_checkpoint_path(ckpt_dir)
+    _ckpt = _load_checkpoint(ckpt_path) if ckpt_path is not None else None
+    if _ckpt is not None:
+        logger.info(
+            "Resuming full fine-tune from checkpoint: %d epoch(s) already completed.",
+            _ckpt["epoch_completed"] + 1,
+        )
+        _ckpt_sd = _ckpt["model_state"]
+        _live_sd = model.state_dict()
+        with torch.no_grad():
+            for _k, _v in _ckpt_sd.items():
+                if _k in _live_sd:
+                    _live_sd[_k].copy_(_v.to(_live_sd[_k].device, dtype=_live_sd[_k].dtype))
+        try:
+            optim.load_state_dict(_ckpt["optim_state"])
+        except Exception as _oe:
+            logger.warning("Could not restore optimizer state (%s) — optimizer reset.", _oe)
+        run.metrics = _ckpt["metrics"]
+        run.started_at = _ckpt.get("started_at", run.started_at)
+        start_epoch = _ckpt["epoch_completed"] + 1
+        _es_best_loss = _ckpt.get("es_best_loss", float("inf"))
+        _es_patience_counter = _ckpt.get("es_patience_counter", 0)
+        _es_best_state = _ckpt.get("es_best_state")
+        _es_best_epoch = _ckpt.get("es_best_epoch", 0)
+        logger.info(
+            "Resumed: start_epoch=%d, es_best_loss=%.5f, es_patience=%d.",
+            start_epoch, _es_best_loss, _es_patience_counter,
+        )
+
+    for epoch in range(start_epoch, args.epochs):
         if _sampler is not None:
             _sampler.set_epoch(epoch)
         epoch_losses: list[float] = []
@@ -349,6 +393,7 @@ def train_finetune(
         )
         run.metrics.append({"epoch": float(epoch), "loss": mean_loss})
 
+        _es_stop = False
         if args.early_stopping_patience > 0:
             if mean_loss < _es_best_loss - args.early_stopping_min_delta:
                 _es_best_loss = mean_loss
@@ -377,7 +422,37 @@ def train_finetune(
                         epoch + 1, args.epochs, _es_best_epoch,
                         _es_best_loss,
                     )
-                    break
+                    _es_stop = True
+
+        # ── Checkpoint (one file per completed epoch) ───────────────────────────
+        ckpt_path = _checkpoint_path_for_epoch(ckpt_dir, epoch)
+        _save_checkpoint(ckpt_path, {
+            "epoch_completed": epoch,
+            "model_state": {
+                k: model.state_dict()[k].detach().cpu().clone()
+                for k in trainable_names
+                if k in model.state_dict()
+            },
+            "optim_state": optim.state_dict(),
+            "metrics": run.metrics,
+            "started_at": run.started_at,
+            "es_best_loss": _es_best_loss,
+            "es_patience_counter": _es_patience_counter,
+            "es_best_epoch": _es_best_epoch,
+            "es_best_state": _es_best_state,
+        })
+        logger.debug("Checkpoint saved after epoch %d.", epoch + 1)
+
+        # ── Live loss curve (updated after every epoch) ──────────────────────
+        if args.plot_loss_curve:
+            _plot_loss_curve(
+                run.metrics,
+                ckpt_dir / "loss_curve.png",
+                title=f"Affinity Fine-tune Loss — {args.name}",
+            )
+
+        if _es_stop:
+            break
 
     # Restore best-seen weights when early stopping is active.
     if args.early_stopping_patience > 0 and _es_best_state is not None:
@@ -397,13 +472,6 @@ def train_finetune(
         for k in trainable_names if k in full_state
     }
     registry.save(record, partial_state, overwrite=args.overwrite)
-
-    if args.plot_loss_curve and run.metrics:
-        _plot_loss_curve(
-            run.metrics,
-            registry.adapter_dir(args.name) / "loss_curve.png",
-            title=f"Affinity Fine-tune Loss — {args.name}",
-        )
 
     return record
 

@@ -291,11 +291,17 @@ def run_ablation_for_pair(
     recycling_steps: int,
     use_msa_server: bool,
     cache_dir: Path,
-) -> List[Dict]:
+    output_path: Optional[Path] = None,
+    fieldnames: Optional[List[str]] = None,
+) -> tuple:
     """Run all ablation experiments for one receptor/ligand-set pair.
 
     Preprocesses each ligand once, then runs the affinity head repeatedly
     with different ablation flags — avoiding redundant featurization.
+
+    Results are written to ``output_path`` incrementally after each ligand
+    so that partial results are preserved if the job is killed.  Returns
+    ``(n_done, n_failed)`` counts rather than the full row list.
     """
     import numpy as np
     import torch
@@ -388,7 +394,8 @@ def run_ablation_for_pair(
         ligands = ligands[:max_ligands]
     logger.info(f"[{receptor_id}] {len(ligands)} ligands to process")
 
-    results = []
+    n_done = 0
+    n_failed = 0
 
     for lig_idx, ligand in enumerate(ligands):
         ligand_name = ligand.name
@@ -407,22 +414,25 @@ def run_ablation_for_pair(
 
         if smiles is None:
             logger.warning(f"  Cannot infer SMILES for {ligand_name}, skipping.")
-            for exp in experiments:
-                results.append({
-                    "receptor_id": receptor_id,
-                    "ligand_name": ligand_name,
-                    "experiment": exp.name,
-                    "affinity_pred_value": "",
-                    "affinity_probability_binary": "",
-                    "pose_noise_sigma": exp.pose_noise_sigma,
-                    "pose_noise_target": exp.pose_noise_target,
-                    "pose_noise_seed": (
-                        "" if exp.pose_noise_seed is None
-                        else exp.pose_noise_seed
-                    ),
-                    "error": "SMILES inference failed",
-                    "time_ms": "",
-                })
+            _failed_rows = [{
+                "receptor_id": receptor_id,
+                "ligand_name": ligand_name,
+                "experiment": exp.name,
+                "affinity_pred_value": "",
+                "affinity_probability_binary": "",
+                "pose_noise_sigma": exp.pose_noise_sigma,
+                "pose_noise_target": exp.pose_noise_target,
+                "pose_noise_seed": (
+                    "" if exp.pose_noise_seed is None
+                    else exp.pose_noise_seed
+                ),
+                "error": "SMILES inference failed",
+                "time_ms": "",
+            } for exp in experiments]
+            if output_path and fieldnames:
+                with open(output_path, "a", newline="") as _f:
+                    csv.DictWriter(_f, fieldnames=fieldnames).writerows(_failed_rows)
+            n_failed += 1
             continue
 
         ligand_chain_id = "L"
@@ -586,6 +596,7 @@ def run_ablation_for_pair(
                     batch[k] = v
 
             # ── Run each ablation experiment ─────────────────────────
+            lig_rows = []
             for exp in experiments:
                 t0 = time.perf_counter()
                 try:
@@ -604,7 +615,7 @@ def run_ablation_for_pair(
                         pose_noise_target=exp.pose_noise_target,
                     )
                     elapsed = (time.perf_counter() - t0) * 1000
-                    results.append({
+                    lig_rows.append({
                         "receptor_id": receptor_id,
                         "ligand_name": ligand_name,
                         "experiment": exp.name,
@@ -628,7 +639,7 @@ def run_ablation_for_pair(
                     )
                 except Exception as e:
                     logger.error(f"  [{exp.name}] FAILED: {e}")
-                    results.append({
+                    lig_rows.append({
                         "receptor_id": receptor_id,
                         "ligand_name": ligand_name,
                         "experiment": exp.name,
@@ -643,32 +654,40 @@ def run_ablation_for_pair(
                         "error": str(e),
                         "time_ms": "",
                     })
+            # Write this ligand's rows immediately
+            if output_path and fieldnames and lig_rows:
+                with open(output_path, "a", newline="") as _f:
+                    csv.DictWriter(_f, fieldnames=fieldnames).writerows(lig_rows)
+            n_done += 1
 
         except Exception as e:
             logger.error(f"  Failed to process {ligand_name}: {e}")
             import traceback
             traceback.print_exc()
-            for exp in experiments:
-                results.append({
-                    "receptor_id": receptor_id,
-                    "ligand_name": ligand_name,
-                    "experiment": exp.name,
-                    "affinity_pred_value": "",
-                    "affinity_probability_binary": "",
-                    "pose_noise_sigma": exp.pose_noise_sigma,
-                    "pose_noise_target": exp.pose_noise_target,
-                    "pose_noise_seed": (
-                        "" if exp.pose_noise_seed is None
-                        else exp.pose_noise_seed
-                    ),
-                    "error": str(e),
-                    "time_ms": "",
-                })
+            _exc_rows = [{
+                "receptor_id": receptor_id,
+                "ligand_name": ligand_name,
+                "experiment": exp.name,
+                "affinity_pred_value": "",
+                "affinity_probability_binary": "",
+                "pose_noise_sigma": exp.pose_noise_sigma,
+                "pose_noise_target": exp.pose_noise_target,
+                "pose_noise_seed": (
+                    "" if exp.pose_noise_seed is None
+                    else exp.pose_noise_seed
+                ),
+                "error": str(e),
+                "time_ms": "",
+            } for exp in experiments]
+            if output_path and fieldnames:
+                with open(output_path, "a", newline="") as _f:
+                    csv.DictWriter(_f, fieldnames=fieldnames).writerows(_exc_rows)
+            n_failed += 1
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
     shutil.rmtree(msa_cache_dir, ignore_errors=True)
-    return results
+    return n_done, n_failed
 
 
 def _remap_ligand_atoms(ligand, smiles, ligand_chain_id):
@@ -789,10 +808,11 @@ def main():
         logger.info(f"  {exp.name:25s} → {flag_str}")
 
     # Run
-    all_results = []
+    n_total_done = 0
+    n_total_failed = 0
     t_start = time.perf_counter()
 
-    # Write CSV header upfront for incremental writes
+    # Write CSV header upfront; rows are appended per-ligand inside run_ablation_for_pair
     fieldnames = [
         "receptor_id", "ligand_name", "experiment",
         "affinity_pred_value", "affinity_probability_binary",
@@ -801,8 +821,7 @@ def main():
     ]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+        csv.DictWriter(f, fieldnames=fieldnames).writeheader()
 
     for pair_idx, (receptor_id, receptor_path, ligands_path) in enumerate(
         pairs, 1
@@ -811,7 +830,7 @@ def main():
         logger.info(f"Receptor {pair_idx}/{len(pairs)}: {receptor_id}")
         logger.info(f"{'=' * 60}")
 
-        pair_results = run_ablation_for_pair(
+        n_done, n_failed = run_ablation_for_pair(
             receptor_id=receptor_id,
             receptor_path=receptor_path,
             ligands_path=ligands_path,
@@ -821,21 +840,18 @@ def main():
             recycling_steps=args.recycling_steps,
             use_msa_server=args.use_msa_server,
             cache_dir=cache_dir,
+            output_path=args.output,
+            fieldnames=fieldnames,
         )
-        all_results.extend(pair_results)
-
-        # Append results incrementally (survive job kills)
-        if pair_results:
-            with open(args.output, "a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writerows(pair_results)
+        n_total_done += n_done
+        n_total_failed += n_failed
 
     elapsed_total = time.perf_counter() - t_start
 
     # Summary
-    n_total = len(all_results)
-    n_success = sum(1 for r in all_results if r.get("error") == "")
-    n_failed = n_total - n_success
+    n_total = n_total_done + n_total_failed
+    n_success = n_total_done
+    n_failed = n_total_failed
 
     logger.info(f"\n{'=' * 60}")
     logger.info("FEATURE ABLATION COMPLETE")
