@@ -36,6 +36,7 @@ from boltz.finetune.adapter import (
     FinetuneRecord,
     TrainingRun,
 )
+from boltz.finetune.l2_sp import add_l2_sp_penalty
 from boltz.finetune.registry import FinetuneRegistry, default_registry
 from boltz.finetune.targets import resolve_targets
 
@@ -72,6 +73,7 @@ class FinetuneArgs:
     learning_rate: float = 1e-5  # smaller than LoRA default — full FT is risky
     batch_size: int = 1
     weight_decay: float = 0.0
+    l2_sp_weight: float = 0.0
     gradient_clip: float = 1.0
     recycling_steps: int = 3
     device: str = "auto"
@@ -176,6 +178,16 @@ def train_finetune(
     trainable_names = {n for n, _ in selected}
     _freeze_all_then_unfreeze(model, trainable_names)
     model = model.to(device)
+    trainable_param_dict = dict(selected)
+
+    # L2-SP anchor: snapshot values right after loading the base checkpoint
+    # (before any --update resume state below), so the penalty always pulls
+    # toward the pretrained values for the lifetime of this fine-tune.
+    initial_params: Optional[dict[str, torch.Tensor]] = None
+    if args.l2_sp_weight > 0.0:
+        initial_params = {
+            n: p.detach().clone() for n, p in trainable_param_dict.items()
+        }
 
     # Optionally resume from a previous fine-tune's weights.
     if init_state is not None:
@@ -216,6 +228,7 @@ def train_finetune(
             target_spec=args.target_spec,
             target_patterns=list(target_patterns),
             num_trainable_params=int(n_params),
+            l2_sp_weight=args.l2_sp_weight,
         ),
         trained_params=sorted(trainable_names),
         parent=parent,
@@ -378,6 +391,9 @@ def train_finetune(
             # don't use it ignore it, and those that do (rare) will get a
             # clear AttributeError.
             loss = call_loss(loss_fn, pred_combined, batch_for_loss, None)
+            loss = add_l2_sp_penalty(
+                loss, args.l2_sp_weight, trainable_param_dict, initial_params,
+            )
             loss.backward()
             if args.gradient_clip > 0:
                 torch.nn.utils.clip_grad_norm_(

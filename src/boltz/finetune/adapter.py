@@ -35,11 +35,16 @@ class FinetuneConfig:
     ``target_patterns`` is the resolved regex tuple actually used; saved so
     we can reproduce the parameter selection at load time without depending
     on preset names that may evolve.
+
+    ``l2_sp_weight`` records the L2-SP regularization strength used for
+    this fine-tune (0.0 = disabled, the default and today's behavior). See
+    :mod:`boltz.finetune.l2_sp`.
     """
 
     target_spec: str = "affinity_module"
     target_patterns: list[str] = field(default_factory=list)
     num_trainable_params: int = 0
+    l2_sp_weight: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)

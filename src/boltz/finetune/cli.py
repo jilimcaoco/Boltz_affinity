@@ -79,6 +79,13 @@ def _train_options(fn):
             "--weight-decay", default=0.0, type=float, show_default=True,
         ),
         click.option(
+            "--l2-sp-weight", default=0.0, type=float, show_default=True,
+            help="L2-SP regularization strength: pulls trainable params "
+                 "toward their pretrained (start-of-training) values, "
+                 "instead of toward zero like --weight-decay. 0.0 = "
+                 "disabled (default, matches prior behavior).",
+        ),
+        click.option(
             "--gradient-clip", default=1.0, type=float, show_default=True,
         ),
         click.option(
@@ -140,6 +147,7 @@ def train_cmd(
     learning_rate: float,
     batch_size: int,
     weight_decay: float,
+    l2_sp_weight: float,
     gradient_clip: float,
     recycling_steps: int,
     device: str,
@@ -168,7 +176,8 @@ def train_cmd(
         name=name, csv_path=csv_path, mode=mode, loss_spec=loss_spec,
         target_spec=target_spec, epochs=epochs,
         learning_rate=learning_rate, batch_size=batch_size,
-        weight_decay=weight_decay, gradient_clip=gradient_clip,
+        weight_decay=weight_decay, l2_sp_weight=l2_sp_weight,
+        gradient_clip=gradient_clip,
         recycling_steps=recycling_steps, device=device,
         checkpoint=checkpoint, use_msa_server=use_msa_server,
         overwrite=overwrite, notes=notes,
@@ -205,6 +214,7 @@ def update_cmd(
     learning_rate: float,
     batch_size: int,
     weight_decay: float,
+    l2_sp_weight: float,
     gradient_clip: float,
     recycling_steps: int,
     device: str,
@@ -242,6 +252,7 @@ def update_cmd(
         target_spec=parent_record.config.target_spec,
         epochs=epochs, learning_rate=learning_rate,
         batch_size=batch_size, weight_decay=weight_decay,
+        l2_sp_weight=l2_sp_weight,
         gradient_clip=gradient_clip,
         recycling_steps=recycling_steps, device=device,
         checkpoint=checkpoint, use_msa_server=use_msa_server,

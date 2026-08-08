@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from boltz.finetune import (
@@ -21,6 +22,7 @@ from boltz.finetune import (
     FinetuneRegistry,
     load_finetune_into_model,
 )
+from boltz.finetune.l2_sp import add_l2_sp_penalty, l2_sp_penalty
 from boltz.finetune.targets import TARGET_PRESETS, resolve_targets
 from boltz.finetune.train import _select_trainable_params
 
@@ -289,3 +291,97 @@ def test_default_target_spec_is_full_affinity_module() -> None:
         if n.startswith("affinity_module.")
     }
     assert sel_names == all_am_names
+
+
+# ─── L2-SP regularization ───────────────────────────────────────────────────
+
+
+def test_l2_sp_penalty_known_value() -> None:
+    current = {
+        "a": torch.tensor([1.0, 2.0, 3.0]),
+        "b": torch.tensor([[0.0, 0.0]]),
+    }
+    initial = {
+        "a": torch.tensor([0.0, 2.0, 5.0]),  # diff = [1, 0, -2] -> sq sum 5
+        "b": torch.tensor([[3.0, 4.0]]),  # diff = [-3, -4] -> sq sum 25
+    }
+    penalty = l2_sp_penalty(current, initial)
+    assert torch.allclose(penalty, torch.tensor(30.0))
+
+
+def test_l2_sp_penalty_empty_raises() -> None:
+    with pytest.raises(ValueError, match="empty"):
+        l2_sp_penalty({}, {})
+
+
+def test_l2_sp_penalty_missing_key_raises() -> None:
+    current = {"a": torch.tensor([1.0])}
+    with pytest.raises(KeyError):
+        l2_sp_penalty(current, {})
+
+
+def test_add_l2_sp_penalty_zero_weight_is_noop() -> None:
+    """Regression safety: l2_sp_weight=0.0 must reproduce prior behavior
+    exactly — the penalty must not even be computed."""
+    loss = torch.tensor(3.5, requires_grad=True)
+    current = {"a": torch.tensor([100.0])}  # would blow up if penalty ran
+    initial = None  # no snapshot exists when L2-SP is disabled
+    out = add_l2_sp_penalty(loss, 0.0, current, initial)
+    assert out is loss
+    assert out.item() == pytest.approx(3.5)
+
+
+def test_add_l2_sp_penalty_positive_weight_adds_expected_amount() -> None:
+    loss = torch.tensor(3.5)
+    current = {"a": torch.tensor([2.0]), "b": torch.tensor([0.0])}
+    initial = {"a": torch.tensor([0.0]), "b": torch.tensor([0.0])}
+    # penalty = (2-0)^2 + (0-0)^2 = 4.0
+    weight = 0.5
+    out_zero = add_l2_sp_penalty(loss, 0.0, current, initial)
+    out_pos = add_l2_sp_penalty(loss, weight, current, initial)
+    assert out_zero.item() == pytest.approx(3.5)
+    assert out_pos.item() == pytest.approx(3.5 + weight * 4.0)
+    assert out_pos.item() > out_zero.item()
+
+
+def test_add_l2_sp_penalty_missing_snapshot_raises() -> None:
+    loss = torch.tensor(1.0)
+    with pytest.raises(ValueError, match="no initial parameter snapshot"):
+        add_l2_sp_penalty(loss, 1.0, {"a": torch.tensor([1.0])}, None)
+
+
+def test_l2_sp_pulls_trained_params_toward_initial_values() -> None:
+    """End-to-end (but GPU-free, model-free) check of the actual
+    regularization behaviour: a large l2_sp_weight should keep trained
+    parameters measurably closer to their initial values than training
+    with l2_sp_weight=0.0, on the same tiny synthetic problem."""
+
+    def run(l2_sp_weight: float, steps: int = 60) -> float:
+        torch.manual_seed(0)
+        model = nn.Linear(4, 4)
+        initial_params = {
+            n: p.detach().clone() for n, p in model.named_parameters()
+        }
+        optim = torch.optim.AdamW(model.parameters(), lr=0.1)
+        x = torch.randn(8, 4)
+        # Target is far from the model's initial behavior so gradient
+        # descent on the primary loss alone pulls params away from init.
+        y = torch.randn(8, 4) * 10.0
+        for _ in range(steps):
+            optim.zero_grad(set_to_none=True)
+            pred = model(x)
+            loss = F.mse_loss(pred, y)
+            current_params = dict(model.named_parameters())
+            loss = add_l2_sp_penalty(
+                loss, l2_sp_weight, current_params, initial_params,
+            )
+            loss.backward()
+            optim.step()
+        return sum(
+            (p.detach() - initial_params[n]).pow(2).sum().item()
+            for n, p in model.named_parameters()
+        )
+
+    dist_no_reg = run(0.0)
+    dist_with_reg = run(10.0)
+    assert dist_with_reg < dist_no_reg

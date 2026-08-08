@@ -113,6 +113,33 @@ containing `meta.json` (provenance), `weights.pt` (a partial state-dict
 keyed by Boltz2 parameter names, holding only the trained tensors), and
 `loss_curve.png`.
 
+### L2-SP regularization
+
+`--weight-decay` (via AdamW) pulls trainable parameters toward **zero**.
+`--l2-sp-weight` (default `0.0`, disabled) instead pulls them toward
+their value **at the start of training** — i.e. the pretrained
+checkpoint. This is the standard "L2-SP" regularizer (Xuhong et al.,
+ICML 2018) and is the right choice when you want full fine-tuning to be
+a fair, capacity-matched comparator to LoRA: a LoRA adapter can only add
+a low-rank residual and is implicitly anchored to the base weights,
+whereas an unconstrained full fine-tune can drift arbitrarily far from
+them without some form of anchoring.
+
+```bash
+boltz finetune train \
+    --name my_kinase_full_v1 \
+    --csv data/kinase_train.csv \
+    --loss huber \
+    --target-spec affinity_module \
+    --l2-sp-weight 1e-3 \
+    --weight-decay 0.0
+```
+
+`--l2-sp-weight` and `--weight-decay` can be combined but typically
+you'd use one or the other. `--l2-sp-weight 0.0` (the default)
+reproduces prior behavior exactly — the penalty term is skipped
+entirely rather than computed and added as a guaranteed zero.
+
 ### Custom losses
 
 The full set of built-in losses (`mse`, `mae`, `huber`, `bce`,
