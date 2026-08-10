@@ -45,6 +45,7 @@ from boltz.lora.data import AssayGroupedSampler, LoRADataset, lora_collate
 from boltz.lora.losses import LossFn, call_loss, load_loss_from_spec
 from boltz.lora.train import (
     _affinity_forward_trainable,
+    _configure_train_cache,
     _extract_row_from_batch,
     _featurize_row,
     _load_base_model,
@@ -179,6 +180,7 @@ def train_finetune(
     _freeze_all_then_unfreeze(model, trainable_names)
     model = model.to(device)
     trainable_param_dict = dict(selected)
+    _configure_train_cache(model, ckpt_sha)
 
     # L2-SP anchor: snapshot values right after loading the base checkpoint
     # (before any --update resume state below), so the penalty always pulls

@@ -18,6 +18,7 @@ adapter's ``meta.json`` via :class:`LoRARegistry`.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import tempfile
@@ -348,6 +349,155 @@ def _materialize_row_yaml(
     return out
 
 
+# ── Frozen-trunk feature / z cache (opt-in via $BOLTZ_TRAIN_CACHE_DIR) ────────
+#
+# rescore-mode training re-featurises every row AND re-runs the frozen Boltz
+# trunk (MSA + pairformer, `recycling_steps+1` passes) on EVERY epoch — even
+# though, when the trainable parameters live entirely inside the affinity
+# module (target-spec affinity_module / affinity_heads / affinity_pairformer /
+# heads_pairformer), both the features and the trunk output ``z`` are constant
+# across epochs and across concurrently-training arms that share a base
+# checkpoint. This cache memoises both to disk so each pose is featurised +
+# trunk-forwarded ONCE, then reused by every later epoch and every other arm.
+#
+# Disabled by default (env unset → behaviour byte-identical to before). When
+# enabled AND the trunk is frozen, the trunk is evaluated deterministically
+# (eval mode + no_grad), so the cached ``z`` is exact and reusable; this drops
+# frozen-trunk dropout, the intended semantics for a frozen feature extractor.
+
+FEAT_CACHE_VERSION = "feat_v1"
+Z_CACHE_VERSION = "z_v1"
+
+_TRUNK_MODULE_ATTRS = (
+    "input_embedder", "s_init", "z_init_1", "z_init_2", "rel_pos",
+    "token_bonds", "token_bonds_type", "contact_conditioning",
+    "s_recycle", "s_norm", "z_recycle", "z_norm",
+    "template_module", "msa_module", "pairformer_module",
+)
+
+
+def _unwrap_module(model: Any, attr: str) -> Any:
+    mod = getattr(model, attr, None)
+    if mod is None:
+        return None
+    return getattr(mod, "_orig_mod", mod)
+
+
+def trunk_is_frozen(model: Any) -> bool:
+    """True when no parameter feeding the pre-affinity trunk requires grad.
+
+    Only then is the trunk output ``z`` a constant function of the (fixed)
+    features and base weights, hence safe to cache across epochs.
+    """
+    for attr in _TRUNK_MODULE_ATTRS:
+        mod = _unwrap_module(model, attr)
+        if mod is None or not hasattr(mod, "parameters"):
+            continue
+        for p in mod.parameters():
+            if p.requires_grad:
+                return False
+    return True
+
+
+def _stat_sig(path: str) -> str:
+    try:
+        st = os.stat(path)
+        return f"{os.path.abspath(path)}:{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        return f"{path}:missing"
+
+
+def _atomic_torch_save(obj: Any, path: Path) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        torch.save(obj, tmp)
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+class TrunkFeatureCache:
+    """On-disk memo of per-row features and (frozen) trunk output ``z``."""
+
+    def __init__(self, root: Path, ckpt_sha: str, *, trunk_frozen: bool) -> None:
+        self.root = Path(root).expanduser()
+        (self.root / "feats").mkdir(parents=True, exist_ok=True)
+        (self.root / "z").mkdir(parents=True, exist_ok=True)
+        self.ckpt_sha = ckpt_sha or "nockpt"
+        self.trunk_frozen = trunk_frozen
+
+    @staticmethod
+    def _first(x: Any) -> Any:
+        return x[0] if isinstance(x, list) else x
+
+    def feats_key(self, row: dict[str, Any]) -> str:
+        rec = _stat_sig(str(self._first(row["receptor"])))
+        struct = _stat_sig(str(self._first(row["structure"])))
+        lig = str(self._first(row["ligand"]))
+        raw = f"{FEAT_CACHE_VERSION}|{rec}|{lig}|{struct}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def _feats_path(self, key: str) -> Path:
+        return self.root / "feats" / f"{key}.pt"
+
+    def _z_path(self, key: str, recycling_steps: int) -> Path:
+        h = hashlib.sha256(
+            f"{Z_CACHE_VERSION}|{key}|{self.ckpt_sha}|rec{recycling_steps}".encode()
+        ).hexdigest()
+        return self.root / "z" / f"{h}.pt"
+
+    def load_feats(self, key: str, device: Any) -> Optional[dict[str, Any]]:
+        p = self._feats_path(key)
+        if not p.exists():
+            return None
+        try:
+            blob = torch.load(p, map_location="cpu", weights_only=False)
+        except Exception:  # noqa: BLE001 — partial/corrupt write → recompute
+            return None
+        out = {k: (v.to(device) if torch.is_tensor(v) else v)
+               for k, v in blob.items()}
+        out["__cache_key__"] = key
+        return out
+
+    def save_feats(self, key: str, feats: dict[str, Any]) -> None:
+        cpu = {k: (v.detach().cpu() if torch.is_tensor(v) else v)
+               for k, v in feats.items() if k != "__cache_key__"}
+        _atomic_torch_save(cpu, self._feats_path(key))
+
+    def load_z(self, key: str, recycling_steps: int, device: Any) -> Optional[torch.Tensor]:
+        p = self._z_path(key, recycling_steps)
+        if not p.exists():
+            return None
+        try:
+            return torch.load(p, map_location="cpu", weights_only=False).to(device)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def save_z(self, key: str, recycling_steps: int, z: torch.Tensor) -> None:
+        _atomic_torch_save(z.detach().cpu(), self._z_path(key, recycling_steps))
+
+
+# Module-global cache, configured per-process by train_lora / train_finetune.
+_TRAIN_CACHE: Optional[TrunkFeatureCache] = None
+
+
+def _configure_train_cache(model: Any, ckpt_sha: str) -> Optional[TrunkFeatureCache]:
+    """Enable the disk cache when ``$BOLTZ_TRAIN_CACHE_DIR`` is set."""
+    global _TRAIN_CACHE
+    root = os.environ.get("BOLTZ_TRAIN_CACHE_DIR", "").strip()
+    if not root:
+        _TRAIN_CACHE = None
+        return None
+    frozen = trunk_is_frozen(model)
+    _TRAIN_CACHE = TrunkFeatureCache(Path(root), ckpt_sha, trunk_frozen=frozen)
+    logger.info(
+        "Train cache ENABLED at %s (trunk_frozen=%s → z-cache %s).",
+        root, frozen, "ON" if frozen else "OFF (feature-cache only)",
+    )
+    return _TRAIN_CACHE
+
+
 def _featurize_row(
     row: dict[str, Any],
     *,
@@ -359,7 +509,18 @@ def _featurize_row(
 
     Reuses the affinity_rescoring pipeline up to (but not including) the
     forward pass. The returned dict has all tensors moved to ``device``.
+
+    When the frozen-trunk cache is active (``$BOLTZ_TRAIN_CACHE_DIR`` set) the
+    deterministic feature dict is memoised to disk, so re-featurisation is
+    skipped on every epoch after the first (and shared across arms).
     """
+    cache = _TRAIN_CACHE
+    _key = cache.feats_key(row) if cache is not None else None
+    if cache is not None and _key is not None:
+        _cached = cache.load_feats(_key, device)
+        if _cached is not None:
+            return _cached
+
     from boltz.affinity_rescoring.coord_injection import (
         build_chain_id_map,
         inject_pdb_coords_into_structure,
@@ -487,6 +648,9 @@ def _featurize_row(
                 batch[k] = [v]
             else:
                 batch[k] = v
+        if cache is not None and _key is not None:
+            cache.save_feats(_key, batch)
+            batch["__cache_key__"] = _key
         return batch
     finally:
         import shutil
@@ -494,6 +658,69 @@ def _featurize_row(
 
 
 # ── Differentiable trunk + affinity ──────────────────────────────────────────
+
+
+def _compute_trunk_z(
+    model: Any,
+    feats: dict[str, Any],
+    *,
+    recycling_steps: int,
+    deterministic: bool,
+    unwrap,
+) -> torch.Tensor:
+    """Run the (frozen) trunk to produce the post-recycling pair rep ``z``.
+
+    ``deterministic=True`` (used only when the trunk is frozen and caching is
+    active) evaluates the trunk in eval mode under ``no_grad`` so the returned
+    ``z`` is a reusable constant; otherwise the graph is built exactly as
+    before (grad flows through any trunk-side adapter linears).
+    """
+    use_kernels = getattr(model, "use_kernels", False)
+
+    def _body() -> torch.Tensor:
+        s_inputs = model.input_embedder(feats)
+        s_init = model.s_init(s_inputs)
+        z_init = (
+            model.z_init_1(s_inputs)[:, :, None]
+            + model.z_init_2(s_inputs)[:, None, :]
+            + model.rel_pos(feats)
+            + model.token_bonds(feats["token_bonds"].float())
+        )
+        if model.bond_type_feature:
+            z_init = z_init + model.token_bonds_type(feats["type_bonds"].long())
+        z_init = z_init + model.contact_conditioning(feats)
+
+        s = torch.zeros_like(s_init)
+        z = torch.zeros_like(z_init)
+        mask = feats["token_pad_mask"].float()
+        pair_mask = mask[:, :, None] * mask[:, None, :]
+        msa_module = unwrap("msa_module")
+        pairformer_module = unwrap("pairformer_module")
+
+        for _ in range(recycling_steps + 1):
+            s = s_init + model.s_recycle(model.s_norm(s))
+            z = z_init + model.z_recycle(model.z_norm(z))
+            if getattr(model, "use_templates", False):
+                template_module = unwrap("template_module")
+                z = z + template_module(z, feats, pair_mask, use_kernels=use_kernels)
+            z = z + msa_module(z, s_inputs, feats, use_kernels=use_kernels)
+            s, z = pairformer_module(s, z, mask=mask, pair_mask=pair_mask, use_kernels=use_kernels)
+        return z
+
+    if not deterministic:
+        return _body()
+
+    mods = [m for m in (_unwrap_module(model, a) for a in _TRUNK_MODULE_ATTRS)
+            if m is not None and hasattr(m, "train")]
+    prev = [(m, m.training) for m in mods]
+    for m in mods:
+        m.eval()
+    try:
+        with torch.no_grad():
+            return _body().detach()
+    finally:
+        for m, was_training in prev:
+            m.train(was_training)
 
 
 def _affinity_forward_trainable(
@@ -508,6 +735,10 @@ def _affinity_forward_trainable(
     frozen, so the backward graph through the trunk is effectively a no-op for
     parameter updates but is still required to flow gradients back to adapters
     when targets include trunk-side pairformer linears.
+
+    When the frozen-trunk cache is active and the trunk carries no trainable
+    parameters, the post-recycling ``z`` is loaded from disk (computed once)
+    instead of being re-derived each epoch.
     """
     if "coords" not in feats:
         raise RuntimeError("LoRA training requires injected 'coords' in features.")
@@ -516,35 +747,20 @@ def _affinity_forward_trainable(
         mod = getattr(model, attr)
         return mod._orig_mod if hasattr(mod, "_orig_mod") else mod  # noqa: SLF001
 
-    s_inputs = model.input_embedder(feats)
-    s_init = model.s_init(s_inputs)
-    z_init = (
-        model.z_init_1(s_inputs)[:, :, None]
-        + model.z_init_2(s_inputs)[:, None, :]
-        + model.rel_pos(feats)
-        + model.token_bonds(feats["token_bonds"].float())
-    )
-    if model.bond_type_feature:
-        z_init = z_init + model.token_bonds_type(feats["type_bonds"].long())
-    z_init = z_init + model.contact_conditioning(feats)
-
-    s = torch.zeros_like(s_init)
-    z = torch.zeros_like(z_init)
-    mask = feats["token_pad_mask"].float()
-    pair_mask = mask[:, :, None] * mask[:, None, :]
-
+    cache = _TRAIN_CACHE
+    _key = feats.pop("__cache_key__", None) if cache is not None else None
+    use_cache_z = cache is not None and _key is not None and cache.trunk_frozen
+    device = feats["coords"].device
     use_kernels = getattr(model, "use_kernels", False)
-    msa_module = _unwrap("msa_module")
-    pairformer_module = _unwrap("pairformer_module")
 
-    for _ in range(recycling_steps + 1):
-        s = s_init + model.s_recycle(model.s_norm(s))
-        z = z_init + model.z_recycle(model.z_norm(z))
-        if getattr(model, "use_templates", False):
-            template_module = _unwrap("template_module")
-            z = z + template_module(z, feats, pair_mask, use_kernels=use_kernels)
-        z = z + msa_module(z, s_inputs, feats, use_kernels=use_kernels)
-        s, z = pairformer_module(s, z, mask=mask, pair_mask=pair_mask, use_kernels=use_kernels)
+    z = cache.load_z(_key, recycling_steps, device) if use_cache_z else None
+    if z is None:
+        z = _compute_trunk_z(
+            model, feats, recycling_steps=recycling_steps,
+            deterministic=use_cache_z, unwrap=_unwrap,
+        )
+        if use_cache_z:
+            cache.save_z(_key, recycling_steps, z)
 
     pad_token_mask = feats["token_pad_mask"][0]
     rec_mask = (feats["mol_type"][0] == 0) * pad_token_mask
@@ -720,6 +936,7 @@ def train_lora(
     if not trainable:
         msg = "No trainable parameters after LoRA injection."
         raise RuntimeError(msg)
+    _configure_train_cache(model, ckpt_sha)
     optim = torch.optim.AdamW(
         trainable, lr=args.learning_rate, weight_decay=args.weight_decay,
     )
