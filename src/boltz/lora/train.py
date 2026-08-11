@@ -418,14 +418,24 @@ def _atomic_torch_save(obj: Any, path: Path) -> None:
 
 
 class TrunkFeatureCache:
-    """On-disk memo of per-row features and (frozen) trunk output ``z``."""
+    """On-disk memo of per-row features and (frozen) trunk output ``z``.
 
-    def __init__(self, root: Path, ckpt_sha: str, *, trunk_frozen: bool) -> None:
+    ``max_bytes`` (optional) caps the combined size of the ``feats/`` and
+    ``z/`` subdirectories; once exceeded, the least-recently-used files (by
+    mtime) are evicted after each write until back under budget. This bounds
+    scratch usage for long-running / many-arm grids without requiring the
+    user to babysit disk space. ``None``/``0`` = unbounded (previous
+    behaviour, still the default).
+    """
+
+    def __init__(self, root: Path, ckpt_sha: str, *, trunk_frozen: bool,
+                max_bytes: Optional[int] = None) -> None:
         self.root = Path(root).expanduser()
         (self.root / "feats").mkdir(parents=True, exist_ok=True)
         (self.root / "z").mkdir(parents=True, exist_ok=True)
         self.ckpt_sha = ckpt_sha or "nockpt"
         self.trunk_frozen = trunk_frozen
+        self.max_bytes = max_bytes if max_bytes and max_bytes > 0 else None
 
     @staticmethod
     def _first(x: Any) -> Any:
@@ -464,6 +474,7 @@ class TrunkFeatureCache:
         cpu = {k: (v.detach().cpu() if torch.is_tensor(v) else v)
                for k, v in feats.items() if k != "__cache_key__"}
         _atomic_torch_save(cpu, self._feats_path(key))
+        self._enforce_budget()
 
     def load_z(self, key: str, recycling_steps: int, device: Any) -> Optional[torch.Tensor]:
         p = self._z_path(key, recycling_steps)
@@ -476,6 +487,46 @@ class TrunkFeatureCache:
 
     def save_z(self, key: str, recycling_steps: int, z: torch.Tensor) -> None:
         _atomic_torch_save(z.detach().cpu(), self._z_path(key, recycling_steps))
+        self._enforce_budget()
+
+    def _enforce_budget(self) -> None:
+        """Evict least-recently-used cache files until under ``max_bytes``.
+
+        Scans both subdirectories together (a feats/z pair for the same pose
+        can be evicted independently; either half is cheaply recomputed on
+        the next miss). Runs once per cache MISS (i.e. once per unique pose,
+        not per epoch), so the directory scan cost is amortised.
+        """
+        if self.max_bytes is None:
+            return
+        entries: list[tuple[float, int, Path]] = []
+        total = 0
+        for sub in ("feats", "z"):
+            for p in (self.root / sub).glob("*.pt"):
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                entries.append((st.st_mtime, st.st_size, p))
+                total += st.st_size
+        if total <= self.max_bytes:
+            return
+        entries.sort(key=lambda e: e[0])  # oldest mtime first
+        for _mtime, size, p in entries:
+            if total <= self.max_bytes:
+                break
+            try:
+                p.unlink()
+                total -= size
+            except OSError:
+                continue
+        if total > self.max_bytes:
+            logger.warning(
+                "Train cache still %.1f GB over budget (%.1f GB) after "
+                "evicting all removable files — a single pose's cache "
+                "entries may exceed the budget alone.",
+                (total - self.max_bytes) / 1e9, self.max_bytes / 1e9,
+            )
 
 
 # Module-global cache, configured per-process by train_lora / train_finetune.
@@ -483,17 +534,25 @@ _TRAIN_CACHE: Optional[TrunkFeatureCache] = None
 
 
 def _configure_train_cache(model: Any, ckpt_sha: str) -> Optional[TrunkFeatureCache]:
-    """Enable the disk cache when ``$BOLTZ_TRAIN_CACHE_DIR`` is set."""
+    """Enable the disk cache when ``$BOLTZ_TRAIN_CACHE_DIR`` is set.
+
+    ``$BOLTZ_TRAIN_CACHE_MAX_GB`` (optional float) caps total cache size with
+    LRU eviction; unset/0 = unbounded.
+    """
     global _TRAIN_CACHE
     root = os.environ.get("BOLTZ_TRAIN_CACHE_DIR", "").strip()
     if not root:
         _TRAIN_CACHE = None
         return None
     frozen = trunk_is_frozen(model)
-    _TRAIN_CACHE = TrunkFeatureCache(Path(root), ckpt_sha, trunk_frozen=frozen)
+    max_gb_raw = os.environ.get("BOLTZ_TRAIN_CACHE_MAX_GB", "").strip()
+    max_bytes = int(float(max_gb_raw) * 1e9) if max_gb_raw else None
+    _TRAIN_CACHE = TrunkFeatureCache(Path(root), ckpt_sha, trunk_frozen=frozen,
+                                     max_bytes=max_bytes)
     logger.info(
-        "Train cache ENABLED at %s (trunk_frozen=%s → z-cache %s).",
+        "Train cache ENABLED at %s (trunk_frozen=%s → z-cache %s; budget=%s).",
         root, frozen, "ON" if frozen else "OFF (feature-cache only)",
+        f"{max_bytes/1e9:.0f} GB" if max_bytes else "unbounded",
     )
     return _TRAIN_CACHE
 
