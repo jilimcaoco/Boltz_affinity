@@ -1,0 +1,38 @@
+{
+  "5ht2a_v1": {
+    "created_at": 1780089529.4900866,
+    "num_adapted_layers": 102,
+    "parent_adapter": null,
+    "path": "/nfs/turbo/umms-maom/limcaoco/Boltz_affinity/fineturning_experiment/adapters/5ht2a_v1",
+    "rank": 8,
+    "target_spec": "heads_pairformer",
+    "updated_at": 1780167983.7638896
+  },
+  "drd4_v1": {
+    "created_at": 1780089529.508253,
+    "num_adapted_layers": 102,
+    "parent_adapter": null,
+    "path": "/nfs/turbo/umms-maom/limcaoco/Boltz_affinity/fineturning_experiment/adapters/drd4_v1",
+    "rank": 8,
+    "target_spec": "heads_pairformer",
+    "updated_at": 1780132699.8690019
+  },
+  "drd4_v2_rank_64": {
+    "path": "/nfs/turbo/umms-maom/limcaoco/Boltz_affinity/fineturning_experiment/adapters/drd4_v2_rank_64",
+    "created_at": 1782819995.1244817,
+    "updated_at": 1782820532.4923174,
+    "parent_adapter": null,
+    "rank": 32,
+    "target_spec": "heads_pairformer",
+    "num_adapted_layers": 204
+  },
+  "5ht2a_v2_rank_64": {
+    "path": "/nfs/turbo/umms-maom/limcaoco/Boltz_affinity/fineturning_experiment/adapters/5ht2a_v2_rank_64",
+    "created_at": 1782820521.5412385,
+    "updated_at": 1782820532.540201,
+    "parent_adapter": null,
+    "rank": 32,
+    "target_spec": "heads_pairformer",
+    "num_adapted_layers": 204
+  }
+}

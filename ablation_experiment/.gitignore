@@ -1,0 +1,21 @@
+# Keep repository lightweight: track only reproducibility scripts here.
+
+# Ignore everything in this directory by default.
+*
+
+# Keep this file.
+!.gitignore
+!README.md
+!run_analysis.sh
+
+# Keep experiment/analysis script infrastructure.
+!analysis_scripts/
+!analysis_scripts/*.py
+!experiment_scripts/
+!experiment_scripts/*.py
+!tests/
+!tests/*.py
+
+# Never track Python cache artifacts.
+analysis_scripts/__pycache__/
+experiment_scripts/__pycache__/

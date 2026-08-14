@@ -6,11 +6,8 @@ from typing import Optional
 import click
 import numpy as np
 from Bio import Align
-from chembl_structure_pipeline.exclude_flag import exclude_flag
-from chembl_structure_pipeline.standardizer import standardize_mol
 from rdkit import Chem, rdBase
 from rdkit.Chem import AllChem, HybridizationType
-from rdkit.Chem.MolStandardize import rdMolStandardize
 from rdkit.Chem.rdchem import BondStereo, Conformer, Mol
 from rdkit.Chem.rdDistGeom import GetMoleculeBoundsMatrix
 from rdkit.Chem.rdMolDescriptors import CalcNumHeavyAtoms
@@ -20,6 +17,7 @@ from boltz.data import const
 from boltz.data.mol import load_molecules
 from boltz.data.parse.mmcif import parse_mmcif
 from boltz.data.parse.pdb import parse_pdb
+from boltz.data.parse.smiles_standardize import standardize
 
 from boltz.data.types import (
     AffinityInfo,
@@ -1832,31 +1830,3 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         templates=templates,
         extra_mols=extra_mols,
     )
-
-
-def standardize(smiles: str) -> Optional[str]:
-    """Standardize a molecule and return its SMILES and a flag indicating whether the molecule is valid.
-    This version has exception handling, which the original in mol-finder/data doesn't have. I didn't change the mol-finder/data
-    since there are a lot of other functions that depend on it and I didn't want to break them.
-    """
-    LARGEST_FRAGMENT_CHOOSER = rdMolStandardize.LargestFragmentChooser()
-
-    mol = Chem.MolFromSmiles(smiles, sanitize=False)
-
-    exclude = exclude_flag(mol, includeRDKitSanitization=False)
-
-    if exclude:
-        raise ValueError("Molecule is excluded")
-
-    # Standardize with ChEMBL data curation pipeline. During standardization, the molecule may be broken
-    # Choose molecule with largest component
-    mol = LARGEST_FRAGMENT_CHOOSER.choose(mol)
-    # Standardize with ChEMBL data curation pipeline. During standardization, the molecule may be broken
-    mol = standardize_mol(mol)
-    smiles = Chem.MolToSmiles(mol)
-
-    # Check if molecule can be parsed by RDKit (in rare cases, the molecule may be broken during standardization)
-    if Chem.MolFromSmiles(smiles) is None:
-        raise ValueError("Molecule is broken")
-
-    return smiles

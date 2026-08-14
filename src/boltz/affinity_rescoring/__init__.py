@@ -14,6 +14,7 @@ Usage:
 """
 
 from boltz.affinity_rescoring.rescorer import AffinityRescorer
+from boltz.affinity_rescoring.multipocket import MultiPocketPipeline
 
-__all__ = ["AffinityRescorer"]
+__all__ = ["AffinityRescorer", "MultiPocketPipeline"]
 __version__ = "1.0.0"

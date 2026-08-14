@@ -1,0 +1,403 @@
+# Boltz-2 Affinity Module: Mechanistic Ablation and Target-Specific LoRA Finetuning
+
+**A Formal Research Proposal**
+
+---
+
+## 1. Introduction
+
+Recent structure-prediction foundation models such as Boltz-2 combine an
+AlphaFold-style structural trunk with a dedicated *affinity head* that regresses
+a continuous binding affinity ($\log_{10} \text{IC50}_{\mu\text{M}}$) and a
+binary binder probability from a jointly predicted protein–ligand complex.
+Because the affinity head is trained on very broad public data (ChEMBL, PDBBind,
+etc.), it inherits two problems that limit its utility as a *virtual screening
+rescorer*:
+
+1. **Mechanistic opacity.** It is unclear which information channels feeding the
+   affinity head (the pairformer trunk representation $z$, the single-token
+   embeddings $s_{\text{inputs}}$, the embedded distogram, atom-level geometry,
+   MSA profiles, and residue-type one-hots) actually drive the prediction, and
+   how sensitive that prediction is to pose noise. Without this understanding
+   any downstream deployment — including pose-quality filtering, saliency-based
+   interpretation, or targeted finetuning — is guesswork.
+2. **Generalization gap on individual targets.** The affinity head is a
+   generalist. On a specific therapeutic target of interest, well-curated
+   assay-consistent data from ChEMBL can outperform the pre-trained head by
+   substantial margins — but only if adaptation is done in a
+   parameter-efficient, capacity-comparable way that does not overwrite the
+   trunk's structural knowledge.
+
+This proposal describes two complementary experimental campaigns already
+scaffolded in this repository — an **ablation study**
+([ablation_experiment/](ablation_experiment)) and a **LoRA/full-finetune
+comparison** ([fineturning_experiment/](fineturning_experiment)) — that
+together answer *what the affinity module uses* and *how to specialize it*.
+Both campaigns operate on physically realistic pose ensembles (DOCK3.8,
+DiffDock, and Boltz-generated complexes) and are evaluated with early-recognition
+metrics appropriate for virtual screening.
+
+---
+
+## 2. Aims
+
+### Aim 1 — Mechanistic dissection of the Boltz-2 affinity head.
+Quantify the individual and joint contributions of the affinity head's input
+channels and sub-components, and its robustness to pose perturbations.
+
+- **1a.** Rank the three top-level information channels (`distogram`, `z_trunk`,
+  `s_inputs`) by necessity (single-channel ablation) and sufficiency
+  (single-channel isolation with bias-only control).
+- **1b.** Within `s_inputs`, decompose the contributions of the atom encoder
+  (3D geometry, elements, vdW), the MSA profile, and the residue-type one-hot.
+- **1c.** Characterize the spatial locality of the distogram signal via five
+  masking patterns (whole, cross, ligand-involving, receptor–receptor,
+  distance-cutoff).
+- **1d.** Measure robustness under Gaussian coordinate noise applied to (i) the
+  ligand only, (ii) the receptor only, and (iii) all atoms, across
+  $\sigma \in \{0.25, 0.5, 1.0, 2.0, 5.0, 10.0\}$ Å with seed replicates.
+- **1e.** Localize per-residue importance via a *residue leave-one-out (LOO)*
+  saliency analysis on the pair representation, yielding per-target hotspot
+  fingerprints comparable to experimental mutagenesis.
+
+### Aim 2 — Target-specific parameter-efficient finetuning.
+Determine whether a small LoRA adapter can match a full finetune of the affinity
+sub-tree on curated, assay-grouped ChEMBL data for two clinically relevant
+aminergic GPCRs (DRD4, 5-HT2A).
+
+- **2a.** Curate assay-consistent ChEMBL bioactivity data for DRD4 (CHEMBL219)
+  and 5-HT2A (CHEMBL224) with censoring flags and assay-group identifiers.
+- **2b.** Generate Boltz-2-predicted holoprotein poses for every ligand
+  (no external docking required), so training and inference share the same
+  featurization distribution.
+- **2c.** Train **LoRA adapters** (`heads_pairformer` target spec, rank 8/32)
+  and **matched full finetunes** of the same sub-tree, with identical data,
+  loss, and early stopping — enabling a strict parameter-efficiency comparison.
+- **2d.** Explore hyperparameter sensitivity, including a Huber-$\delta$ scan
+  and a rank / batch-size / dataset-size scaling study
+  ([huber_delta_scan/](fineturning_experiment/huber_delta_scan),
+  [scaling/](fineturning_experiment/scaling)).
+- **2e.** Validate adapted models against held-out in-vitro data
+  ([validation_data/](fineturning_experiment/validation_data)) that was not
+  seen during ChEMBL curation.
+
+### Aim 3 — Integrated evaluation as a virtual screening rescorer.
+Compare vanilla Boltz-2, LoRA-adapted Boltz-2, full-finetuned Boltz-2, and
+external baselines (DOCK3.8, DiffDock, "OG" Boltz-1 affinity) on the DUD-E /
+DUD-Z benchmark using bootstrap-CI log-AUC as the primary metric, and connect
+the ablation results (Aim 1) to observed screening behavior (Aim 3).
+
+---
+
+## 3. Design and Methodology
+
+### 3.1 Model under study
+
+All experiments target the **Boltz-2 affinity head** (`boltz==2.2.1`). The head
+consumes three streams produced by the frozen structural trunk:
+
+| Stream | Origin | Content |
+|---|---|---|
+| `distogram` | Boltz trunk | Embedded protein–ligand pairwise distance matrix |
+| `z_trunk` | Pairformer | Pair representation (MSA, templates, relative position, bond info) |
+| `s_inputs` | InputEmbedder | Per-token single representation composed of `atom_encoder` + `msa_profile` + `res_type` |
+
+The trunk is expensive (~10 s per complex); the head is cheap (~10 ms).
+The ablation pipeline exploits this asymmetry by caching trunk outputs once per
+`(receptor, ligand)` pair and replaying the head under many masking
+configurations.
+
+### 3.2 Ablation matrix (Aim 1)
+
+Implemented in
+[run_feature_ablation.py](ablation_experiment/experiment_scripts/run_feature_ablation.py),
+[run_feature_ablation_dudez.py](ablation_experiment/experiment_scripts/run_feature_ablation_dudez.py),
+[run_distogram_ablation.py](ablation_experiment/experiment_scripts/run_distogram_ablation.py),
+[run_residue_loo.py](ablation_experiment/experiment_scripts/run_residue_loo.py),
+[queue_boltz_rescoring.py](ablation_experiment/experiment_scripts/queue_boltz_rescoring.py).
+
+**Channel ablations.** Multiplicative masking zeros a stream and re-runs the
+head. Configurations: `baseline`, `no_distogram`, `no_z_trunk`, `no_s_inputs`
+(necessity); `distogram_only`, `z_trunk_only`, `s_inputs_only`, `bias_only`
+(sufficiency).
+
+**Sub-component ablations.** Analogous necessity / sufficiency sweeps over
+`atom_encoder`, `msa_profile`, `res_type` within `s_inputs`.
+
+**Distogram spatial masks.** Five patterns — `none`, `zero_all`, `zero_cross`
+(protein↔ligand only), `zero_ligand`, `zero_receptor`, `distance_cutoff` (zero
+pairs beyond $d$ Å, default 8 Å).
+
+**Pose-noise perturbations.** Gaussian noise
+$\mathcal{N}(0, \sigma^2 I_3)$ is applied in coordinate space before
+featurization for
+$\sigma \in \{0.25, 0.5, 1.0, 2.0, 5.0, 10.0\}$ Å (ligand-only) and
+$\sigma \in \{1.0, 5.0\}$ Å (receptor-only and all-atom controls),
+each with seed replicates `{101, 202, 303}`. This yields ~48 named
+configurations in total.
+
+**Residue LOO saliency.** For each receptor token within `--radius` Å (default
+8) of any ligand atom, the corresponding row and column of $z$ are zeroed and
+the head is re-run. The per-residue signal is
+$\Delta = \text{baseline pIC50} - \text{LOO pIC50}$. Outputs are long-form CSVs
+consumed by
+[plot_residue_saliency.py](ablation_experiment/analysis_scripts/plot_residue_saliency.py)
+to produce per-target hotspot heatmaps and top-10 rankings.
+
+**Launcher infrastructure.**
+[queue_boltz_rescoring.py](ablation_experiment/experiment_scripts/queue_boltz_rescoring.py)
+submits per-receptor jobs with configurable `--max-concurrent` and dependency
+chaining; the DUDEZ array wrapper
+[submit_feature_ablation_dudez.sh](ablation_experiment/experiment_scripts/submit_feature_ablation_dudez.sh)
+discovers Boltz-predicted receptors and forwards experiment flags.
+
+### 3.3 Finetuning pipeline (Aim 2)
+
+End-to-end pipeline in
+[fineturning_experiment/run_pipeline.sh](fineturning_experiment/run_pipeline.sh),
+driven by [config.env](fineturning_experiment/config.env) and staged as
+sequential SLURM jobs:
+
+1. **`01_pull_chembl.slurm`** — [pull_chembl_affinity_data.py](scripts/pull_chembl_affinity_data.py)
+   queries ChEMBL REST for CHEMBL219 / CHEMBL224, filters on standard type
+   (Ki/Kd/IC50/EC50/AC50/XC50), applies confidence cutoffs (B ≥ 7, F ≥ 6),
+   canonicalizes SMILES via `boltz.data.parse.smiles_standardize`, and emits
+   `data/chembl_D4_5HT2A_curated.csv` with `log10_aff_uM`, `assay_chembl_id`,
+   `is_censored`, and `n_measurements`.
+2. **`02_precompute_msas.slurm`** — [precompute_msas.py](fineturning_experiment/precompute_msas.py)
+   makes exactly two ColabFold MMseqs2 calls (one per receptor) and caches
+   `.a3m` under the canonical sequence hash. All later stages read from this
+   cache via `$BOLTZ_MSA_CACHE_DIR`; the MSA server is otherwise disabled by
+   repo policy.
+3. **`03_predict_poses.slurm`** — [prepare_predict_inputs.py](fineturning_experiment/prepare_predict_inputs.py)
+   emits per-ligand Boltz YAMLs (`PREDICT_RECYCLING_STEPS=3`,
+   `PREDICT_SAMPLING_STEPS=200`, `PREDICT_DIFFUSION_SAMPLES=1`), `boltz predict`
+   generates rank-0 complexes, and [collect_predicted_poses.py](fineturning_experiment/collect_predicted_poses.py)
+   flattens results into `poses/{DRD4,5HT2A}/{molecule_chembl_id}.pdb`. **This
+   means training and inference see poses drawn from the same distribution.**
+4. **`04{a,b}_prepare_manifest_*.slurm`** — [build_lora_manifest.py](fineturning_experiment/build_lora_manifest.py)
+   joins curated CSV with existing pose files, drops censored rows, and emits
+   `manifests/lora_manifest_{DRD4,5HT2A}.csv` with columns
+   `name, ligand, receptor, target, structure, group_id, is_binder`.
+5. **`05{a,b}_train_*.slurm`** — `boltz lora train` with
+   `rank=8, alpha=16, lr=1e-4, batch_size=32, epochs=20,
+   loss=censored_boltz2_affinity, target_spec=heads_pairformer`. Adapters land
+   in `adapters/{drd4,5ht2a}_..._rank_8_censored_data/` and are registered in
+   [adapters/registry.json](fineturning_experiment/adapters).
+6. **`05{c,d}_finetune_*.slurm`** — Matched *full-finetune control* with the
+   same data, loss, and target sub-tree, but $10\times$ lower learning rate
+   ($1\text{e-}5$) to stabilize full-parameter updates. Outputs to
+   `finetunes/{drd4,5ht2a}_full_v1/`.
+
+**LoRA parameterization.** For every adapted `nn.Linear`:
+$$y = W_0 x + \tfrac{\alpha}{r}\, B A\, x, \qquad A \in \mathbb{R}^{r\times d_{\text{in}}},\ B \in \mathbb{R}^{d_{\text{out}}\times r},\ B \equiv 0 \text{ at init.}$$
+With `heads_pairformer` and rank 8, this covers ~102 layers (~1–5% of the
+affinity sub-tree); a v2 registry entry uses rank 32 (~204 layers).
+
+**Loss.** `censored_boltz2_affinity` combines (i) intra-assay Huber on
+$\log_{10}\text{IC50}_{\mu\text{M}}$, (ii) intra-assay pairwise Huber on
+$\hat{y}_i - \hat{y}_j$ (which cancels the Cheng–Prusoff offset and legitimizes
+mixing Ki/Kd/IC50), and (iii) an optional BCE branch on `is_binder`
+(threshold $\log_{10}\text{IC50}_{\mu\text{M}} \le 1.0$, i.e. IC50 ≤ 10 µM,
+matching the Boltz-2 paper convention). An `AssayGroupedSampler` guarantees
+$\ge 4$ compounds per assay per batch so the pairwise term is always active.
+
+**Ancillary studies.**
+[huber_delta_scan/](fineturning_experiment/huber_delta_scan) systematically
+varies $\delta$ (MSE↔MAE transition), and
+[scaling/](fineturning_experiment/scaling) sweeps rank, batch size, and
+dataset size. `register_v2_adapters.py`, `recover_adapter.py`, and
+`recover_5ht2a_adapter.py` handle registry migrations and mid-run recovery.
+
+### 3.4 Evaluation methodology (Aim 3)
+
+Implemented in [ablation_experiment/analysis_scripts/](ablation_experiment/analysis_scripts):
+
+- **log-AUC (early recognition).** [compute_logauc_bootstrap.py](ablation_experiment/analysis_scripts/compute_logauc_bootstrap.py)
+  computes the log-scaled area under the TPR curve between $10^{-3}$ and $1$
+  FPR (10 000 bins, linear interpolation), scaled to $[0, 100]$; random ≈ 28–35.
+  Bootstrap: 100 replicates stratified per `(experiment, receptor)`; actives
+  and decoys are resampled independently with replacement, then aggregated
+  across receptors. Random labels: actives = non-ZINC IDs, decoys = ZINC IDs.
+- **Distribution statistics.** [compute_distribution_stats.py](ablation_experiment/analysis_scripts/compute_distribution_stats.py)
+  reports per `(experiment, receptor)` mean/std pIC50 for actives and decoys,
+  Cohen's $d$, and rank-based AUROC (lower-is-better aware); per-experiment
+  cross-receptor summaries in `distribution_stats_summary.csv`.
+- **Score aggregation.** [combine_scores.py](ablation_experiment/analysis_scripts/combine_scores.py)
+  outer-joins DOCK3.8, "OG" Boltz-1 affinity, and Boltz-2 rescoring outputs
+  into [analysis_data/combined_scores.csv](ablation_experiment/analysis_data/combined_scores.csv).
+- **Visualization.** [plot_ridgeline.py](ablation_experiment/analysis_scripts/plot_ridgeline.py)
+  (KDE ridges of log-AUC per method), [plot_scatter.py](ablation_experiment/analysis_scripts/plot_scatter.py)
+  (Boltz vs. DOCK3.8 / OG with Pearson/Spearman + OLS), [plot_residue_saliency.py](ablation_experiment/analysis_scripts/plot_residue_saliency.py)
+  (per-target hotspot heatmaps).
+- **TL;DR summarizer.** [bootstrap_tldr.py](ablation_experiment/analysis_scripts/bootstrap_tldr.py)
+  produces a compact ranked table of experiments with mean log-AUC and 95% CI.
+
+---
+
+## 4. Datasets and Evaluation
+
+### 4.1 Ablation and screening benchmark (Aims 1 & 3)
+
+- **Receptors.** 43 DUD-E / DUD-Z targets in [ablation_experiment/receptors/](ablation_experiment/receptors)
+  spanning kinases (ABL1, EGFR, KIT, LCK, MK01, SRC, ROCK1, PLK1, FGFR1, MAPK2,
+  CSF1R), GPCRs (AA2AR, ADRB2, CXCR4, DRD4), nuclear receptors (ANDR, PPARA),
+  proteases (HIVPR, FA10, FA7, RENI, THRB, TRY1, UROK), and diverse enzymes.
+- **Pose sources.** DOCK3.8 multi-pose MOL2 in
+  [DOCK3.8_poses/](ablation_experiment/DOCK3.8_poses), DiffDock scores in
+  [analysis_data/diffdock_scores/](ablation_experiment/analysis_data/diffdock_scores),
+  and Boltz-predicted complexes for the DUDEZ variant.
+- **Ligand labels.** Convention shared by all scripts: **actives = ChEMBL IDs
+  (non-ZINC prefix)**, **decoys = `ZINC` IDs**.
+- **External baselines.** [dock3.8_scores/](ablation_experiment/analysis_data/dock3.8_scores),
+  [OG_affinity_scores/master_scores.csv](ablation_experiment/analysis_data/OG_affinity_scores),
+  and the DiffDock TSVs.
+
+### 4.2 ChEMBL finetuning datasets (Aim 2)
+
+- **Targets.** DRD4 (CHEMBL219) and 5-HT2A (CHEMBL224) — related aminergic
+  GPCRs with abundant published binding data and clinical relevance
+  (antipsychotics, psychedelics).
+- **Curation.** See §3.3 stage 01. Filters keep only high-confidence
+  biochemical/functional assays with standard IC50/Ki/Kd/EC50/AC50/XC50 values,
+  RDKit-canonicalized and Boltz-standardized SMILES, and explicit censoring
+  flags. Assay groups are preserved throughout for the pairwise loss term.
+- **Held-out validation.** [validation_data/D4_in_vitro_data.csv](fineturning_experiment/validation_data/D4_in_vitro_data.csv)
+  and [validation_data/5ht2a_in_vitro_data.csv](fineturning_experiment/validation_data/5ht2a_in_vitro_data.csv)
+  provide external in-vitro measurements not seen during ChEMBL curation.
+
+### 4.3 Primary and secondary evaluation metrics
+
+| Metric | Rationale | Where computed |
+|---|---|---|
+| **log-AUC (0.1%–100% FPR)** | Early recognition; standard for VS | `compute_logauc_bootstrap.py` |
+| **Bootstrap 95% CI** on log-AUC | Statistical significance across receptors | same |
+| **Cohen's $d$, AUROC** | Effect size, ranking quality | `compute_distribution_stats.py` |
+| **Regression on continuous $\log_{10}\text{IC50}$** | Sanity check for Aim 2 (MAE, RMSE, Pearson $r$) | training logs |
+| **Per-residue $|\Delta|$ saliency** | Mechanistic interpretation | `plot_residue_saliency.py` |
+| **Robustness curves** (log-AUC vs. $\sigma$) | Pose-noise sensitivity | ablation CSV |
+
+---
+
+## 5. Expected Outcomes
+
+**From Aim 1.**
+1. The **distogram** channel is expected to be the largest single contributor
+   to affinity accuracy; `zero_all` and `zero_cross` masks should collapse
+   log-AUC to near-random, while `zero_receptor` should have small effect.
+2. `z_trunk` and `s_inputs` are likely partially redundant: single-channel
+   removal degrades performance modestly, but joint removal (bias-only) yields
+   random-quality scores.
+3. Within `s_inputs`, `atom_encoder` (3D geometry) is expected to dominate
+   `msa_profile` and `res_type`; MSA profile still contributes non-trivially
+   because it encodes evolutionary conservation of pocket residues.
+4. Pose-noise robustness curves are expected to show a soft knee near
+   $\sigma \approx 1$ Å for ligand-only noise (roughly the resolution of a good
+   docking pose) with much steeper degradation for receptor / all-atom noise,
+   consistent with a model that has learned distance-based interaction
+   fingerprints.
+5. Residue LOO should identify pharmacophorically meaningful residues
+   (aminergic-binding aspartate in TM3 of GPCRs, hinge residues of kinases,
+   catalytic dyads/triads of proteases) — providing a strong sanity check
+   and a candidate tool for mutant-effect prediction.
+
+**From Aim 2.**
+6. **LoRA (rank 8) matches full finetune within noise** on DRD4 and 5-HT2A at
+   a fraction of the parameters (~1–5%), particularly at moderate data sizes
+   (hundreds of assay-consistent labels). The scaling study should reveal a
+   crossover at which full FT begins to win, informing when LoRA is enough.
+7. Both LoRA and full FT substantially outperform vanilla Boltz-2 on target-
+   specific ranking (regression Pearson $r$ and held-out log-AUC), while
+   preserving performance on unrelated DUD-E/Z receptors from the ablation
+   benchmark (i.e. no catastrophic forgetting of the structural trunk, since
+   only `heads_pairformer` is adapted).
+8. The Huber-$\delta$ scan should identify a robust plateau (e.g. $\delta
+   \in [1, 3]$) with the pairwise term making training insensitive to the
+   absolute assay offset.
+
+**From Aim 3.**
+9. A joint picture: the *sub-components* the ablations identify as important
+   should be exactly the ones whose adaptation via LoRA yields the largest
+   Aim-2 gains, closing the mechanistic-to-practical loop.
+
+---
+
+## 6. Pitfalls and Mitigations
+
+| Pitfall | Impact | Mitigation |
+|---|---|---|
+| **Decoy/active label leakage via ID conventions** (ZINC vs ChEMBL) | Inflated log-AUC | Documented and enforced by all analysis scripts; audit `combined_scores.csv` on load |
+| **MSA server disabled but pipeline needs MSAs** | Silent fallback / crashes | Repo policy: `precompute_msas.py` runs once per target; canonical hash + legacy symlinks; `$BOLTZ_MSA_CACHE_DIR` honored everywhere |
+| **`GLIBCXX_3.4.34` mismatch** on Great Lakes after `module load cuda/...` | Boltz fails to import | All `.slurm` scripts prepend `${CONDA_PREFIX}/lib` to `LD_LIBRARY_PATH` |
+| **Trunk cost dominates ablation matrix** | 48 configs × trunk = infeasible | Cache trunk once per `(receptor, ligand)`; replay head with masks |
+| **Full-finetune divergence** relative to LoRA at matched LR | Unfair capacity comparison | Full FT uses $10\times$ lower LR (1e-5), gradient clip 1.0, weight decay 1e-4, early stopping (patience 5, min-delta 0.005) |
+| **Batch size < 4** breaks pairwise loss | Loss term silently zero | `AssayGroupedSampler` enforces ≥ 4 compounds/assay per batch |
+| **Censored measurements skew regression** | Biased MAE | Dropped by default; retained via `--keep-censored` for censored-aware loss experiments |
+| **Bootstrap under-samples rare actives** | Wide CI | Stratified per-receptor bootstrap with 100 replicates; report CI, not just point estimates |
+| **Boltz-predicted poses are self-generated** (Aim 2) | Train/test distribution match too tight | Held-out validation on in-vitro data + external DUD-Z evaluation with DOCK3.8 poses breaks any circularity |
+| **Adapter registry drift** across renames | Broken checkpoints | `register_v2_adapters.py` / `recover_*_adapter.py` reconcile registry; `adapters/registry.json` is the source of truth |
+
+---
+
+## 7. Anticipated Challenges
+
+1. **Compute budget.** `03_predict_poses.slurm` is the tall pole (up to 6 days
+   on an H200 for a few thousand ligands with 3 recycling / 200 sampling
+   steps). Mitigations: reduce `PREDICT_DIFFUSION_SAMPLES` to 1 (already done),
+   and reserve high-quality prediction for the finetuning targets only.
+2. **Assay heterogeneity in ChEMBL.** Even after confidence filtering, IC50
+   values across labs vary by 0.5–1.0 log units. The intra-assay pairwise Huber
+   loss is the principal mitigation; the Huber-$\delta$ scan quantifies
+   residual sensitivity.
+3. **Interpreting isolation vs. necessity.** A channel can be *necessary*
+   (removing it hurts) without being *sufficient* (isolating it does not
+   recover baseline) because the head is trained on the joint distribution.
+   The `bias_only` control anchors the sufficiency scale.
+4. **Statistical power on 43 receptors.** Log-AUC variance across DUD-E/Z
+   targets is high. Bootstrap CIs prevent over-claiming; per-target reporting
+   is preserved in `distribution_stats_per_receptor.csv`.
+5. **Distinguishing genuine improvement from memorization** in Aim 2. Held-out
+   in-vitro validation sets and, ideally, temporal splits (post-cutoff ChEMBL
+   releases) are required. The current pipeline supports the first; the second
+   is a straightforward extension of `pull_chembl_affinity_data.py`.
+6. **Extrapolating LOO residue saliency to causal claims.** LOO gives a
+   *model-attribution* signal, not an experimental one. Cross-reference with
+   known mutagenesis data (e.g. GPCRdb) before interpreting hotspots as
+   drug-design guidance.
+7. **Reproducibility across environments.** Trunk stochasticity (diffusion
+   sampling) means exact score reproduction requires fixed seeds; the pose
+   noise experiments already report per-seed variability, and full-run
+   reproducibility is guarded by pinned versions in
+   [boltz_affinity.yaml](boltz_affinity.yaml).
+
+---
+
+## 8. Deliverables
+
+1. **Ablation matrix CSV** — `results/ablation/feature_ablation_results.csv`
+   plus per-receptor and per-mask files, with bootstrap-CI log-AUC and
+   distribution statistics.
+2. **Residue-saliency heatmaps** per target, with top-10 residue rankings.
+3. **Trained adapters** — `adapters/{drd4,5ht2a}_*_rank_8_censored_data/`
+   registered in [adapters/registry.json](fineturning_experiment/adapters),
+   plus rank-32 v2 entries.
+4. **Full-finetune baselines** — `finetunes/{drd4,5ht2a}_full_v1/`.
+5. **Held-out validation report** — regression metrics and log-AUC on
+   [validation_data/](fineturning_experiment/validation_data).
+6. **Analysis notebooks / plots** — ridgeline distributions, correlation
+   scatters, residue heatmaps, robustness curves.
+7. **This proposal** and a companion write-up of results.
+
+---
+
+## 9. Summary
+
+The two experimental campaigns already scaffolded in this repository jointly
+answer a central question about protein–ligand foundation models:
+*which parts of the affinity module carry the signal, and can the module be
+cheaply specialized to a target of interest without disturbing the trunk?*
+The ablation campaign gives a mechanistic map (channels, sub-components, pose
+noise, per-residue attribution); the LoRA / full-finetune campaign gives a
+practical protocol grounded in a rigorous, capacity-matched control. Together
+they define a research program that connects interpretation to deployment for
+Boltz-2 as a virtual-screening rescorer.

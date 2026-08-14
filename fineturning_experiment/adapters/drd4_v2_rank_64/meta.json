@@ -1,0 +1,114 @@
+{
+  "name": "drd4_v2_rank_64",
+  "created_at": 1782819995.1244817,
+  "boltz_version": null,
+  "base_checkpoint_sha256": null,
+  "base_checkpoint_path": null,
+  "config": {
+    "rank": 32,
+    "alpha": 64.0,
+    "dropout": 0.0,
+    "target_spec": "heads_pairformer",
+    "target_patterns": []
+  },
+  "adapted_layers": [],
+  "history": [
+    {
+      "started_at": 1781286357.0093899,
+      "finished_at": 1782819995.124466,
+      "data_manifest": "/nfs/turbo/umms-maom/limcaoco/Boltz_affinity/fineturning_experiment/manifests/lora_manifest_DRD4.csv",
+      "data_sha256": null,
+      "data_rows": null,
+      "mode": "rescore",
+      "loss_spec": "boltz2_affinity",
+      "epochs": 20,
+      "learning_rate": 0.0001,
+      "batch_size": 32,
+      "metrics": [
+        {
+          "epoch": 0.0,
+          "loss": 1.7357459160904427
+        },
+        {
+          "epoch": 1.0,
+          "loss": 1.5226330452382901
+        },
+        {
+          "epoch": 2.0,
+          "loss": 1.524065658408033
+        },
+        {
+          "epoch": 3.0,
+          "loss": 1.5280434648364276
+        },
+        {
+          "epoch": 4.0,
+          "loss": 1.5046698089773203
+        },
+        {
+          "epoch": 5.0,
+          "loss": 1.4679042008300285
+        },
+        {
+          "epoch": 6.0,
+          "loss": 1.481520779052023
+        },
+        {
+          "epoch": 7.0,
+          "loss": 1.4450807888376511
+        },
+        {
+          "epoch": 8.0,
+          "loss": 1.4609346889001502
+        },
+        {
+          "epoch": 9.0,
+          "loss": 1.4582877899967344
+        },
+        {
+          "epoch": 10.0,
+          "loss": 1.4727458686562582
+        },
+        {
+          "epoch": 11.0,
+          "loss": 1.4116128246157855
+        },
+        {
+          "epoch": 12.0,
+          "loss": 1.4325911640110662
+        },
+        {
+          "epoch": 13.0,
+          "loss": 1.418729594450886
+        },
+        {
+          "epoch": 14.0,
+          "loss": 1.404573677791714
+        },
+        {
+          "epoch": 15.0,
+          "loss": 1.4175431770456712
+        },
+        {
+          "epoch": 16.0,
+          "loss": 1.414689523078459
+        },
+        {
+          "epoch": 17.0,
+          "loss": 1.41047031487112
+        },
+        {
+          "epoch": 18.0,
+          "loss": 1.3792557675538764
+        },
+        {
+          "epoch": 19.0,
+          "loss": 1.3512808267174468
+        }
+      ],
+      "notes": "DRD4 LoRA rank=32 alpha=64 \u2014 meta.json recovered from checkpoint after FileExistsError bug (checkpoint dir pre-existed registry.save)"
+    }
+  ],
+  "parent_adapter": null,
+  "format_version": 1
+}

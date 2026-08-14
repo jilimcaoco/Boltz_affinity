@@ -1,3 +1,6 @@
+# Datasets (downloaded structures and generated CSVs)
+datasets/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -165,6 +168,31 @@ cython_debug/
 #   All result files generated from a boltz prediction call
 boltz_results_*/
 
+# Local experiment / test files
+AA2AR_subposes.mol2
+AA2AR_receptor.pdb
+boltz_affinity.yaml
+submit_boltz.py
+experiment_files/
+
+# Generated fine-tuning experiment outputs
+fineturning_experiment/predict_inputs/
+fineturning_experiment/logs/
+fineturning_experiment/msa/
+fineturning_experiment/poses/
+fineturning_experiment/manifests/
+fineturning_experiment/scaling/
+fineturning_experiment/data/
+fineturning_experiment/decoys/
+fineturning_experiment/validation_data/
+fineturning_experiment/analysis/labels/
+fineturning_experiment/analysis/leakage/
+fineturning_experiment/analysis/metrics/
+fineturning_experiment/analysis/plots/
+fineturning_experiment/analysis/poses/
+fineturning_experiment/analysis/poses_inputs/
+fineturning_experiment/analysis/scores/
+
 # Generated data files (receptor PDBs, ligand mol2s, score CSVs)
 *.pdb
 *.mol2
@@ -177,7 +205,12 @@ boltz_results_*/
 slurm_scripts/*.log
 slurm_scripts/*.out
 slurm_scripts/*.err
-slurm_scripts/*.slurm
+
+# NOTE: main also carried `slurm_scripts/*.slurm` here. That rule is
+# deliberately NOT merged: the .slurm job scripts in slurm_scripts/ are
+# tracked reproducibility artifacts, not generated logs, and the rule would
+# silently stop any new one from being added. The three log patterns above
+# are what that block was actually after.
 
 # Cached/copied path artifacts
 home/

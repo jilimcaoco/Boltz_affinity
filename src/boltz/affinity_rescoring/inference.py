@@ -1,32 +1,31 @@
 """
 Inference engine for affinity rescoring.
 
-Manages model loading, device detection, and running inference
-through the Boltz-2 affinity module - either via the full pipeline
-or with pre-computed coordinates (skipping diffusion).
+*** AFFINITY-ONLY MODE ***
+This module runs ONLY the trunk + affinity head of Boltz-2.
+Diffusion and confidence modules are intentionally bypassed.
+All coordinates come from pre-existing PDB/CIF structures.
+
+Manages model loading, device detection, checkpoint management,
+and direct affinity inference (trunk + affinity head) for the
+Boltz-2 affinity module.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
 import tempfile
-import time
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+from torch import Tensor
 
 from boltz.affinity_rescoring.models import (
-    AffinityResult,
     DeviceOption,
-    RescoreConfig,
-    Timer,
-    ValidationStatus,
     compute_file_sha256,
 )
 
@@ -44,7 +43,7 @@ class AffinityModelManager:
     - Handle device fallback (GPU → CPU)
     """
 
-    # Default checkpoint URLs (same as main.py)
+    # Default checkpoint URLs (same as main.py) I had to put this here cause of cache errors that may occur. 
     CHECKPOINT_URLS = {
         "gateway": "https://model-gateway.boltz.bio/boltz2_aff.ckpt",
         "huggingface": "https://huggingface.co/boltz-community/boltz2/resolve/main/boltz2_aff.ckpt",
@@ -166,19 +165,89 @@ class AffinityModelManager:
 
         logger.info(f"Loading model from {ckpt_path} on {self.device}")
 
-        # Default predict args for affinity (mirroring main.py)
+        # Affinity-only predict args.
+        # NOTE: diffusion / confidence parameters are intentionally omitted.
+        # This module runs trunk + affinity head ONLY — no diffusion, no
+        # confidence module.  Setting diffusion/sampling values here would
+        # have no effect since affinity_forward() bypasses those stages.
         predict_args = {
             "recycling_steps": 5,
-            "sampling_steps": 200,
-            "diffusion_samples": 5,
+            "sampling_steps": 0,      # unused — affinity-only mode
+            "diffusion_samples": 0,   # unused — affinity-only mode
             "write_confidence_summary": False,
             "write_full_pae": False,
             "write_full_pde": False,
         }
 
+        # ── Patch checkpoint to strip unknown kwargs ──────────────
+        # Newer checkpoints may store hyperparameters (e.g.
+        # mse_rotational_alignment) that the current source code's
+        # AtomDiffusion.__init__() does not accept.  Rather than
+        # modifying Boltz source, we strip them from the checkpoint
+        # in memory before loading.
+        _STRIP_DIFFUSION_KEYS = {"mse_rotational_alignment"}
+
+        # PyTorch ≥2.6 changed weights_only default to True.  This checkpoint
+        # is from a trusted internal source and serialises multiple omegaconf
+        # internal types (DictConfig, ListConfig, ContainerMetadata, …).
+        # Rather than maintaining an ever-growing allowlist, load with
+        # weights_only=False which is the correct approach for trusted ckpts.
+        ckpt_data = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        patched = False
+        if "hyper_parameters" in ckpt_data:
+            hp = ckpt_data["hyper_parameters"]
+            if "diffusion_process_args" in hp:
+                for key in _STRIP_DIFFUSION_KEYS:
+                    if key in hp["diffusion_process_args"]:
+                        del hp["diffusion_process_args"][key]
+                        patched = True
+                        logger.info(
+                            f"Stripped unsupported checkpoint hparam: "
+                            f"diffusion_process_args.{key}"
+                        )
+            # ── Force v2 pairformer/MSA paths ──────────────────────
+            # The Boltz-2 affinity checkpoint was trained with the v2
+            # attention/MSA blocks but stores `pairformer_args` /
+            # `msa_args` without the `v2: True` flag.  Rebuilding the
+            # model from these hparams without the flag picks the v1
+            # AttentionPairBias (with an extra `norm_s` LayerNorm) and
+            # produces a state-dict mismatch.  Force v2 here.
+            # Note: hparams are typically stored as omegaconf DictConfig,
+            # so we use duck-typing rather than isinstance(dict).
+            for _args_key in ("pairformer_args", "msa_args"):
+                _args = hp.get(_args_key)
+                if _args is None:
+                    continue
+                try:
+                    _has_v2 = bool(_args.get("v2", False)) if hasattr(_args, "get") else False
+                    if not _has_v2:
+                        _args["v2"] = True
+                        patched = True
+                        logger.info(
+                            f"Forced checkpoint hparam {_args_key}.v2 = True "
+                            f"(Boltz-2 uses v2 attention blocks)"
+                        )
+                except Exception as _e:  # pragma: no cover
+                    logger.warning(
+                        f"Could not patch {_args_key}.v2 in checkpoint hparams: {_e}"
+                    )
+
+        if patched:
+            # Save patched checkpoint to a temp file for loading
+            import tempfile as _tmpmod
+            _tmp_fd, _tmp_ckpt = _tmpmod.mkstemp(suffix=".ckpt")
+            os.close(_tmp_fd)
+            torch.save(ckpt_data, _tmp_ckpt)
+            _load_path = _tmp_ckpt
+        else:
+            _load_path = str(ckpt_path)
+            _tmp_ckpt = None
+
+        del ckpt_data  # free memory
+
         try:
             model = Boltz2.load_from_checkpoint(
-                str(ckpt_path),
+                _load_path,
                 strict=True,
                 map_location="cpu",  # Load to CPU first, then move
                 predict_args=predict_args,
@@ -195,7 +264,7 @@ class AffinityModelManager:
                 logger.warning(f"GPU loading failed: {e}. Falling back to CPU.")
                 self.device = "cpu"
                 model = Boltz2.load_from_checkpoint(
-                    str(ckpt_path),
+                    _load_path,
                     strict=True,
                     map_location="cpu",
                     predict_args=predict_args,
@@ -209,6 +278,14 @@ class AffinityModelManager:
                 f"Verify CUDA/torch installation: pip install torch --force-reinstall"
             ) from e
 
+        finally:
+            # Clean up temp patched checkpoint
+            if _tmp_ckpt is not None:
+                try:
+                    os.remove(_tmp_ckpt)
+                except OSError:
+                    pass
+
     @property
     def model(self):
         if self._model is None:
@@ -218,230 +295,6 @@ class AffinityModelManager:
     @property
     def checkpoint_sha256(self) -> str:
         return self._checkpoint_sha256
-
-
-class AffinityInferenceEngine:
-    """
-    Performs inference using the existing Boltz-2 pipeline.
-
-    This engine orchestrates the full Boltz-2 predict pipeline
-    for affinity prediction, integrating with the existing
-    data loading, tokenization, cropping, featurization,
-    and model forward pass.
-    """
-
-    def __init__(
-        self,
-        model_manager: AffinityModelManager,
-        config: RescoreConfig,
-    ):
-        self.model_manager = model_manager
-        self.config = config
-        self._model = None
-        self._total_inference_time = 0.0
-
-    def run_boltz_affinity_pipeline(
-        self,
-        input_yaml_path: Path,
-        output_dir: Path,
-        structure_prediction_dir: Optional[Path] = None,
-        run_structure_prediction: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        Run the full Boltz-2 affinity pipeline for a single input.
-
-        This leverages the existing predict infrastructure via
-        programmatic invocation rather than CLI. It:
-        1. Processes input YAML
-        2. Runs structure prediction (if needed)
-        3. Runs affinity prediction
-        4. Returns parsed results
-
-        Parameters
-        ----------
-        input_yaml_path : Path
-            Path to the YAML input file
-        output_dir : Path
-            Directory for output files
-        structure_prediction_dir : Path, optional
-            Directory with pre-computed structures (skip diffusion)
-        run_structure_prediction : bool
-            Whether to run structure prediction first
-
-        Returns
-        -------
-        dict
-            Affinity prediction results
-        """
-        from boltz.main import predict as boltz_predict
-
-        # This calls the existing predict flow which handles everything
-        # For now, we raise NotImplementedError for direct invocation
-        # and instead use the YAML-based pipeline
-        raise NotImplementedError(
-            "Direct pipeline invocation is under development. "
-            "Use AffinityRescorer.rescore_pdb() which generates YAML and runs via CLI."
-        )
-
-    def infer_single_from_features(
-        self, features: Dict[str, torch.Tensor]
-    ) -> Dict[str, float]:
-        """
-        Run inference on pre-computed features.
-
-        This is a lower-level method that directly calls the model
-        forward pass on already-featurized data.
-
-        Parameters
-        ----------
-        features : dict
-            Feature dictionary as produced by Boltz2Featurizer
-
-        Returns
-        -------
-        dict
-            Raw model outputs (affinity_pred_value, affinity_probability_binary, etc.)
-        """
-        model = self.model_manager.model
-
-        with torch.no_grad(), Timer() as t:
-            try:
-                # Move features to device
-                device = self.model_manager.device
-                batch = {}
-                for k, v in features.items():
-                    if isinstance(v, torch.Tensor):
-                        batch[k] = v.to(device)
-                    else:
-                        batch[k] = v
-
-                out = model.predict_step(batch, 0)
-
-                results = {}
-                if not out.get("exception", False):
-                    if "affinity_pred_value" in out:
-                        results["affinity_pred_value"] = out["affinity_pred_value"].item()
-                    if "affinity_probability_binary" in out:
-                        results["affinity_probability_binary"] = out[
-                            "affinity_probability_binary"
-                        ].item()
-                    # Ensemble values
-                    for key in [
-                        "affinity_pred_value1",
-                        "affinity_pred_value2",
-                        "affinity_probability_binary1",
-                        "affinity_probability_binary2",
-                    ]:
-                        if key in out:
-                            results[key] = out[key].item()
-                else:
-                    results["error"] = "Model returned exception"
-
-                results["inference_time_ms"] = t.elapsed_ms
-                return results
-
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                raise RuntimeError(
-                    "Out of memory during inference. "
-                    "Try reducing complex size or using CPU (--device cpu)."
-                )
-            except Exception as e:
-                return {
-                    "error": str(e),
-                    "inference_time_ms": t.elapsed_ms,
-                }
-
-
-def run_affinity_prediction_via_yaml(
-    input_path: Path,
-    output_dir: Path,
-    checkpoint: str = "auto",
-    device: str = "auto",
-    recycling_steps: int = 5,
-    diffusion_samples: int = 5,
-    sampling_steps: int = 200,
-    affinity_mw_correction: bool = True,
-    use_msa_server: bool = False,
-    override: bool = True,
-) -> Optional[Dict[str, Any]]:
-    """
-    Run the full Boltz affinity prediction pipeline for a single input.
-
-    This function programmatically invokes the existing Boltz predict
-    command to run structure + affinity prediction.
-
-    Parameters
-    ----------
-    input_path : Path
-        Path to YAML/FASTA input file
-    output_dir : Path
-        Output directory
-    checkpoint : str
-        Checkpoint path or 'auto'
-    device : str
-        Device to use
-    Other parameters match the Boltz CLI options.
-
-    Returns
-    -------
-    dict or None
-        Parsed affinity results JSON, or None on failure
-    """
-    import subprocess
-    import sys
-
-    cmd = [
-        sys.executable, "-m", "boltz.main", "predict",
-        str(input_path),
-        "--out_dir", str(output_dir),
-        "--recycling_steps", str(recycling_steps),
-        "--diffusion_samples_affinity", str(diffusion_samples),
-        "--sampling_steps", str(sampling_steps),
-    ]
-
-    if not affinity_mw_correction:
-        cmd.append("--no_affinity_mw_correction")
-
-    if device != "auto":
-        cmd.extend(["--accelerator", device])
-
-    if override:
-        cmd.append("--override")
-
-    if not use_msa_server:
-        pass  # Default is no MSA server
-
-    logger.info(f"Running Boltz predict: {' '.join(cmd)}")
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=3600,  # 1 hour timeout
-        )
-
-        if result.returncode != 0:
-            logger.error(f"Boltz predict failed:\n{result.stderr}")
-            return None
-
-        # Find and parse affinity output
-        results_dir = output_dir / f"boltz_results_{input_path.stem}" / "predictions"
-        if results_dir.exists():
-            for json_file in results_dir.rglob("affinity_*.json"):
-                with open(json_file) as f:
-                    return json.load(f)
-
-        logger.warning("No affinity output found")
-        return None
-
-    except subprocess.TimeoutExpired:
-        logger.error("Boltz predict timed out (>1h)")
-        return None
-    except Exception as e:
-        logger.error(f"Failed to run Boltz predict: {e}")
-        return None
 
 
 def create_affinity_yaml(
@@ -496,84 +349,663 @@ def create_affinity_yaml(
     return output_path
 
 
-def create_affinity_yaml_from_structure(
-    structure_path: Path,
-    protein_chains: List[str],
-    ligand_chains: List[str],
-    protein_sequences: Dict[str, str],
-    ligand_smiles: Dict[str, str],
-    output_path: Optional[Path] = None,
-) -> Path:
+# ─── Direct Affinity Inference (Plan B) ──────────────────────────────────────
+
+
+def _get_module(model: Any, attr: str) -> Any:
+    """Get a model submodule, unwrapping torch.compile if needed."""
+    mod = getattr(model, attr)
+    if hasattr(mod, "_orig_mod"):
+        return mod._orig_mod  # noqa: SLF001
+    return mod
+
+
+def _affinity_input_embed_with_ablation(
+    model: Any,
+    feats: Dict[str, Tensor],
+    *,
+    zero_atom_encoder: bool = False,
+    zero_msa_profile: bool = False,
+    zero_res_type: bool = False,
+) -> Tensor:
+    """Compute ``model.input_embedder(feats, affinity=True)`` with optional
+    sub-component ablations.
+
+    The InputEmbedder additively combines three paths:
+
+        s = atom_encoder(feats) + res_type_encoding(res_type)
+              + msa_profile_encoding(profile, deletion_mean)
+
+    Each ``zero_*`` flag subtracts the corresponding contribution from
+    the recomputed ``s_inputs`` tensor so that channel is zeroed before
+    being passed to the affinity head.
     """
-    Create a Boltz affinity YAML from a parsed structure.
+    s_inputs = model.input_embedder(feats, affinity=True)
 
-    This is used for PDB/CIF rescoring where we need to
-    create the YAML that Boltz expects as input.
+    if not (zero_atom_encoder or zero_msa_profile or zero_res_type):
+        return s_inputs
 
-    Parameters
-    ----------
-    structure_path : Path
-        Original structure file (for reference)
-    protein_chains : list of str
-        Protein chain IDs
-    ligand_chains : list of str
-        Ligand chain IDs
-    protein_sequences : dict
-        Map of chain_id → amino acid sequence
-    ligand_smiles : dict
-        Map of chain_id → SMILES string
-    output_path : Path, optional
-        Where to write YAML
+    embedder = model.input_embedder
+    if hasattr(embedder, "_orig_mod"):
+        embedder = embedder._orig_mod  # noqa: SLF001
+
+    if zero_res_type:
+        contrib = embedder.res_type_encoding(feats["res_type"].float())
+        s_inputs = s_inputs - contrib
+
+    if zero_msa_profile:
+        profile = feats["profile_affinity"]
+        deletion_mean = feats["deletion_mean_affinity"].unsqueeze(-1)
+        contrib = embedder.msa_profile_encoding(
+            torch.cat([profile, deletion_mean], dim=-1)
+        )
+        s_inputs = s_inputs - contrib
+
+    if zero_atom_encoder:
+        # Recompute the atom-encoder contribution exactly as InputEmbedder
+        # does, then subtract it. This avoids replicating the full forward
+        # pass while still cleanly removing that pathway.
+        q, c, p, to_keys = embedder.atom_encoder(feats)
+        atom_enc_bias = embedder.atom_enc_proj_z(p)
+        a, _, _, _ = embedder.atom_attention_encoder(
+            feats=feats,
+            q=q,
+            c=c,
+            atom_enc_bias=atom_enc_bias,
+            to_keys=to_keys,
+        )
+        s_inputs = s_inputs - a
+
+    return s_inputs
+
+
+@torch.inference_mode()
+def affinity_trunk_forward(
+    model: Any,
+    feats: Dict[str, Tensor],
+    recycling_steps: int = 3,
+) -> Dict[str, Tensor]:
+    """Run only the trunk (input embedder + recycled msa/pairformer) and
+    return the intermediate tensors needed by the affinity head.
+
+    This is the front half of :func:`affinity_forward`; useful when the
+    same trunk output should be reused across many affinity-head
+    invocations (e.g. residue leave-one-out studies).
 
     Returns
     -------
-    Path
-        Path to created YAML
+    dict
+        ``{"z": Tensor, "s": Tensor, "use_kernels": bool}`` where
+        ``z`` has shape ``(B, N, N, token_z)`` and ``s`` has shape
+        ``(B, N, token_s)`` from the trunk's last recycling iteration.
     """
-    import yaml
+    if "coords" not in feats:
+        raise RuntimeError(
+            "AFFINITY-ONLY MODE: 'coords' not found in features. "
+            "PDB coordinates must be injected before calling "
+            "affinity_trunk_forward(). This function does NOT run diffusion."
+        )
+    model.eval()
 
-    sequences = []
-    for chain_id in protein_chains:
-        if chain_id in protein_sequences:
-            sequences.append({
-                "protein": {
-                    "id": chain_id,
-                    "sequence": protein_sequences[chain_id],
-                }
-            })
+    s_inputs = model.input_embedder(feats)
+    s_init = model.s_init(s_inputs)
+    z_init = (
+        model.z_init_1(s_inputs)[:, :, None]
+        + model.z_init_2(s_inputs)[:, None, :]
+    )
+    relative_position_encoding = model.rel_pos(feats)
+    z_init = z_init + relative_position_encoding
+    z_init = z_init + model.token_bonds(feats["token_bonds"].float())
+    if model.bond_type_feature:
+        z_init = z_init + model.token_bonds_type(feats["type_bonds"].long())
+    z_init = z_init + model.contact_conditioning(feats)
 
-    binder_chain = None
-    for chain_id in ligand_chains:
-        if chain_id in ligand_smiles:
-            sequences.append({
-                "ligand": {
-                    "id": chain_id,
-                    "smiles": ligand_smiles[chain_id],
-                }
-            })
-            if binder_chain is None:
-                binder_chain = chain_id
+    s = torch.zeros_like(s_init)
+    z = torch.zeros_like(z_init)
 
-    if binder_chain is None:
-        raise ValueError(
-            f"No ligand SMILES provided for chains {ligand_chains}. "
-            f"Cannot create affinity YAML without ligand SMILES."
+    mask = feats["token_pad_mask"].float()
+    pair_mask = mask[:, :, None] * mask[:, None, :]
+
+    use_kernels = model.use_kernels
+
+    msa_module = _get_module(model, "msa_module")
+    pairformer_module = _get_module(model, "pairformer_module")
+
+    for _ in range(recycling_steps + 1):
+        s = s_init + model.s_recycle(model.s_norm(s))
+        z = z_init + model.z_recycle(model.z_norm(z))
+        if model.use_templates:
+            template_module = _get_module(model, "template_module")
+            z = z + template_module(z, feats, pair_mask, use_kernels=use_kernels)
+        z = z + msa_module(z, s_inputs, feats, use_kernels=use_kernels)
+        s, z = pairformer_module(
+            s, z, mask=mask, pair_mask=pair_mask, use_kernels=use_kernels,
         )
 
-    data = {
-        "version": 1,
-        "sequences": sequences,
-        "properties": [
-            {"affinity": {"binder": binder_chain}},
-        ],
-    }
+    return {"z": z, "s": s, "use_kernels": use_kernels}
 
-    if output_path is None:
-        fd, tmp = tempfile.mkstemp(suffix=".yaml", prefix="affinity_")
-        os.close(fd)
-        output_path = Path(tmp)
 
-    with open(output_path, "w") as f:
-        yaml.dump(data, f, default_flow_style=False)
+def _build_cross_pair_mask(feats: Dict[str, Tensor]) -> Tensor:
+    """Construct the (N, N) cross-pair mask used by the affinity head."""
+    pad_token_mask = feats["token_pad_mask"][0]
+    rec_mask = (feats["mol_type"][0] == 0) * pad_token_mask
+    lig_mask = feats["affinity_token_mask"][0].to(torch.bool) * pad_token_mask
+    return (
+        lig_mask[:, None] * rec_mask[None, :]
+        + rec_mask[:, None] * lig_mask[None, :]
+        + lig_mask[:, None] * lig_mask[None, :]
+    )
 
-    return output_path
+
+@torch.inference_mode()
+def affinity_head_forward(
+    model: Any,
+    feats: Dict[str, Tensor],
+    trunk_out: Dict[str, Tensor],
+    *,
+    z_token_mask: Optional[Tensor] = None,
+    zero_z_trunk: bool = False,
+    zero_s_inputs: bool = False,
+    disable_distogram: bool = False,
+    pose_noise_sigma: float = 0.0,
+    pose_noise_seed: Optional[int] = None,
+    pose_noise_target: str = "ligand",
+    zero_atom_encoder: bool = False,
+    zero_msa_profile: bool = False,
+    zero_res_type: bool = False,
+) -> Dict[str, Any]:
+    """Run only the affinity head, given pre-computed trunk outputs.
+
+    Parameters
+    ----------
+    model, feats : see :func:`affinity_forward`.
+    trunk_out : dict
+        Output of :func:`affinity_trunk_forward` (must contain ``z`` and
+        ``use_kernels``).
+    z_token_mask : Tensor or None
+        Optional per-token multiplicative mask of shape ``(N_tokens,)``
+        applied to ``z`` as an outer product ``mask[:,None] * mask[None,:]``
+        before passing into the affinity head. Used by the leave-one-out
+        residue saliency analysis to zero a single residue's row/col.
+    Other kwargs : same as :func:`affinity_forward`.
+    """
+    z = trunk_out["z"]
+    use_kernels = trunk_out["use_kernels"]
+
+    cross_pair_mask = _build_cross_pair_mask(feats)
+    z_affinity = z * cross_pair_mask[None, :, :, None]
+
+    if z_token_mask is not None:
+        z_token_mask = z_token_mask.to(z_affinity.device, z_affinity.dtype)
+        loo_mask = z_token_mask[:, None] * z_token_mask[None, :]
+        z_affinity = z_affinity * loo_mask[None, :, :, None]
+
+    if zero_z_trunk:
+        z_affinity = torch.zeros_like(z_affinity)
+
+    coords_affinity = feats["coords"].detach()
+    if coords_affinity.dim() == 3:
+        coords_affinity = coords_affinity[None]
+    elif coords_affinity.dim() == 4 and coords_affinity.shape[1] > 1:
+        coords_affinity = coords_affinity[:, :1]
+
+    if pose_noise_sigma > 0.0:
+        atom_to_token = feats["atom_to_token"]
+        if pose_noise_target == "ligand":
+            tok_mask = feats["affinity_token_mask"][0].to(torch.bool)
+        elif pose_noise_target == "receptor":
+            pad_tok = feats["token_pad_mask"][0]
+            tok_mask = ((feats["mol_type"][0] == 0) * pad_tok).to(torch.bool)
+        elif pose_noise_target == "all":
+            tok_mask = feats["token_pad_mask"][0].to(torch.bool)
+        else:
+            raise ValueError(
+                f"Unknown pose_noise_target={pose_noise_target!r}"
+            )
+        n_tok_mask = tok_mask.shape[0]
+        a2t = atom_to_token[0][..., :n_tok_mask].to(torch.bool)
+        atom_mask = a2t.any(dim=-1) & (a2t & tok_mask.unsqueeze(0)).any(dim=-1)
+        atom_mask_b = atom_mask.view(1, 1, -1, 1).to(coords_affinity.dtype)
+        if pose_noise_seed is not None:
+            gen = torch.Generator(device=coords_affinity.device)
+            gen.manual_seed(int(pose_noise_seed))
+            noise = torch.randn(
+                coords_affinity.shape,
+                generator=gen,
+                device=coords_affinity.device,
+                dtype=coords_affinity.dtype,
+            )
+        else:
+            noise = torch.randn_like(coords_affinity)
+        coords_affinity = coords_affinity + atom_mask_b * (
+            noise * float(pose_noise_sigma)
+        )
+
+    s_inputs = _affinity_input_embed_with_ablation(
+        model, feats,
+        zero_atom_encoder=zero_atom_encoder,
+        zero_msa_profile=zero_msa_profile,
+        zero_res_type=zero_res_type,
+    )
+    if zero_s_inputs:
+        s_inputs = torch.zeros_like(s_inputs)
+
+    module_kwargs = {"disable_distogram": disable_distogram}
+    results: Dict[str, Any] = {}
+
+    with torch.autocast("cuda", enabled=False):
+        if model.affinity_ensemble:
+            affinity_module1 = _get_module(model, "affinity_module1")
+            affinity_module2 = _get_module(model, "affinity_module2")
+
+            out1 = affinity_module1(
+                s_inputs=s_inputs.detach(),
+                z=z_affinity.detach(),
+                x_pred=coords_affinity,
+                feats=feats,
+                multiplicity=1,
+                use_kernels=use_kernels,
+                **module_kwargs,
+            )
+            out1["affinity_probability_binary"] = torch.nn.functional.sigmoid(
+                out1["affinity_logits_binary"]
+            )
+            out2 = affinity_module2(
+                s_inputs=s_inputs.detach(),
+                z=z_affinity.detach(),
+                x_pred=coords_affinity,
+                feats=feats,
+                multiplicity=1,
+                use_kernels=use_kernels,
+                **module_kwargs,
+            )
+            out2["affinity_probability_binary"] = torch.nn.functional.sigmoid(
+                out2["affinity_logits_binary"]
+            )
+            avg_pred = (out1["affinity_pred_value"] + out2["affinity_pred_value"]) / 2
+            avg_prob = (
+                out1["affinity_probability_binary"]
+                + out2["affinity_probability_binary"]
+            ) / 2
+            if model.affinity_mw_correction:
+                model_coef = 1.03525938
+                mw_coef = -0.59992683
+                bias = 2.83288489
+                mw = feats["affinity_mw"][0] ** 0.3
+                avg_pred = model_coef * avg_pred + mw_coef * mw + bias
+            results["affinity_pred_value"] = avg_pred.item()
+            results["affinity_probability_binary"] = avg_prob.item()
+            results["affinity_pred_value1"] = out1["affinity_pred_value"].item()
+            results["affinity_pred_value2"] = out2["affinity_pred_value"].item()
+            results["affinity_probability_binary1"] = out1[
+                "affinity_probability_binary"
+            ].item()
+            results["affinity_probability_binary2"] = out2[
+                "affinity_probability_binary"
+            ].item()
+        else:
+            affinity_module = _get_module(model, "affinity_module")
+            out = affinity_module(
+                s_inputs=s_inputs.detach(),
+                z=z_affinity.detach(),
+                x_pred=coords_affinity,
+                feats=feats,
+                multiplicity=1,
+                use_kernels=use_kernels,
+                **module_kwargs,
+            )
+            results["affinity_pred_value"] = out["affinity_pred_value"].item()
+            results["affinity_probability_binary"] = torch.nn.functional.sigmoid(
+                out["affinity_logits_binary"]
+            ).item()
+
+    return results
+
+
+@torch.inference_mode()
+def affinity_forward(
+    model: Any,
+    feats: Dict[str, Tensor],
+    recycling_steps: int = 3,
+    *,
+    zero_z_trunk: bool = False,
+    zero_s_inputs: bool = False,
+    disable_distogram: bool = False,
+    pose_noise_sigma: float = 0.0,
+    pose_noise_seed: Optional[int] = None,
+    pose_noise_target: str = "ligand",
+    zero_atom_encoder: bool = False,
+    zero_msa_profile: bool = False,
+    zero_res_type: bool = False,
+) -> Dict[str, Any]:
+    """Run trunk + affinity head, skipping diffusion and confidence.
+
+    This replicates the relevant parts of ``Boltz2.forward()`` without
+    running the diffusion or confidence modules.  The input ``feats``
+    must already contain ``coords`` (from PDB coordinate injection)
+    which will be used directly as ``x_pred`` for the affinity head.
+
+    *** SAFETY: This function NEVER calls diffusion or confidence. ***
+    If you see results from this function, they came from affinity-only
+    inference (trunk + affinity head with injected PDB coordinates).
+
+    Parameters
+    ----------
+    model : Boltz2
+        A loaded Boltz2 model in eval mode.
+    feats : dict
+        Feature dictionary produced by the data pipeline
+        (tokenize → crop → featurize) with PDB coordinates.
+    recycling_steps : int
+        Number of recycling iterations for the trunk.
+    zero_z_trunk : bool
+        If True, zero the pair representation ``z`` passed to the affinity
+        head (ablation: removes trunk pair signal).
+    zero_s_inputs : bool
+        If True, zero the single representation ``s_inputs`` passed to the
+        affinity head (ablation: removes per-token single signal).
+    disable_distogram : bool
+        If True, skip the distogram contribution inside the affinity
+        module (ablation: removes pose-distance signal).
+    pose_noise_sigma : float
+        Gaussian noise standard deviation (Å) added to atom coordinates
+        before the affinity head. ``0`` disables noise.
+    pose_noise_seed : int or None
+        RNG seed for reproducibility of the noise. If ``None``, draws
+        from the global torch RNG.
+    pose_noise_target : {"ligand", "all", "receptor"}
+        Which atoms to perturb. Default ``"ligand"`` perturbs only atoms
+        belonging to the ligand (affinity binder).
+    zero_atom_encoder, zero_msa_profile, zero_res_type : bool
+        Sub-component ablations of the affinity-pass ``InputEmbedder``
+        output. Each one zeroes one of the three additive paths inside
+        ``InputEmbedder.forward`` (atom encoder, MSA profile, residue
+        type). Implemented by recomputing the affinity-pass embedding
+        with the targeted feature tensor in ``feats`` zeroed.
+
+    Returns
+    -------
+    dict
+        Affinity predictions including ``affinity_pred_value``,
+        ``affinity_probability_binary``, and ensemble values if applicable.
+
+    Raises
+    ------
+    RuntimeError
+        If ``feats`` does not contain ``coords`` (PDB coordinates must
+        be injected before calling this function).
+    """
+    # Single source of truth: run the trunk, then the head.  The two
+    # split helpers below carry the actual implementation; this entry
+    # point is preserved for backward compatibility and stays the
+    # canonical call for one-shot trunk + head inference.
+    trunk_out = affinity_trunk_forward(
+        model, feats, recycling_steps=recycling_steps,
+    )
+    return affinity_head_forward(
+        model, feats, trunk_out,
+        zero_z_trunk=zero_z_trunk,
+        zero_s_inputs=zero_s_inputs,
+        disable_distogram=disable_distogram,
+        pose_noise_sigma=pose_noise_sigma,
+        pose_noise_seed=pose_noise_seed,
+        pose_noise_target=pose_noise_target,
+        zero_atom_encoder=zero_atom_encoder,
+        zero_msa_profile=zero_msa_profile,
+        zero_res_type=zero_res_type,
+    )
+
+
+def run_direct_affinity_inference(
+    model: Any,
+    yaml_path: Path,
+    pdb_atoms: list,
+    chain_id_map: Dict[str, int],
+    cache_dir: Optional[Path] = None,
+    work_dir: Optional[Path] = None,
+    use_msa_server: bool = False,
+    msa_server_url: str = "https://api.colabfold.com",
+    recycling_steps: int = 3,
+    device: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run the complete direct affinity inference pipeline.
+
+    Steps:
+    1. Run ``process_input`` to preprocess the YAML (structures, MSA, molecules)
+    2. Inject PDB coordinates into the processed structure
+    3. Save as pre_affinity npz
+    4. Load through the affinity data pipeline (tokenize, crop, featurize)
+    5. Run ``affinity_forward`` (trunk + affinity head, no diffusion)
+
+    Parameters
+    ----------
+    model : Boltz2
+        Loaded model in eval mode.
+    yaml_path : Path
+        Path to the affinity YAML input file.
+    pdb_atoms : list
+        Parsed PDB atoms (AtomInfo namedtuples).
+    chain_id_map : dict
+        Mapping from PDB chain_id → YAML chain_id. This is used to
+        build the full chain_id → asym_id mapping after processing.
+    cache_dir : Path, optional
+        Boltz cache directory (default: ``~/.boltz``).
+    work_dir : Path, optional
+        Working directory for intermediate files. Created as tmpdir if None.
+    use_msa_server : bool
+        Whether to use the MSA server.
+    msa_server_url : str
+        URL for the MSA server.
+    recycling_steps : int
+        Number of trunk recycling steps.
+    device : str, optional
+        Device string (e.g. "cuda", "cpu"). Inferred from model if None.
+
+    Returns
+    -------
+    dict
+        Affinity prediction results.
+    """
+    from boltz.affinity_rescoring.coord_injection import (
+        build_chain_id_map,
+        check_unresolved_near_pocket,
+        inject_pdb_coords_into_structure,
+        save_pre_affinity_structure,
+    )
+    from boltz.data import const
+    from boltz.data.crop.affinity import AffinityCropper
+    from boltz.data.feature.featurizerv2 import Boltz2Featurizer
+    from boltz.data.mol import load_canonicals, load_molecules
+    from boltz.data.module.inferencev2 import load_input
+    from boltz.data.tokenize.boltz2 import Boltz2Tokenizer
+    from boltz.data.types import Record, StructureV2
+    from boltz.main import process_input
+
+    if cache_dir is None:
+        cache_dir = Path(os.environ.get("BOLTZ_CACHE", "~/.boltz")).expanduser()
+
+    mol_dir = cache_dir / "mols"
+    ccd_path = cache_dir / "ccd.pkl"
+    own_work_dir = work_dir is None
+    if work_dir is None:
+        work_dir = Path(tempfile.mkdtemp(prefix="boltz_direct_"))
+
+    try:
+        # ── Step 1: Preprocess YAML ──────────────────────────────────
+        out_dir = work_dir / "output"
+        msa_dir = out_dir / "msa"
+        records_dir = out_dir / "processed" / "records"
+        structure_dir = out_dir / "processed" / "structures"
+        processed_msa_dir = out_dir / "processed" / "msa"
+        processed_constraints_dir = out_dir / "processed" / "constraints"
+        processed_templates_dir = out_dir / "processed" / "templates"
+        processed_mols_dir = out_dir / "processed" / "mols"
+        predictions_dir = out_dir / "predictions"
+
+        for d in [
+            out_dir, msa_dir, records_dir, structure_dir,
+            processed_msa_dir, processed_constraints_dir,
+            processed_templates_dir, processed_mols_dir, predictions_dir,
+        ]:
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Load CCD
+        ccd = load_canonicals(mol_dir)
+
+        process_input(
+            path=yaml_path,
+            ccd=ccd,
+            msa_dir=msa_dir,
+            mol_dir=mol_dir,
+            boltz2=True,
+            use_msa_server=use_msa_server,
+            msa_server_url=msa_server_url,
+            msa_pairing_strategy="paired+unpaired",
+            msa_server_username=None,
+            msa_server_password=None,
+            api_key_header=None,
+            api_key_value=None,
+            max_msa_seqs=8192,
+            processed_msa_dir=processed_msa_dir,
+            processed_constraints_dir=processed_constraints_dir,
+            processed_templates_dir=processed_templates_dir,
+            processed_mols_dir=processed_mols_dir,
+            structure_dir=structure_dir,
+            records_dir=records_dir,
+        )
+
+        # ── Step 2: Load record and inject coordinates ───────────────
+        record_files = list(records_dir.glob("*.json"))
+        if not record_files:
+            raise RuntimeError("process_input produced no records.")
+        record = Record.load(record_files[0])
+
+        processed_struct = StructureV2.load(structure_dir / f"{record.id}.npz")
+
+        # Build the chain_id_map from YAML chain IDs to asym_ids
+        yaml_chain_ids = list(chain_id_map.values())
+        asym_map = build_chain_id_map(processed_struct, yaml_chain_ids)
+
+        # Build full map: PDB chain_id → asym_id
+        full_map: Dict[str, int] = {}
+        for pdb_cid, yaml_cid in chain_id_map.items():
+            if yaml_cid in asym_map:
+                full_map[pdb_cid] = asym_map[yaml_cid]
+
+        injected, unmatched_indices = inject_pdb_coords_into_structure(
+            processed_struct, pdb_atoms, full_map
+        )
+
+        # ── Step 2b: Check if unresolved residues are near pocket ────
+        pocket_report = check_unresolved_near_pocket(
+            injected, unmatched_indices, threshold=10.0
+        )
+        if unmatched_indices:
+            logger.warning(
+                f"{len(unmatched_indices)} atoms had no PDB match and were "
+                f"zeroed out. Atom indices: {unmatched_indices[:20]}"
+                + ("..." if len(unmatched_indices) > 20 else "")
+            )
+
+        # ── Step 3: Save pre_affinity structure ──────────────────────
+        save_pre_affinity_structure(injected, predictions_dir, record.id)
+
+        # ── Step 4: Featurize through affinity pipeline ──────────────
+        tokenizer = Boltz2Tokenizer()
+        cropper = AffinityCropper()
+        featurizer = Boltz2Featurizer()
+        canonicals = load_canonicals(mol_dir)
+
+        input_data = load_input(
+            record=record,
+            target_dir=predictions_dir,
+            msa_dir=processed_msa_dir,
+            constraints_dir=processed_constraints_dir,
+            template_dir=processed_templates_dir,
+            extra_mols_dir=processed_mols_dir,
+            affinity=True,
+        )
+
+        tokenized = tokenizer.tokenize(input_data)
+        tokenized = cropper.crop(tokenized, max_tokens=256, max_atoms=2048)
+
+        molecules = {}
+        molecules.update(canonicals)
+        if input_data.extra_mols:
+            molecules.update(input_data.extra_mols)
+        mol_names = set(tokenized.tokens["res_name"].tolist())
+        mol_names = mol_names - set(molecules.keys())
+        molecules.update(load_molecules(mol_dir, mol_names))
+
+        random = np.random.default_rng(42)
+        features = featurizer.process(
+            tokenized,
+            molecules=molecules,
+            random=random,
+            training=False,
+            max_atoms=None,
+            max_tokens=None,
+            max_seqs=const.max_msa_seqs,
+            pad_to_max_seqs=False,
+            single_sequence_prop=0.0,
+            compute_frames=True,
+            inference_pocket_constraints=None,
+            inference_contact_constraints=None,
+            compute_constraint_features=True,
+            override_method=None,
+            compute_affinity=True,
+        )
+
+        # ── Step 5: Move features to device and run forward ──────────
+        if device is None:
+            device = next(model.parameters()).device
+        else:
+            device = torch.device(device)
+
+        batch = {}
+        for k, v in features.items():
+            if isinstance(v, Tensor):
+                batch[k] = v.unsqueeze(0).to(device)  # add batch dim
+            elif isinstance(v, np.ndarray):
+                batch[k] = torch.from_numpy(v).unsqueeze(0).to(device)
+            elif k == "affinity_mw":
+                # Must be a list so feats["affinity_mw"][0] works
+                # (matches collate() in inferencev2.py which keeps it as list)
+                batch[k] = [v]
+            else:
+                batch[k] = v
+
+        results = affinity_forward(model, batch, recycling_steps=recycling_steps)
+
+        # Attach pocket proximity report for benchmarking
+        results["pocket_proximity_report"] = {
+            "n_unresolved_residues": pocket_report.n_unresolved_residues,
+            "n_near_pocket": pocket_report.n_near_pocket,
+            "threshold_angstrom": pocket_report.threshold_angstrom,
+            "near_pocket_residues": [
+                {
+                    "chain": r.chain_name,
+                    "residue_index": r.residue_index,
+                    "unresolved_atoms": r.n_unresolved_atoms,
+                    "total_atoms": r.n_total_atoms,
+                    "min_dist_to_ligand": r.min_distance_to_ligand,
+                    "nearest_ligand_chain": r.nearest_ligand_chain,
+                }
+                for r in pocket_report.near_pocket_residues
+            ],
+        }
+
+        logger.info(
+            f"Direct affinity inference complete: "
+            f"pred={results.get('affinity_pred_value', 'N/A'):.3f}, "
+            f"prob={results.get('affinity_probability_binary', 'N/A'):.3f}"
+        )
+
+        return results
+
+    finally:
+        if own_work_dir:
+            try:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass

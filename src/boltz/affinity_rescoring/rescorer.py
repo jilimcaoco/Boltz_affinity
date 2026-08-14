@@ -1,6 +1,12 @@
 """
 Main AffinityRescorer class.
 
+*** AFFINITY-ONLY MODE ***
+This module intentionally does NOT run the full Boltz pipeline.
+Diffusion and confidence modules are disabled. All inference goes
+through trunk + affinity head with pre-existing PDB coordinates.
+The subprocess fallback (`boltz predict`) has been removed.
+
 Orchestrates the complete affinity rescoring pipeline:
 input validation → parsing → featurization → inference → export.
 """
@@ -12,7 +18,6 @@ import logging
 import math
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -24,6 +29,7 @@ from boltz.affinity_rescoring.export import ResultsExporter, compute_batch_summa
 from boltz.affinity_rescoring.inference import (
     AffinityModelManager,
     create_affinity_yaml,
+    run_direct_affinity_inference,
 )
 from boltz.affinity_rescoring.models import (
     AffinityResult,
@@ -140,12 +146,22 @@ class AffinityRescorer:
         config: Optional[RescoreConfig] = None,
         cache_dir: Optional[str] = None,
         validation_level: str = "moderate",
+        recycling_steps: Optional[int] = None,
+        fast: bool = False,
+        lora: Optional[str] = None,
+        finetune: Optional[str] = None,
     ):
         self.config = config or RescoreConfig(
             checkpoint=checkpoint,
             device=DeviceOption(device),
             validation_level=ValidationLevel(validation_level),
         )
+        # fast=True → 1 recycling step for maximum throughput.
+        # explicit recycling_steps overrides fast.
+        if fast and recycling_steps is None:
+            self.config.recycling_steps = 1
+        elif recycling_steps is not None:
+            self.config.recycling_steps = recycling_steps
 
         self._cache_dir = Path(
             cache_dir or os.environ.get("BOLTZ_CACHE", "~/.boltz")
@@ -161,6 +177,25 @@ class AffinityRescorer:
         # Model manager - lazy initialization
         self._model_manager: Optional[AffinityModelManager] = None
         self._checkpoint = checkpoint
+
+        # Eagerly loaded model for direct inference (loaded on first use)
+        self._loaded_model = None
+
+        # Optional LoRA adapter to apply post-load (name or directory path).
+        # Resolved via boltz.lora.default_registry() unless an absolute
+        # directory path is given.
+        self._lora = lora or os.environ.get("BOLTZ_RESCORE_LORA")
+
+        # Optional full fine-tune to apply post-load. Mutually exclusive
+        # with ``self._lora`` — checked here so the error surfaces before
+        # any model is loaded.
+        self._finetune = finetune or os.environ.get("BOLTZ_RESCORE_FINETUNE")
+        if self._lora and self._finetune:
+            msg = (
+                "AffinityRescorer received both 'lora' and 'finetune'; "
+                "these are mutually exclusive. Pass only one."
+            )
+            raise ValueError(msg)
 
         # Results cache
         self._last_results: List[AffinityResult] = []
@@ -182,6 +217,8 @@ class AffinityRescorer:
         ligand_smiles: Optional[Dict[str, str]] = None,
         use_msa_server: bool = False,
         reference_sequences: Optional[Dict[str, str]] = None,
+        msa_paths: Optional[Dict[str, str]] = None,
+        msa_directory: Optional[str | Path] = None,
     ) -> AffinityResult:
         """
         Rescore a single PDB/CIF complex.
@@ -210,6 +247,11 @@ class AffinityRescorer:
             both ATOM-derived and SEQRES-derived sequences when
             provided, ensuring the model sees the complete biological
             sequence even if the PDB has missing loops.
+        msa_paths : dict, optional
+            Map of chain_id → path to a pre-computed MSA file (.a3m
+            or .csv).  When provided, the path is injected into the
+            generated YAML so ``process_input`` skips MSA generation
+            and the MSA server is never contacted.
 
         Returns
         -------
@@ -305,6 +347,24 @@ class AffinityRescorer:
 
                 ligand_smiles = resolved_smiles
 
+                # Step 6b: Resolve MSAs from --msa-directory if needed
+                if msa_paths is None and (msa_directory is not None or not use_msa_server):
+                    try:
+                        msa_paths = self._resolve_msa_paths(
+                            sequences=sequences,
+                            protein_chains=chain_assignment.protein_chains,
+                            use_msa_server=use_msa_server,
+                            msa_directory=msa_directory,
+                        )
+                    except Exception as msa_err:
+                        # Surface as a failure so the row reports a clean error
+                        # rather than ColabFold being silently invoked downstream.
+                        result.validation_status = ValidationStatus.FAILED
+                        result.error_message = (
+                            f"MSA resolution failed: {msa_err}"
+                        )
+                        return result
+
                 # Step 7: Create temporary YAML and run prediction
                 with Timer() as inference_timer:
                     affinity_output = self._run_boltz_prediction(
@@ -313,6 +373,8 @@ class AffinityRescorer:
                         ligand_chains=chain_assignment.ligand_chains,
                         ligand_smiles=ligand_smiles,
                         use_msa_server=use_msa_server,
+                        pdb_atoms=atoms,  # pass PDB atoms for direct inference
+                        msa_paths=msa_paths,
                     )
 
                 result.inference_time_ms = inference_timer.elapsed_ms
@@ -375,7 +437,9 @@ class AffinityRescorer:
         output_path: Optional[str | Path] = None,
         output_format: str = "csv",
         ligand_smiles: Optional[Dict[str, str]] = None,
+        compound_smiles: Optional[Dict[str, str]] = None,
         use_msa_server: bool = False,
+        msa_directory: Optional[str | Path] = None,
     ) -> List[AffinityResult]:
         """
         Rescore a batch of PDB/CIF complexes.
@@ -393,7 +457,15 @@ class AffinityRescorer:
         output_format : str
             Output format for aggregated results
         ligand_smiles : dict, optional
-            Ligand SMILES mapping (applied to all complexes)
+            Ligand SMILES mapping applied to ALL complexes (chain→SMILES).
+            Overridden per-compound by ``compound_smiles`` when both are given.
+        compound_smiles : dict, optional
+            Per-compound SMILES lookup keyed by the PDB file **stem** (filename
+            without extension).  When an entry is found for a given file, it is
+            used as the ligand SMILES (mapped to the first ligand chain, 'B'
+            by default) instead of ``ligand_smiles`` or auto-inference.  This
+            eliminates failures caused by RDKit coordinate-based SMILES
+            perception.
         use_msa_server : bool
             Whether to use MSA server
 
@@ -411,12 +483,23 @@ class AffinityRescorer:
 
         for pdb_file in files_iter:
             try:
+                # Resolve per-compound SMILES when available.  The labels CSV
+                # uses the file stem as the compound id and always places the
+                # ligand in chain B (set by prepare_validation_inputs.py via
+                # _next_chain_id, which picks the first unused letter after A).
+                stem = Path(pdb_file).stem
+                per_compound = None
+                if compound_smiles and stem in compound_smiles:
+                    per_compound = {"B": compound_smiles[stem]}
+                effective_smiles = per_compound if per_compound is not None else ligand_smiles
+
                 result = self.rescore_pdb(
                     pdb_file,
                     protein_chain=protein_chain,
                     ligand_chains=ligand_chains,
-                    ligand_smiles=ligand_smiles,
+                    ligand_smiles=effective_smiles,
                     use_msa_server=use_msa_server,
+                    msa_directory=msa_directory,
                 )
                 results.append(result)
             except Exception as e:
@@ -445,7 +528,9 @@ class AffinityRescorer:
         output_format: str = "csv",
         recursive: bool = False,
         ligand_smiles: Optional[Dict[str, str]] = None,
+        compound_smiles: Optional[Dict[str, str]] = None,
         use_msa_server: bool = False,
+        msa_directory: Optional[str | Path] = None,
     ) -> List[AffinityResult]:
         """
         Rescore all PDB/CIF files in a directory.
@@ -461,7 +546,10 @@ class AffinityRescorer:
         recursive : bool
             Scan subdirectories
         ligand_smiles : dict, optional
-            Ligand SMILES mapping
+            Ligand SMILES mapping applied to ALL complexes (chain→SMILES).
+        compound_smiles : dict, optional
+            Per-compound SMILES lookup keyed by file stem.  Overrides
+            ``ligand_smiles`` and auto-inference for matched entries.
         use_msa_server : bool
             Whether to use MSA server
 
@@ -494,7 +582,9 @@ class AffinityRescorer:
             output_path=output_path,
             output_format=output_format,
             ligand_smiles=ligand_smiles,
+            compound_smiles=compound_smiles,
             use_msa_server=use_msa_server,
+            msa_directory=msa_directory,
         )
 
     # ─── Receptor-Based Rescoring ─────────────────────────────────────────
@@ -510,6 +600,7 @@ class AffinityRescorer:
         sort_by: str = "affinity_score",
         reference_sequences: Optional[Dict[str, str]] = None,
         use_msa_server: bool = False,
+        msa_directory: Optional[str | Path] = None,
     ) -> List[LigandScore]:
         """
         Score a fixed receptor against multiple ligands from MOL2 file.
@@ -536,6 +627,15 @@ class AffinityRescorer:
         reference_sequences : dict, optional
             Map of chain_id → full amino acid sequence.
             Overrides ATOM-derived and SEQRES-derived sequences.
+        use_msa_server : bool
+            Whether to use the MSA server for sequence search.
+            Only needed if msa_directory is not provided.
+        msa_directory : str or Path, optional
+            Path to directory containing pre-computed MSA files
+            (.a3m or .csv).  When provided, the MSA server is
+            never contacted — ideal for HPC compute nodes without
+            internet.  The directory is also used to cache the MSA
+            when use_msa_server=True so it is only computed once.
 
         Returns
         -------
@@ -580,6 +680,19 @@ class AffinityRescorer:
             f"{len(protein_atoms)} atoms, {len(protein_seq)} residues"
         )
 
+        # ── Pre-compute / locate MSA (once for the whole batch) ───────
+        msa_paths = self._resolve_msa_paths(
+            sequences={protein_chain_id: protein_seq},
+            protein_chains=[protein_chain_id],
+            use_msa_server=use_msa_server,
+            msa_directory=msa_directory,
+        )
+        if msa_paths:
+            logger.info(
+                f"MSA resolved for {len(msa_paths)} chain(s) — "
+                f"will reuse for all ligands"
+            )
+
         # Parse ligands
         logger.info(f"Parsing ligands from: {ligands}")
         ligand_structures = self._mol2_parser.extract_ligands_with_names(ligands)
@@ -589,23 +702,8 @@ class AffinityRescorer:
             logger.warning("No ligands found in MOL2 file")
             return []
 
-        # Score each ligand
+        # Score each ligand (MSA is reused, never recomputed)
         scores: List[LigandScore] = []
-
-        # Pre-generate MSA once for the receptor protein if using MSA server
-        cached_msa_path = None
-        if use_msa_server:
-            cached_msa_path = self._generate_msa(protein_seq, protein_chain_id)
-            if cached_msa_path is not None:
-                logger.info(
-                    f"MSA pre-generated and cached. Will reuse for all "
-                    f"{len(ligand_structures)} ligands."
-                )
-            else:
-                logger.warning(
-                    "MSA pre-generation failed. Will fall back to "
-                    "--use_msa_server per ligand (slow)."
-                )
 
         try:
             from tqdm import tqdm
@@ -613,21 +711,14 @@ class AffinityRescorer:
         except ImportError:
             lig_iter = ligand_structures
 
-        import time as _time
-        for lig_idx, lig_struct in enumerate(lig_iter):
-            _t0 = _time.time()
+        for lig_struct in lig_iter:
             score = self._score_single_ligand(
                 lig_struct,
                 protein_atoms,
                 protein_seq,
                 protein_chain_id,
+                msa_paths=msa_paths,
                 use_msa_server=use_msa_server,
-                msa_path=cached_msa_path,
-            )
-            _elapsed = _time.time() - _t0
-            logger.debug(
-                f"Ligand {lig_idx+1}/{len(ligand_structures)} "
-                f"({lig_struct.name}): {_elapsed:.1f}s"
             )
             scores.append(score)
 
@@ -664,6 +755,125 @@ class AffinityRescorer:
 
     # ─── Internal Methods ─────────────────────────────────────────────────
 
+    def _resolve_msa_paths(
+        self,
+        sequences: Dict[str, str],
+        protein_chains: List[str],
+        use_msa_server: bool = False,
+        msa_directory: Optional[str | Path] = None,
+    ) -> Optional[Dict[str, str]]:
+        """Locate pre-computed MSA files for the given protein chains.
+
+        This is called **once** before the per-ligand scoring loop so the
+        same MSA is reused for every ligand.
+
+        Lookup uses :func:`boltz.affinity_rescoring.msa_cache.find_msa`
+        which probes (in order):
+
+        1. The canonical sequence-hash filename
+           (``<sha256(seq)[:16]>.a3m``).
+        2. Legacy names: ``<chain_id>.a3m``, ``<chain_id>.csv``.
+        3. For single-chain proteins, any lone ``*.a3m`` / ``*.csv`` in
+           the directory.
+
+        Search directories, in priority order:
+
+        * ``msa_directory`` argument (if provided)
+        * Every entry in ``$BOLTZ_MSA_CACHE_DIR``
+          (``os.pathsep``-separated)
+
+        If ``use_msa_server=True`` is passed, :class:`MSAServerDisabledError`
+        is raised.  Querying the public ColabFold MMseqs2 endpoint is
+        disabled in this fork — see :mod:`boltz.affinity_rescoring.msa_cache`
+        for the precompute workflow.
+
+        Returns
+        -------
+        dict or None
+            chain_id → absolute path to MSA file, or ``None`` if no MSA
+            could be resolved for any chain.
+        """
+        from boltz.affinity_rescoring.msa_cache import (
+            find_msa,
+            raise_msa_server_disabled,
+        )
+
+        if use_msa_server:
+            raise_msa_server_disabled()
+
+        search_dirs = [msa_directory] if msa_directory else None
+        single_chain = len(protein_chains) == 1
+
+        msa_paths: Dict[str, str] = {}
+        for chain_id in protein_chains:
+            sequence = sequences.get(chain_id)
+            if sequence is None:
+                continue
+            hit = find_msa(
+                sequence=sequence,
+                msa_dirs=search_dirs,
+                chain_id=chain_id,
+                allow_single_file_fallback=single_chain,
+            )
+            if hit is not None:
+                msa_paths[chain_id] = str(hit)
+                logger.info(
+                    "MSA for chain %s: using pre-computed %s", chain_id, hit
+                )
+            else:
+                logger.warning(
+                    "No pre-computed MSA found for chain %s (sequence length "
+                    "%d). Searched: %s. Pre-compute with "
+                    "`python -m boltz.affinity_rescoring.mmseqs2` or set "
+                    "BOLTZ_MSA_CACHE_DIR.",
+                    chain_id, len(sequence),
+                    msa_directory or "<BOLTZ_MSA_CACHE_DIR only>",
+                )
+
+        return msa_paths if msa_paths else None
+
+    def _ensure_model_loaded(self):
+        """Lazily load the Boltz2 model for direct inference."""
+        if self._loaded_model is not None:
+            return self._loaded_model
+
+        if self._model_manager is None:
+            self._model_manager = AffinityModelManager(
+                device=self.config.device,
+                cache_dir=str(self._cache_dir),
+            )
+
+        self._loaded_model = self._model_manager.load_model(
+            checkpoint_path=self._checkpoint if self._checkpoint != "auto" else None,
+            affinity_mw_correction=self.config.affinity_mw_correction,
+        )
+
+        if self._lora:
+            # Lazy import keeps boltz.lora optional at runtime.
+            from boltz.lora import load_adapter_into_model
+
+            adapter = load_adapter_into_model(self._loaded_model, self._lora)
+            logger.info(
+                "Applied LoRA adapter '%s' (rank=%d) to affinity model.",
+                adapter.name, adapter.config.rank,
+            )
+
+        if self._finetune:
+            from boltz.finetune import load_finetune_into_model
+
+            record = load_finetune_into_model(
+                self._loaded_model, self._finetune,
+            )
+            logger.info(
+                "Applied affinity fine-tune '%s' (target=%s, %.2fM params) "
+                "to affinity model.",
+                record.name,
+                record.config.target_spec,
+                record.config.num_trainable_params / 1e6,
+            )
+
+        return self._loaded_model
+
     def _run_boltz_prediction(
         self,
         sequences: Dict[str, str],
@@ -671,115 +881,136 @@ class AffinityRescorer:
         ligand_chains: List[str],
         ligand_smiles: Dict[str, str],
         use_msa_server: bool = False,
-        msa_path: Optional[Path] = None,
+        pdb_atoms: Optional[list] = None,
+        msa_paths: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Run Boltz prediction by creating YAML and invoking the predict command.
+        Run Boltz affinity prediction (affinity-only, no diffusion).
+
+        Requires ``pdb_atoms`` — feeds PDB coordinates directly through
+        trunk + affinity head, skipping diffusion and confidence.
 
         Parameters
         ----------
-        msa_path : Path, optional
-            Path to a pre-computed MSA file (.a3m or .csv). When provided,
-            the MSA path is embedded in the YAML and --use_msa_server is
-            not needed.
+        sequences : dict
+            chain_id → amino acid sequence.
+        protein_chains : list
+            Protein chain IDs.
+        ligand_chains : list
+            Ligand chain IDs.
+        ligand_smiles : dict
+            chain_id → SMILES for ligands.
+        use_msa_server : bool
+            Whether to use the MSA server.
+        pdb_atoms : list
+            Parsed PDB atoms for direct coordinate injection.
+            **Required** — will raise RuntimeError if None.
+        msa_paths : dict, optional
+            chain_id → path to pre-computed MSA file (.a3m or .csv).
+            When provided, injected into the YAML so ``process_input``
+            skips MSA generation entirely.
 
-        Returns parsed affinity JSON or None on failure.
+        Returns
+        -------
+        dict or None
+            Parsed affinity output, or None on failure.
+
+        Raises
+        ------
+        RuntimeError
+            If ``pdb_atoms`` is None (full pipeline is disabled).
         """
-        # Create temp directory
-        work_dir = Path(tempfile.mkdtemp(prefix="boltz_rescore_"))
+        if pdb_atoms is None:
+            raise RuntimeError(
+                "AFFINITY-ONLY MODE: pdb_atoms are required for direct "
+                "affinity inference.  The full Boltz pipeline (diffusion + "
+                "confidence) has been intentionally disabled in this module. "
+                "Ensure you are passing a PDB/CIF file with 3D coordinates."
+            )
+
+        return self._run_direct_prediction(
+            sequences=sequences,
+            protein_chains=protein_chains,
+            ligand_chains=ligand_chains,
+            ligand_smiles=ligand_smiles,
+            pdb_atoms=pdb_atoms,
+            use_msa_server=use_msa_server,
+            msa_paths=msa_paths,
+        )
+
+    def _run_direct_prediction(
+        self,
+        sequences: Dict[str, str],
+        protein_chains: List[str],
+        ligand_chains: List[str],
+        ligand_smiles: Dict[str, str],
+        pdb_atoms: list,
+        use_msa_server: bool = False,
+        msa_paths: Optional[Dict[str, str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Run direct in-process affinity prediction using PDB coordinates.
+
+        Bypasses diffusion and confidence — feeds PDB coords directly
+        through trunk + affinity head.
+        """
+        work_dir = Path(tempfile.mkdtemp(prefix="boltz_direct_"))
 
         try:
-            # Create YAML
-            yaml_path = work_dir / "input.yaml"
+            # Build YAML (with pre-computed MSA paths if available)
             yaml_data = self._build_yaml_data(
                 sequences, protein_chains, ligand_chains, ligand_smiles,
-                msa_path=msa_path,
+                msa_paths=msa_paths,
             )
+            yaml_path = work_dir / "input.yaml"
 
             import yaml
             with open(yaml_path, "w") as f:
                 yaml.dump(yaml_data, f, default_flow_style=False)
 
-            # Run Boltz predict
-            cmd = [
-                sys.executable, "-m", "boltz.main", "predict",
-                str(yaml_path),
-                "--out_dir", str(work_dir / "output"),
-                "--cache", str(self._cache_dir),
-                "--recycling_steps", str(self.config.recycling_steps),
-                "--diffusion_samples_affinity", str(self.config.diffusion_samples),
-                "--sampling_steps", str(self.config.sampling_steps),
-                "--sampling_steps_affinity", str(self.config.sampling_steps),
-                "--num_workers", "0",
-            ]
+            # Build chain_id_map: PDB chain_id → YAML chain_id
+            # The YAML uses the same chain IDs as the PDB
+            all_chain_ids = protein_chains + ligand_chains
+            chain_id_map = {cid: cid for cid in all_chain_ids}
 
-            if self._checkpoint != "auto":
-                cmd.extend(["--affinity_checkpoint", self._checkpoint])
+            # Load model
+            model = self._ensure_model_loaded()
 
-            if not self.config.affinity_mw_correction:
-                # The CLI flag is --affinity_mw_correction (toggle)
-                pass  # Default is True
+            # Determine whether process_input needs the MSA server.
+            # If we already injected MSA paths into the YAML, the
+            # schema parser will see msa != 0 and process_input will
+            # NOT call compute_msa, so use_msa_server is irrelevant.
+            needs_msa_server = use_msa_server and not msa_paths
 
-            if self.config.device != DeviceOption.AUTO:
-                cmd.extend(["--accelerator", self.config.device.value])
-
-            if use_msa_server and msa_path is None:
-                cmd.append("--use_msa_server")
-
-            logger.debug(f"Running: {' '.join(cmd)}")
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=7200,  # 2 hour timeout
-                cwd=str(work_dir),
+            # Run direct inference
+            results = run_direct_affinity_inference(
+                model=model,
+                yaml_path=yaml_path,
+                pdb_atoms=pdb_atoms,
+                chain_id_map=chain_id_map,
+                cache_dir=self._cache_dir,
+                work_dir=work_dir,
+                use_msa_server=needs_msa_server,
+                recycling_steps=self.config.recycling_steps,
             )
 
-            if result.returncode != 0:
-                logger.error(f"Boltz predict failed (rc={result.returncode}):")
-                logger.error(result.stderr[-2000:] if result.stderr else "No stderr")
-                logger.error(result.stdout[-2000:] if result.stdout else "No stdout")
-                return None
-
-            # Log subprocess output at debug level even on success
-            if result.stdout:
-                logger.debug(f"Boltz predict stdout: {result.stdout[-2000:]}")
-            if result.stderr:
-                logger.debug(f"Boltz predict stderr: {result.stderr[-2000:]}")
-
-            # Find affinity output — boltz predict nests under boltz_results_<stem>/
-            output_base = work_dir / "output"
-
-            # Log what files exist for debugging
-            if output_base.exists():
-                all_files = list(output_base.rglob("*"))
-                logger.debug(f"Files in output dir ({len(all_files)}): {[str(f.relative_to(output_base)) for f in all_files[:30]]}")
-            else:
-                logger.warning(f"Output directory does not exist: {output_base}")
-                return None
-
-            # Search for affinity JSON anywhere under the output tree
-            for json_file in output_base.rglob("affinity_*.json"):
-                logger.info(f"Found affinity output: {json_file}")
-                with open(json_file) as f:
-                    return json.load(f)
-
-            logger.warning(f"No affinity JSON found in output. Searched: {output_base}")
-            return None
-
-        except subprocess.TimeoutExpired:
-            logger.error("Boltz predict timed out (>2h)")
-            return None
+            return results
         except Exception as e:
-            logger.error(f"Error running Boltz predict: {e}")
+            logger.error(f"Direct affinity prediction failed: {e}")
+            import traceback
+            traceback.print_exc()
             return None
         finally:
-            # Clean up temp directory
             try:
                 shutil.rmtree(work_dir, ignore_errors=True)
             except Exception:
                 pass
+
+    # NOTE: _run_subprocess_prediction has been intentionally removed.
+    # The full Boltz pipeline (diffusion + confidence) is disabled in this
+    # affinity-only rescoring module.  All inference goes through
+    # _run_direct_prediction → affinity_forward (trunk + affinity head).
+    # If you need the full pipeline, use `boltz predict` directly.
 
     def _build_yaml_data(
         self,
@@ -787,20 +1018,37 @@ class AffinityRescorer:
         protein_chains: List[str],
         ligand_chains: List[str],
         ligand_smiles: Dict[str, str],
-        msa_path: Optional[Path] = None,
+        msa_paths: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """Build the YAML data structure for Boltz input."""
+        """Build the YAML data structure for Boltz input.
+
+        Parameters
+        ----------
+        sequences : dict
+            chain_id → amino acid sequence.
+        protein_chains : list
+            Protein chain IDs.
+        ligand_chains : list
+            Ligand chain IDs.
+        ligand_smiles : dict
+            chain_id → SMILES.
+        msa_paths : dict, optional
+            chain_id → path to pre-computed MSA file (.a3m or .csv).
+            When provided, the ``msa`` field is set on each protein
+            entry so ``process_input`` skips MSA generation.
+        """
         yaml_sequences = []
 
         for chain_id in protein_chains:
             if chain_id in sequences:
-                protein_entry = {
+                entry: Dict[str, Any] = {
                     "id": chain_id,
                     "sequence": sequences[chain_id],
                 }
-                if msa_path is not None:
-                    protein_entry["msa"] = str(msa_path)
-                yaml_sequences.append({"protein": protein_entry})
+                # Inject pre-computed MSA path if available
+                if msa_paths and chain_id in msa_paths:
+                    entry["msa"] = str(msa_paths[chain_id])
+                yaml_sequences.append({"protein": entry})
 
         binder_chain = None
         for chain_id in ligand_chains:
@@ -828,113 +1076,30 @@ class AffinityRescorer:
             ],
         }
 
-    def _generate_msa(
-        self,
-        protein_seq: str,
-        protein_chain_id: str,
-    ) -> Optional[Path]:
-        """
-        Generate MSA once for the protein sequence and return the cached path.
-
-        Calls boltz predict with --use_msa_server on a dummy ligand,
-        then extracts the generated MSA .csv file for reuse.
-        """
-        msa_dir = Path(tempfile.mkdtemp(prefix="boltz_msa_cache_"))
-        logger.info("Pre-generating MSA for receptor protein (one-time)...")
-
-        try:
-            # Create a dummy YAML with a trivial ligand
-            yaml_data = {
-                "version": 1,
-                "sequences": [
-                    {"protein": {"id": protein_chain_id, "sequence": protein_seq}},
-                    {"ligand": {"id": "L", "smiles": "C"}},  # methane placeholder
-                ],
-            }
-
-            import yaml
-            yaml_path = msa_dir / "msa_gen.yaml"
-            with open(yaml_path, "w") as f:
-                yaml.dump(yaml_data, f, default_flow_style=False)
-
-            cmd = [
-                sys.executable, "-m", "boltz.main", "predict",
-                str(yaml_path),
-                "--out_dir", str(msa_dir / "output"),
-                "--cache", str(self._cache_dir),
-                "--recycling_steps", "1",
-                "--diffusion_samples_affinity", "1",
-                "--sampling_steps", "1",
-                "--num_workers", "0",
-                "--use_msa_server",
-            ]
-
-            if self.config.device != DeviceOption.AUTO:
-                cmd.extend(["--accelerator", self.config.device.value])
-
-            logger.debug(f"MSA generation cmd: {' '.join(cmd)}")
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=3600,
-                cwd=str(msa_dir),
-            )
-
-            # Note: prediction may fail (e.g. SVD error on dummy ligand) but
-            # that's OK — we only need the MSA file which is generated before
-            # the prediction step. So we search for it regardless of returncode.
-            if result.returncode != 0:
-                logger.debug(
-                    f"MSA generation predict returned rc={result.returncode} "
-                    f"(expected — dummy ligand prediction may crash). "
-                    f"Checking for MSA file anyway..."
-                )
-
-            # Find the generated MSA .csv file in the msa/ subdirectory
-            msa_content_files = list(msa_dir.rglob("msa/*.csv"))
-
-            if not msa_content_files:
-                # Broader search: any .csv starting with "key,sequence" header
-                all_csv = list(msa_dir.rglob("*.csv"))
-                msa_content_files = [
-                    f for f in all_csv
-                    if f.read_text(errors='ignore').startswith("key,sequence")
-                ]
-
-            if msa_content_files:
-                # Copy to a stable location outside temp dirs
-                stable_msa_dir = Path(tempfile.mkdtemp(prefix="boltz_msa_cached_"))
-                cached_path = stable_msa_dir / "receptor_msa.csv"
-                shutil.copy2(msa_content_files[0], cached_path)
-                logger.info(f"MSA cached at: {cached_path}")
-                return cached_path
-            else:
-                logger.warning("MSA generation succeeded but no MSA .csv file found")
-                all_files = list((msa_dir / "output").rglob("*"))
-                logger.debug(f"Files in MSA output: {[str(f) for f in all_files[:30]]}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Failed to pre-generate MSA: {e}")
-            return None
-
     def _score_single_ligand(
         self,
         ligand: "LigandStructure",
         protein_atoms: List["AtomInfo"],
         protein_seq: str,
         protein_chain_id: str,
+        msa_paths: Optional[Dict[str, str]] = None,
         use_msa_server: bool = False,
-        msa_path: Optional[Path] = None,
     ) -> LigandScore:
         """
         Score a single ligand against a receptor.
 
-        Note: This currently creates a placeholder score since
-        direct MOL2→Boltz integration requires SMILES conversion.
-        For full functionality, ligands should provide SMILES strings.
+        Converts MOL2 ligand to SMILES, combines receptor + ligand
+        atoms into a single atom list with consistent chain IDs, then
+        runs the affinity-only pipeline (trunk + affinity head) with
+        PDB/MOL2 coordinate injection.
+
+        Parameters
+        ----------
+        msa_paths : dict, optional
+            Pre-computed MSA paths (chain_id → file path) to inject
+            into the YAML so the MSA server is never contacted.
+        use_msa_server : bool
+            Fallback: contact MSA server if msa_paths is not provided.
         """
         score = LigandScore(
             ligand_name=ligand.name,
@@ -980,15 +1145,55 @@ class AffinityRescorer:
                     )
                     return score
 
-                # Run Boltz prediction
+                # ── Build combined pdb_atoms ──────────────────────────
+                # Boltz assigns atom names as ELEMENT.upper() + (canonical_rank+1)
+                # where ranks come from AllChem.CanonicalRankAtoms on the
+                # H-inclusive mol of the standardised SMILES.  The mol2 file
+                # uses per-element sequential names (C1, C2, N1, …) that
+                # never match.  _remap_ligand_atoms_to_canonical() uses
+                # RDKit GetSubstructMatch to establish the mol2→canonical
+                # atom mapping and returns AtomInfo with canonical names.
                 ligand_chain_id = "L"
+
+                from boltz.affinity_rescoring.models import AtomInfo as _AI
+
+                ligand_atoms_remapped = self._remap_ligand_atoms_to_canonical(
+                    ligand, smiles, ligand_chain_id
+                )
+                if ligand_atoms_remapped is None:
+                    # Fallback: pass mol2 atom names — injection will likely
+                    # fail to match but the pipeline will not crash.
+                    logger.warning(
+                        f"Using original mol2 atom names for {ligand.name}; "
+                        f"ligand 3-D coordinates may not be injected."
+                    )
+                    ligand_atoms_remapped = [
+                        _AI(
+                            index=a.index,
+                            name=a.name,
+                            element=a.element,
+                            x=a.x, y=a.y, z=a.z,
+                            chain_id=ligand_chain_id,
+                            residue_name=a.residue_name,
+                            residue_number=a.residue_number,
+                            occupancy=a.occupancy,
+                            b_factor=a.b_factor,
+                            is_hetatm=True,
+                        )
+                        for a in ligand.atoms
+                    ]
+
+                combined_atoms = list(protein_atoms) + ligand_atoms_remapped
+
+                # Run Boltz prediction with coordinate injection
                 affinity_output = self._run_boltz_prediction(
                     sequences={protein_chain_id: protein_seq},
                     protein_chains=[protein_chain_id],
                     ligand_chains=[ligand_chain_id],
                     ligand_smiles={ligand_chain_id: smiles},
+                    pdb_atoms=combined_atoms,
+                    msa_paths=msa_paths,
                     use_msa_server=use_msa_server,
-                    msa_path=msa_path,
                 )
 
                 if affinity_output is not None:
@@ -1004,6 +1209,16 @@ class AffinityRescorer:
                         v2 = affinity_output.get("affinity_pred_value2", v1)
                         score.affinity_uncertainty = abs(v1 - v2) / 2.0
 
+                    # Attach pocket proximity report for benchmarking
+                    report = affinity_output.get("pocket_proximity_report")
+                    if report:
+                        score.n_unresolved_near_pocket = report.get(
+                            "n_near_pocket", 0
+                        )
+                        score.pocket_proximity_details = report.get(
+                            "near_pocket_residues"
+                        )
+
                     if score.validation_status != ValidationStatus.WARNING:
                         score.validation_status = ValidationStatus.SUCCESS
                 else:
@@ -1016,6 +1231,146 @@ class AffinityRescorer:
 
         score.processing_ms = t.elapsed_ms
         return score
+
+    def _remap_ligand_atoms_to_canonical(
+        self,
+        ligand: "LigandStructure",
+        smiles: str,
+        ligand_chain_id: str,
+    ) -> Optional[List]:
+        """Remap mol2 atom coordinates to Boltz's canonical atom naming.
+
+        Boltz's ``schema.py`` assigns atom names as
+        ``element_symbol.upper() + (canonical_rank + 1)`` where
+        ``canonical_rank`` comes from ``AllChem.CanonicalRankAtoms`` on the
+        H-inclusive mol of the *standardised* SMILES.  The mol2 file uses
+        per-element sequential names (``C1``, ``C2``, …, ``N1``, ``Cl1``,
+        …) that never match the processed-structure names (``C23``, ``CL18``,
+        etc.).
+
+        This method uses ``GetSubstructMatch`` to find the correspondence,
+        then returns an ``AtomInfo`` list with canonical names and mol2
+        coordinates.  Protein atoms are not touched.
+
+        Returns ``None`` if the mapping cannot be established; callers should
+        fall back to passing the original mol2 names with a warning.
+        """
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+
+            from boltz.affinity_rescoring.models import AtomInfo as _AI
+            from boltz.data.parse.schema import standardize
+
+            # ── 1. Standardise SMILES (same as schema.py affinity path) ──
+            std_smiles = standardize(smiles) if smiles else None
+            if not std_smiles:
+                return None
+
+            # ── 2. Build SMILES mol with Boltz canonical names ────────────
+            # Mirrors schema.py lines that assign atom names before the
+            # 3-D conformer is computed.
+            smiles_mol_h = Chem.AddHs(Chem.MolFromSmiles(std_smiles))
+            canonical_order = AllChem.CanonicalRankAtoms(smiles_mol_h)
+            Chem.AssignStereochemistry(smiles_mol_h, force=True, cleanIt=True)
+            for atom, can_idx in zip(smiles_mol_h.GetAtoms(), canonical_order):
+                atom.SetProp(
+                    "name", atom.GetSymbol().upper() + str(can_idx + 1)
+                )
+            smiles_mol_noh = Chem.RemoveHs(smiles_mol_h, sanitize=False)
+
+            # ── 3. Build mol2 ligand as an RDKit mol (heavy atoms only) ──
+            mol2_rdmol = Chem.RWMol()
+            mol2_atom_map: Dict[int, int] = {}  # atom.index → rdkit atom idx
+            for a in ligand.atoms:
+                ridx = mol2_rdmol.AddAtom(Chem.Atom(a.element))
+                mol2_atom_map[a.index] = ridx
+            _bt = {
+                1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE,
+                3: Chem.BondType.TRIPLE, 4: Chem.BondType.AROMATIC,
+                5: Chem.BondType.SINGLE,
+            }
+            for a1, a2, btype in ligand.bonds:
+                if a1 in mol2_atom_map and a2 in mol2_atom_map:
+                    try:
+                        mol2_rdmol.AddBond(
+                            mol2_atom_map[a1], mol2_atom_map[a2],
+                            _bt.get(btype, Chem.BondType.SINGLE),
+                        )
+                    except Exception:
+                        pass
+            try:
+                Chem.SanitizeMol(mol2_rdmol)
+            except Exception:
+                pass
+
+            # ── 4. Substructure match ──────────────────────────────────────
+            # mol2_rdmol.GetSubstructMatch(query) → for each query atom i
+            # returns the mol2 atom index that matches it.
+            match = mol2_rdmol.GetSubstructMatch(smiles_mol_noh)
+            if not match or len(match) != smiles_mol_noh.GetNumAtoms():
+                # Retry without chirality (handles stereochemistry differences)
+                match = mol2_rdmol.GetSubstructMatch(
+                    smiles_mol_noh, useChirality=False
+                )
+
+            if not match or len(match) != smiles_mol_noh.GetNumAtoms():
+                logger.warning(
+                    f"Could not establish mol2 → canonical atom mapping for "
+                    f"{ligand.name} ({len(ligand.atoms)} heavy atoms). "
+                    f"Ligand coordinates will not be injected into the "
+                    f"processed structure."
+                )
+                return None
+
+            # ── 5. Build remapped AtomInfo with canonical names ────────────
+            rdkit_idx_to_info = {
+                mol2_atom_map[a.index]: a for a in ligand.atoms
+            }
+            # All ligand atoms belong to one residue; use the first atom's
+            # residue_number so coord_lookup keying is consistent.
+            residue_number = ligand.atoms[0].residue_number if ligand.atoms else 1
+
+            remapped: List = []
+            for smiles_idx in range(smiles_mol_noh.GetNumAtoms()):
+                mol2_rdkit_idx = match[smiles_idx]
+                src = rdkit_idx_to_info.get(mol2_rdkit_idx)
+                can_name = smiles_mol_noh.GetAtomWithIdx(smiles_idx).GetProp(
+                    "name"
+                )
+                if src is None:
+                    logger.warning(
+                        f"Incomplete atom mapping for {ligand.name} at "
+                        f"SMILES idx {smiles_idx}"
+                    )
+                    return None
+                remapped.append(
+                    _AI(
+                        index=src.index,
+                        name=can_name,   # canonical name matches processed struct
+                        element=src.element,
+                        x=src.x, y=src.y, z=src.z,
+                        chain_id=ligand_chain_id,
+                        residue_name=src.residue_name,
+                        residue_number=residue_number,
+                        occupancy=src.occupancy,
+                        b_factor=src.b_factor,
+                        is_hetatm=True,
+                    )
+                )
+
+            logger.debug(
+                f"Canonical remapping succeeded for {ligand.name}: "
+                f"{len(remapped)} atoms mapped."
+            )
+            return remapped
+
+        except Exception as e:
+            logger.debug(
+                f"_remap_ligand_atoms_to_canonical failed for "
+                f"{ligand.name}: {e}"
+            )
+            return None
 
     def _mol2_to_smiles(self, ligand: "LigandStructure") -> Optional[str]:
         """

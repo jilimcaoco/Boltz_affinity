@@ -1,6 +1,10 @@
 """
 Core data models for the affinity rescoring system.
 
+*** AFFINITY-ONLY MODE ***
+No diffusion_samples or sampling_steps parameters exist in this module.
+If you need those, use the main Boltz pipeline (`boltz predict`) instead.
+
 Defines Pydantic models for validation, dataclasses for results,
 and typed structures used across all layers.
 """
@@ -245,6 +249,10 @@ class LigandScore:
     # Timing
     processing_ms: float = 0.0
 
+    # Pocket proximity check (for benchmarking unresolved loop effects)
+    n_unresolved_near_pocket: int = 0
+    pocket_proximity_details: Optional[List[Dict[str, Any]]] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "ligand_name": self.ligand_name,
@@ -258,6 +266,7 @@ class LigandScore:
             "rotatable_bonds": self.rotatable_bonds,
             "processing_ms": round(self.processing_ms, 2),
             "error_message": self.error_message,
+            "n_unresolved_near_pocket": self.n_unresolved_near_pocket,
         }
 
 
@@ -279,6 +288,71 @@ class BatchSummary:
     throughput_complexes_per_second: float = 0.0
 
 
+# ─── Multi-Pocket Result ─────────────────────────────────────────────────────
+
+
+@dataclass
+class PocketResult:
+    """Score and metadata for one of N predicted ligand binding pockets."""
+
+    pocket_id: int  # 0-indexed pocket rank
+    chain_id: str  # ligand chain ID assigned in the multi-copy YAML
+    structure_path: str  # extracted pocket PDB (protein + this ligand copy)
+
+    # Affinity rescoring
+    affinity_pred: float = float("nan")
+    affinity_std: float = float("nan")
+    affinity_probability_binary: float = float("nan")
+
+    # Boltz-2 confidence (from full prediction confidence JSON)
+    boltz_confidence_score: float = float("nan")
+    interface_iptm: float = float("nan")  # pair_chains_iptm[protein][ligand]
+    plddt_mean: float = float("nan")
+
+    # Structure metadata
+    n_ligand_atoms: int = 0
+    confidence_json_path: str = ""
+
+    # Status
+    validation_status: ValidationStatus = ValidationStatus.SUCCESS
+    error_message: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "pocket_id": self.pocket_id,
+            "chain_id": self.chain_id,
+            "structure_path": self.structure_path,
+            "affinity_pred": self.affinity_pred,
+            "affinity_std": self.affinity_std,
+            "affinity_probability_binary": self.affinity_probability_binary,
+            "boltz_confidence_score": self.boltz_confidence_score,
+            "interface_iptm": self.interface_iptm,
+            "plddt_mean": self.plddt_mean,
+            "n_ligand_atoms": self.n_ligand_atoms,
+            "confidence_json_path": self.confidence_json_path,
+            "validation_status": self.validation_status.value,
+            "error_message": self.error_message,
+        }
+
+
+@dataclass
+class MultiPocketReport:
+    """Aggregated report from a multi-pocket prediction + rescoring run."""
+
+    receptor: str
+    ligand_smiles: str
+    n_pockets_requested: int
+    n_pockets_extracted: int
+    protein_chain: str
+    timestamp: str
+    pockets: List[PocketResult] = field(default_factory=list)
+    csv_path: str = ""
+    html_path: str = ""
+    structures_dir: str = ""
+    boltz_prediction_dir: str = ""
+    total_time_s: float = 0.0
+
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 
@@ -289,10 +363,8 @@ class RescoreConfig(BaseModel):
     checkpoint: str = "auto"
     device: DeviceOption = DeviceOption.AUTO
 
-    # Inference
-    recycling_steps: int = 1
-    diffusion_samples: int = 1
-    sampling_steps: int = 50
+    # Inference (affinity-only — no diffusion / confidence)
+    recycling_steps: int = 3
     affinity_mw_correction: bool = True
 
     # Validation
@@ -318,12 +390,12 @@ class RescoreConfig(BaseModel):
             raise ValueError(f"recycling_steps must be 1-20, got {v}")
         return v
 
-    @field_validator("diffusion_samples")
-    @classmethod
-    def validate_diffusion_samples(cls, v: int) -> int:
-        if v < 1 or v > 100:
-            raise ValueError(f"diffusion_samples must be 1-100, got {v}")
-        return v
+    # Convenience: 1 recycling step for ultra-fast screening throughput.
+    # Accuracy trade-off: ~5-10% degradation vs. the 3-step default.
+    ULTRA_FAST_RECYCLING_STEPS: int = 1
+
+    # diffusion_samples and sampling_steps validators removed:
+    # those fields no longer exist — this module is affinity-only.
 
 
 # ─── Utility Functions ───────────────────────────────────────────────────────

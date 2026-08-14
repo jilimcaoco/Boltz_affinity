@@ -1,0 +1,20 @@
+{
+  "5ht2a_full_v1": {
+    "created_at": 1781018225.9981885,
+    "num_tensors": 480,
+    "num_trainable_params": 8034824,
+    "parent": null,
+    "path": "/nfs/turbo/umms-maom/limcaoco/Boltz_affinity/fineturning_experiment/finetunes/5ht2a_full_v1",
+    "target_spec": "heads_pairformer",
+    "updated_at": 1781020342.2089136
+  },
+  "drd4_full_v1": {
+    "created_at": 1781021942.215098,
+    "num_tensors": 480,
+    "num_trainable_params": 8034824,
+    "parent": null,
+    "path": "/nfs/turbo/umms-maom/limcaoco/Boltz_affinity/fineturning_experiment/finetunes/drd4_full_v1",
+    "target_spec": "heads_pairformer",
+    "updated_at": 1781132608.1415565
+  }
+}

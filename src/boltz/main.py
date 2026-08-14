@@ -821,6 +821,20 @@ try:
 except ImportError:
     pass  # affinity_rescoring module not installed
 
+# Register the LoRA CLI subcommand
+try:
+    from boltz.lora.cli import lora_cli
+    cli.add_command(lora_cli)
+except ImportError:
+    pass  # boltz.lora module not present
+
+# Register the full-finetune CLI subcommand
+try:
+    from boltz.finetune.cli import finetune_cli
+    cli.add_command(finetune_cli)
+except ImportError:
+    pass  # boltz.finetune module not present
+
 
 @cli.command()
 @click.argument("data", type=click.Path(exists=True))
@@ -932,7 +946,14 @@ except ImportError:
 @click.option(
     "--use_msa_server",
     is_flag=True,
-    help="Whether to use the MMSeqs2 server for MSA generation. Default is False.",
+    help=(
+        "[DISABLED in this fork] The ColabFold MSA server is off-limits "
+        "for routine inference. Pre-compute MSAs with "
+        "`python -m boltz.affinity_rescoring.mmseqs2` (or "
+        "fineturning_experiment/precompute_msas.py) and embed the "
+        "resulting .a3m paths under each protein chain's 'msa:' key in "
+        "the input YAML (or expose them via $BOLTZ_MSA_CACHE_DIR)."
+    ),
 )
 @click.option(
     "--msa_server_url",
@@ -1047,6 +1068,21 @@ except ImportError:
     is_flag=True,
     help=" to dump the s and z embeddings into a npz file. Default is False.",
 )
+@click.option(
+    "--use_lora",
+    type=str,
+    default=None,
+    help="LoRA adapter name (registered in $BOLTZ_LORA_DIR) or path to an "
+         "adapter directory; applied to the affinity model post-load.",
+)
+@click.option(
+    "--use_finetune",
+    type=str,
+    default=None,
+    help="Full fine-tune name (registered in $BOLTZ_FINETUNE_DIR) or path "
+         "to a fine-tune directory; applied to the affinity model "
+         "post-load. Mutually exclusive with --use_lora.",
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1085,8 +1121,16 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
     write_embeddings: bool = False,
+    use_lora: Optional[str] = None,
+    use_finetune: Optional[str] = None,
 ) -> None:
     """Run predictions with Boltz."""
+    if use_lora and use_finetune:
+        msg = (
+            "--use_lora and --use_finetune are mutually exclusive; "
+            "pick one. (Adapter composition is not supported.)"
+        )
+        raise click.UsageError(msg)
     # If cpu, write a friendly warning
     if accelerator == "cpu":
         msg = "Running on CPU, this will be slow. Consider using a GPU."
@@ -1121,20 +1165,13 @@ def predict(  # noqa: C901, PLR0915, PLR0912
 
     # Get MSA server credentials from environment variables if not provided
     if use_msa_server:
-        if msa_server_username is None:
-            msa_server_username = os.environ.get("BOLTZ_MSA_USERNAME")
-        if msa_server_password is None:
-            msa_server_password = os.environ.get("BOLTZ_MSA_PASSWORD")
-        if api_key_value is None:
-            api_key_value = os.environ.get("MSA_API_KEY_VALUE")
-        
-        click.echo(f"MSA server enabled: {msa_server_url}")
-        if api_key_value:
-            click.echo("MSA server authentication: using API key header")
-        elif msa_server_username and msa_server_password:
-            click.echo("MSA server authentication: using basic auth")
-        else:
-            click.echo("MSA server authentication: no credentials provided")
+        # The ColabFold public MSA server is disabled in this fork.
+        # See src/boltz/affinity_rescoring/msa_cache.py for the policy.
+        from boltz.affinity_rescoring.msa_cache import raise_msa_server_disabled
+        try:
+            raise_msa_server_disabled()
+        except Exception as exc:  # noqa: BLE001
+            raise click.UsageError(str(exc)) from exc
 
     # Create output directories
     data = Path(data).expanduser()
@@ -1333,6 +1370,13 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         )
         model_module.eval()
 
+        if use_lora:
+            from boltz.lora import load_adapter_into_model
+            load_adapter_into_model(model_module, use_lora)
+        if use_finetune:
+            from boltz.finetune import load_finetune_into_model
+            load_finetune_into_model(model_module, use_finetune)
+
         # Compute structure predictions
         trainer.predict(
             model_module,
@@ -1409,6 +1453,13 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             affinity_mw_correction=affinity_mw_correction,
         )
         model_module.eval()
+
+        if use_lora:
+            from boltz.lora import load_adapter_into_model
+            load_adapter_into_model(model_module, use_lora)
+        if use_finetune:
+            from boltz.finetune import load_finetune_into_model
+            load_finetune_into_model(model_module, use_finetune)
 
         trainer.callbacks[0] = pred_writer
         trainer.predict(

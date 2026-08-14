@@ -512,3 +512,128 @@ def _safe_float(v: float) -> Any:
     if math.isnan(v) or math.isinf(v):
         return None
     return round(v, 4)
+
+
+# ─── Multi-Pocket HTML Report ────────────────────────────────────────────────
+
+
+def generate_multipocket_html(
+    html_path: "Path",
+    receptor: str,
+    ligand_smiles: str,
+    protein_chain: str,
+    n_requested: int,
+    pockets: list,
+    sort_by: str = "affinity_pred",
+) -> "Path":
+    """Render a self-contained HTML report for multi-pocket pipeline output.
+
+    Parameters
+    ----------
+    html_path : Path
+        Output HTML file path.
+    receptor : str
+        Path to source receptor.
+    ligand_smiles : str
+        Ligand SMILES used for prediction.
+    protein_chain : str
+        Identified protein chain ID.
+    n_requested : int
+        Number of pockets requested.
+    pockets : list[PocketResult]
+        Pockets, pre-sorted in display order.
+    sort_by : str
+        Column the pockets are sorted by (for caption).
+    """
+    from pathlib import Path as _P
+
+    rows_html = []
+    for rank, p in enumerate(pockets, start=1):
+        d = p.to_dict()
+        struct_link = _P(d["structure_path"]).name
+        rows_html.append(
+            "<tr>"
+            f"<td>{rank}</td>"
+            f"<td>{d['pocket_id']}</td>"
+            f"<td>{d['chain_id']}</td>"
+            f"<td>{_fmt(d['affinity_pred'])}</td>"
+            f"<td>{_fmt(d['affinity_std'])}</td>"
+            f"<td>{_fmt(d['affinity_probability_binary'])}</td>"
+            f"<td>{_fmt(d['interface_iptm'])}</td>"
+            f"<td>{_fmt(d['boltz_confidence_score'])}</td>"
+            f"<td>{d['n_ligand_atoms']}</td>"
+            f"<td>{d['validation_status']}</td>"
+            f'<td><a href="structures/{struct_link}">{struct_link}</a></td>'
+            "</tr>"
+        )
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    n_extracted = len(pockets)
+    successful = sum(1 for p in pockets if p.validation_status.value == "SUCCESS")
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Boltz Multi-Pocket Report</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         margin: 2rem; color: #222; }}
+  h1 {{ margin-bottom: 0.25rem; }}
+  .meta {{ color: #666; font-size: 0.9rem; margin-bottom: 1.5rem; }}
+  .summary {{ background: #f6f8fa; padding: 1rem 1.25rem;
+              border-left: 4px solid #0366d6; margin-bottom: 1.5rem; }}
+  .summary code {{ background: #eef; padding: 1px 4px; border-radius: 3px; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 0.9rem; }}
+  th, td {{ border: 1px solid #ddd; padding: 6px 10px; text-align: left; }}
+  th {{ background: #f0f3f6; }}
+  tr:nth-child(even) {{ background: #fafbfc; }}
+  caption {{ caption-side: top; text-align: left; font-style: italic;
+             margin-bottom: 0.5rem; color: #555; }}
+  .nan {{ color: #aaa; }}
+</style>
+</head>
+<body>
+<h1>Boltz Multi-Pocket Report</h1>
+<div class="meta">Generated {timestamp}</div>
+
+<div class="summary">
+  <div><b>Receptor:</b> <code>{receptor}</code></div>
+  <div><b>Protein chain:</b> {protein_chain}</div>
+  <div><b>Ligand SMILES:</b> <code>{ligand_smiles}</code></div>
+  <div><b>Pockets requested / extracted / successful:</b>
+       {n_requested} / {n_extracted} / {successful}</div>
+</div>
+
+<table>
+  <caption>Pockets ranked by <code>{sort_by}</code> (best first).</caption>
+  <thead>
+    <tr>
+      <th>Rank</th><th>Pocket ID</th><th>Chain</th>
+      <th>affinity_pred</th><th>std</th><th>P(bind)</th>
+      <th>interface iPTM</th><th>Boltz conf</th>
+      <th>#lig atoms</th><th>Status</th><th>Structure</th>
+    </tr>
+  </thead>
+  <tbody>
+    {''.join(rows_html)}
+  </tbody>
+</table>
+</body>
+</html>
+"""
+    html_path.write_text(html)
+    logger.info(f"Wrote multi-pocket HTML report to {html_path}")
+    return html_path
+
+
+def _fmt(v: Any) -> str:
+    """Format numeric values for HTML; render NaN as a dimmed dash."""
+    try:
+        if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+            return '<span class="nan">—</span>'
+        if isinstance(v, float):
+            return f"{v:.3f}"
+        return str(v)
+    except Exception:  # noqa: BLE001
+        return str(v)
