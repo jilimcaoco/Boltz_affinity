@@ -192,3 +192,25 @@ fineturning_experiment/analysis/plots/
 fineturning_experiment/analysis/poses/
 fineturning_experiment/analysis/poses_inputs/
 fineturning_experiment/analysis/scores/
+
+# Generated data files (receptor PDBs, ligand mol2s, score CSVs)
+*.pdb
+*.mol2
+*.csv
+
+# Generated plots
+*.png
+
+# SLURM logs
+slurm_scripts/*.log
+slurm_scripts/*.out
+slurm_scripts/*.err
+
+# NOTE: main also carried `slurm_scripts/*.slurm` here. That rule is
+# deliberately NOT merged: the .slurm job scripts in slurm_scripts/ are
+# tracked reproducibility artifacts, not generated logs, and the rule would
+# silently stop any new one from being added. The three log patterns above
+# are what that block was actually after.
+
+# Cached/copied path artifacts
+home/

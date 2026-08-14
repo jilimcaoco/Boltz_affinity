@@ -165,7 +165,7 @@ class AffinityRescorer:
 
         self._cache_dir = Path(
             cache_dir or os.environ.get("BOLTZ_CACHE", "~/.boltz")
-        ).expanduser()
+        ).expanduser().resolve()
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._validator = StructureValidator(level=self.config.validation_level)
@@ -995,7 +995,6 @@ class AffinityRescorer:
             )
 
             return results
-
         except Exception as e:
             logger.error(f"Direct affinity prediction failed: {e}")
             import traceback
