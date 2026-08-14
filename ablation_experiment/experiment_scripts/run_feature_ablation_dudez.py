@@ -283,6 +283,27 @@ def run_for_receptor(args: argparse.Namespace) -> int:
     from boltz.main import process_input
 
     receptor_id = args.receptor
+
+    # This runner only implements the ``zero`` operator: it drives the
+    # affinity head straight off ``exp.zero_*``/``distogram_mask_mode``.
+    # A resample/mean experiment leaves every one of those flags unset, so
+    # running one here would silently produce an *unablated baseline* number
+    # filed under the resample name -- corrupting any downstream Shapley/NAE
+    # that consumed it. Those operators need the donor trunk cache and the
+    # two-pass flow in run_feature_ablation.py. Checked before the model
+    # load so this fails in seconds, not after a checkpoint load.
+    non_zero_ops = [n for n in args.experiments if EXPERIMENTS[n].operator != "zero"]
+    if non_zero_ops:
+        logger.error(
+            f"[{receptor_id}] This DUDEZ runner supports only the 'zero' ablation "
+            f"operator, but {len(non_zero_ops)} requested experiment(s) use "
+            f"resample/mean: {non_zero_ops[:5]}"
+            f"{' ...' if len(non_zero_ops) > 5 else ''}. "
+            f"Run those through run_feature_ablation.py, which owns the donor "
+            f"trunk cache the resample/mean operators need."
+        )
+        return 2
+
     structures_dir, smiles_csv, msa_path, output_path = resolve_inputs(args)
     logger.info(f"[{receptor_id}] structures: {structures_dir}")
     logger.info(f"[{receptor_id}] smiles    : {smiles_csv}")

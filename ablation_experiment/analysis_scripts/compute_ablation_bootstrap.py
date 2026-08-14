@@ -9,6 +9,8 @@ Score column: affinity_pred_value (lower = better binding)
 Convention: ZINC-prefixed compound IDs = decoys; everything else = ligands.
 """
 
+import argparse
+import sys
 import warnings
 from pathlib import Path
 
@@ -19,6 +21,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from logauc_utils import (  # noqa: E402
+    DEFAULT_BOOTSTRAPS,
+    MIN_BOOTSTRAPS,
+    bca_interval,
+    bootstrap_logauc,
+    cluster_bootstrap_avg_logauc,
+    cluster_bootstrap_paired_difference,
+    jackknife_leave_one_out_means,
+    point_estimate_logauc,
+    tie_stats,
+)
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ── paths ────────────────────────────────────────────────────────────────────
@@ -26,86 +41,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent           # experiment_files/
 ABLATION_CSV = BASE_DIR / "results" / "ablation" / "feature_ablation_results.csv"
 OUT_DIR = BASE_DIR / "analysis_data" / "ablation_bootstrap_results"
 
-N_BOOTSTRAPS = 100
 SEED = 42
+BASELINE_EXPERIMENT = "baseline"
 
-# ── logAUC calculation (same as compute_logauc_bootstrap.py) ─────────────────
-
-def do_roc(scores, lig_set, decoy_set, nbins=10000):
-    num_data = len(scores)
-    binsize = max(int(num_data / nbins), 1)
-    num_lig = len(lig_set)
-    num_dec = len(decoy_set)
-    if num_lig == 0 or num_dec == 0:
-        return None
-    found_ligand = 0
-    results = []
-    for i in range(num_data):
-        if i % binsize == 0:
-            results.append([i - found_ligand, found_ligand])
-        if scores[i][0] in lig_set:
-            found_ligand += 1
-    results.append([num_data - found_ligand, found_ligand])
-    results.append([num_dec, num_lig])
-    points = []
-    for x in results:
-        fpr = x[0] * 100.0 / num_dec
-        tpr = x[1] * 100.0 / num_lig
-        points.append([fpr, tpr])
-    return points
-
-
-def interpolate_curve(points):
-    i = 0
-    while i < len(points) and points[i][0] < 0.1:
-        i += 1
-    if i == 0:
-        return points
-    slope = (points[i][1] - points[i - 1][1]) / (points[i][0] - points[i - 1][0] + 1e-12)
-    intercept = points[i][1] - slope * points[i][0]
-    point_one = [0.100001, slope * 0.100001 + intercept]
-    npoints = list(points)
-    npoints.insert(i, point_one)
-    return npoints
-
-
-def logAUC(points):
-    LOGAUC_MAX = 1.0
-    LOGAUC_MIN = 0.001
-    RANDOM_LOGAUC = (LOGAUC_MAX - LOGAUC_MIN) / np.log(10) / np.log10(LOGAUC_MAX / LOGAUC_MIN)
-    npoints = []
-    for x in points:
-        if (x[0] >= LOGAUC_MIN * 100) and (x[0] <= LOGAUC_MAX * 100):
-            npoints.append([x[0] / 100, x[1] / 100])
-    area = 0.0
-    for point2, point1 in zip(npoints[1:], npoints[:-1]):
-        if point2[0] - point1[0] < 0.000001:
-            continue
-        dx = point2[0] - point1[0]
-        dy = point2[1] - point1[1]
-        intercept = point2[1] - (dy) / (dx) * point2[0]
-        area += dy / np.log(10) + intercept * (np.log10(point2[0]) - np.log10(point1[0]))
-    return area / np.log10(LOGAUC_MAX / LOGAUC_MIN) - RANDOM_LOGAUC
-
-
-def compute_logauc(ranked_list, lig_set, decoy_set):
-    points = do_roc(ranked_list, lig_set, decoy_set)
-    if points is None:
-        return np.nan
-    points = interpolate_curve(points)
-    return logAUC(points) * 100
-
-
-def bootstrap_logauc(lig_scores, decoy_scores, lig_set, decoy_set, n_boot, rng):
-    results = []
-    for _ in range(n_boot):
-        boot_lig_idx = rng.integers(0, len(lig_scores), size=len(lig_scores))
-        boot_dec_idx = rng.integers(0, len(decoy_scores), size=len(decoy_scores))
-        boot_scores = [lig_scores[i] for i in boot_lig_idx] + [decoy_scores[i] for i in boot_dec_idx]
-        boot_scores.sort(key=lambda x: x[1])
-        val = compute_logauc(boot_scores, lig_set, decoy_set)
-        results.append(val)
-    return results
+# logAUC / ROC / bootstrap core now lives in logauc_utils.py (shared with
+# compute_logauc_bootstrap.py) so the tie-handling fix only has one place to
+# live. See that module's docstring for the bug this replaced.
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -118,21 +59,6 @@ def clean_ligand_name(raw):
     """Strip trailing whitespace + 'none' suffix from ligand_name."""
     import re
     return re.sub(r"\s+none$", "", str(raw)).strip()
-
-
-def compute_avg_logauc_bootstrap(per_receptor_boots, n_boot, rng):
-    receptors = list(per_receptor_boots.keys())
-    if not receptors:
-        return []
-    avg_boots = []
-    for _ in range(n_boot):
-        sampled = []
-        for rec in receptors:
-            vals = per_receptor_boots[rec]
-            idx = rng.integers(0, len(vals))
-            sampled.append(vals[idx])
-        avg_boots.append(np.nanmean(sampled))
-    return avg_boots
 
 
 # ── ridgeline plot ───────────────────────────────────────────────────────────
@@ -193,12 +119,64 @@ def ridgeline_plot(experiment_avg_bootstraps, out_path):
     plt.close(fig)
 
 
+def _paired_receptor_scores(df, exp_a, exp_b, receptors):
+    """Build per-receptor (lig_scores, dec_scores, lig_set, dec_set) for two
+    experiments, restricted to compounds present in *both* on that receptor
+    and in a shared, deterministic order -- required for
+    cluster_bootstrap_paired_difference's index-level pairing to line up
+    the same compound between arms."""
+    out_a, out_b = {}, {}
+    df_a_all = df[df["experiment"] == exp_a]
+    df_b_all = df[df["experiment"] == exp_b]
+
+    for receptor in receptors:
+        best_a = (df_a_all[df_a_all["receptor_id"] == receptor]
+                  .groupby("ligand_id")["affinity_pred_value"].min())
+        best_b = (df_b_all[df_b_all["receptor_id"] == receptor]
+                  .groupby("ligand_id")["affinity_pred_value"].min())
+        common = sorted(set(best_a.index) & set(best_b.index))
+        if not common:
+            continue
+        lig_ids = [n for n in common if not is_decoy(n)]
+        dec_ids = [n for n in common if is_decoy(n)]
+        if not lig_ids or not dec_ids:
+            continue
+
+        out_a[receptor] = (
+            [(n, float(best_a[n])) for n in lig_ids],
+            [(n, float(best_a[n])) for n in dec_ids],
+            set(lig_ids), set(dec_ids),
+        )
+        out_b[receptor] = (
+            [(n, float(best_b[n])) for n in lig_ids],
+            [(n, float(best_b[n])) for n in dec_ids],
+            set(lig_ids), set(dec_ids),
+        )
+    return out_a, out_b
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
-def main():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(SEED)
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--n-bootstraps", type=int, default=DEFAULT_BOOTSTRAPS,
+                         help=f"Bootstrap replicates (min {MIN_BOOTSTRAPS}).")
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--baseline-experiment", default=BASELINE_EXPERIMENT,
+                         help="Experiment used as the comparison arm for paired differences.")
+    args = parser.parse_args()
+    if args.n_bootstraps < MIN_BOOTSTRAPS:
+        parser.error(f"--n-bootstraps must be >= {MIN_BOOTSTRAPS} (got {args.n_bootstraps})")
+    return args
 
+
+def main():
+    args = parse_args()
+    n_bootstraps = args.n_bootstraps
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(args.seed)
+
+    print(f"Bootstrap replicates: {n_bootstraps}")
     print("Loading ablation data...")
     df = pd.read_csv(ABLATION_CSV)
     df["ligand_id"] = df["ligand_name"].apply(clean_ligand_name)
@@ -210,13 +188,19 @@ def main():
     print(f"Experiments: {', '.join(experiments)}")
     print(f"Receptors ({len(receptors)}): {', '.join(receptors)}\n")
 
-    experiment_bootstraps = {}      # {experiment: {receptor: [logAUC vals]}}
-    experiment_avg_bootstraps = {}  # {experiment: [avg_logAUC vals]}
+    experiment_bootstraps = {}       # {experiment: {receptor: [logAUC vals]}}
+    experiment_avg_bootstraps = {}   # {experiment: [naive avg_logAUC vals]} (deprecated, kept for the ridgeline plot)
+    experiment_tie_stats = {}        # {experiment: {receptor: tie_stats dict}}
+    experiment_point_est = {}        # {experiment: {receptor: point-estimate logAUC}}
+    experiment_receptor_scores = {}  # {experiment: {receptor: (lig_scores, dec_scores, lig_set, dec_set)}}
 
     for exp in experiments:
         print(f"Processing {exp}...")
         df_exp = df[df["experiment"] == exp]
         per_rec = {}
+        per_rec_ties = {}
+        per_rec_point = {}
+        per_rec_scores = {}
 
         for receptor in receptors:
             df_rec = df_exp[df_exp["receptor_id"] == receptor]
@@ -238,34 +222,52 @@ def main():
                           for r in best[best["ligand_id"].isin(lig_set)].itertuples()]
             dec_scores = [(r.ligand_id, r.affinity_pred_value)
                           for r in best[best["ligand_id"].isin(dec_set)].itertuples()]
+            per_rec_scores[receptor] = (lig_scores, dec_scores, lig_set, dec_set)
 
-            boot_vals = bootstrap_logauc(lig_scores, dec_scores, lig_set, dec_set, N_BOOTSTRAPS, rng)
+            boot_vals = bootstrap_logauc(lig_scores, dec_scores, lig_set, dec_set, n_bootstraps, rng)
             per_rec[receptor] = boot_vals
             mean_val = np.nanmean(boot_vals)
-            print(f"  [{exp}] {receptor}: mean logAUC = {mean_val:.2f} ({len(lig_set)} ligs, {len(dec_set)} decs)")
+
+            ties = tie_stats(lig_scores + dec_scores)
+            per_rec_ties[receptor] = ties
+            per_rec_point[receptor] = point_estimate_logauc(lig_scores, dec_scores, lig_set, dec_set, rng)
+
+            tie_flag = "  [TIED TOP-1%]" if ties["tied_top1pct_flag"] else ""
+            print(f"  [{exp}] {receptor}: mean logAUC = {mean_val:.2f} ({len(lig_set)} ligs, {len(dec_set)} decs, "
+                  f"{ties['distinct_values']} distinct scores, largest tie block {ties['largest_tie_block']}){tie_flag}")
+            if ties["tied_top1pct_flag"]:
+                print(f"    WARNING: top-1% of the ranking is >=99% inside a single tied score block — "
+                      f"logAUC for [{exp}] {receptor} is determined by tie-break order, not by the model.")
 
         experiment_bootstraps[exp] = per_rec
+        experiment_receptor_scores[exp] = per_rec_scores
+        experiment_tie_stats[exp] = per_rec_ties
+        experiment_point_est[exp] = per_rec_point
 
         # Save per-receptor bootstraps
         for rec, vals in per_rec.items():
             out_file = OUT_DIR / f"{exp}_{rec}_bootstraps.csv"
             pd.DataFrame({"logAUC": vals}).to_csv(out_file, index=False)
 
-        # Bootstrap average across receptors
-        avg_boots = compute_avg_logauc_bootstrap(per_rec, N_BOOTSTRAPS, rng)
-        experiment_avg_bootstraps[exp] = np.array(avg_boots)
+        # Naive avg-bootstrap (deprecated -- see logauc_utils.compute_avg_logauc_bootstrap)
+        # kept only to drive the existing ridgeline plot's KDE, which needs a
+        # smooth per-experiment distribution, not a rigorous CI.
+        from logauc_utils import compute_avg_logauc_bootstrap as _naive_avg_bootstrap
+        naive_avg_boots = _naive_avg_bootstrap(per_rec, n_bootstraps, rng)
+        experiment_avg_bootstraps[exp] = np.array(naive_avg_boots)
 
         avg_file = OUT_DIR / f"{exp}_avg_bootstraps.csv"
-        pd.DataFrame({"avg_logAUC": avg_boots}).to_csv(avg_file, index=False)
+        pd.DataFrame({"avg_logAUC": naive_avg_boots}).to_csv(avg_file, index=False)
 
-        mean_avg = np.nanmean(avg_boots)
-        ci_low, ci_high = np.nanpercentile(avg_boots, [2.5, 97.5])
+        mean_avg = np.nanmean(naive_avg_boots)
+        ci_low, ci_high = np.nanpercentile(naive_avg_boots, [2.5, 97.5])
         print(f"  → {exp} avg logAUC: {mean_avg:.2f} (95% CI: [{ci_low:.2f}, {ci_high:.2f}])\n")
 
     # Save summary tables
     summary_rows = []
     for exp in experiments:
         for rec, vals in experiment_bootstraps[exp].items():
+            ties = experiment_tie_stats[exp][rec]
             summary_rows.append({
                 "experiment": exp,
                 "receptor": rec,
@@ -273,24 +275,106 @@ def main():
                 "std_logAUC": np.nanstd(vals),
                 "ci_low": np.nanpercentile(vals, 2.5),
                 "ci_high": np.nanpercentile(vals, 97.5),
+                "point_estimate_logAUC": experiment_point_est[exp][rec],
+                "n_scores": ties["n"],
+                "distinct_score_values": ties["distinct_values"],
+                "largest_tie_block": ties["largest_tie_block"],
+                "top1pct_tie_fraction": ties["top1pct_tie_fraction"],
+                "tied_top1pct_flag": ties["tied_top1pct_flag"],
             })
-    pd.DataFrame(summary_rows).to_csv(OUT_DIR / "summary_per_receptor.csv", index=False)
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(OUT_DIR / "summary_per_receptor.csv", index=False)
 
+    n_flagged = int(summary_df["tied_top1pct_flag"].sum()) if not summary_df.empty else 0
+    if n_flagged:
+        print(f"\nWARNING: {n_flagged} (experiment, receptor) condition(s) have a tied top-1% ranking. "
+              f"See tied_top1pct_flag in summary_per_receptor.csv.")
+
+    # Task 3a/3b: population-level (cluster) CI, properly resampling
+    # receptors as well as ligands, with a BCa correction. This is the
+    # number that supports "receptors in general" claims; the per-receptor
+    # rows in summary_per_receptor.csv are the within-receptor CIs that
+    # support "this specific receptor" claims. See logauc_utils.py.
+    print("\nComputing population-level cluster bootstrap (Task 3a/3b)...")
     avg_rows = []
     for exp in experiments:
-        vals = experiment_avg_bootstraps[exp]
+        receptor_scores = experiment_receptor_scores[exp]
+        cluster_boots = cluster_bootstrap_avg_logauc(receptor_scores, n_bootstraps, rng)
+        point_ests = list(experiment_point_est[exp].values())
+        point_estimate = float(np.nanmean(point_ests)) if point_ests else float("nan")
+        jackknife_vals = jackknife_leave_one_out_means(point_ests)
+        bca_lo, bca_hi = bca_interval(cluster_boots, point_estimate, jackknife_vals)
+
+        cluster_file = OUT_DIR / f"{exp}_cluster_avg_bootstraps.csv"
+        pd.DataFrame({"cluster_avg_logAUC": cluster_boots}).to_csv(cluster_file, index=False)
+
         avg_rows.append({
             "experiment": exp,
-            "mean_avg_logAUC": np.nanmean(vals),
-            "std_avg_logAUC": np.nanstd(vals),
-            "ci_low": np.nanpercentile(vals, 2.5),
-            "ci_high": np.nanpercentile(vals, 97.5),
+            "n_receptors": len(receptor_scores),
+            "point_estimate_avg_logAUC": point_estimate,
+            "mean_cluster_avg_logAUC": float(np.nanmean(cluster_boots)) if cluster_boots else float("nan"),
+            "cluster_ci_percentile_low": float(np.nanpercentile(cluster_boots, 2.5)) if cluster_boots else float("nan"),
+            "cluster_ci_percentile_high": float(np.nanpercentile(cluster_boots, 97.5)) if cluster_boots else float("nan"),
+            "cluster_ci_bca_low": bca_lo,
+            "cluster_ci_bca_high": bca_hi,
+            # Deprecated naive avg-bootstrap, kept only for continuity with
+            # old output; do not use for population-level claims (Task 3a).
+            "deprecated_naive_mean_avg_logAUC": float(np.nanmean(experiment_avg_bootstraps[exp])),
+            "deprecated_naive_ci_low": float(np.nanpercentile(experiment_avg_bootstraps[exp], 2.5)),
+            "deprecated_naive_ci_high": float(np.nanpercentile(experiment_avg_bootstraps[exp], 97.5)),
         })
-    pd.DataFrame(avg_rows).to_csv(OUT_DIR / "summary_avg_logAUC.csv", index=False)
-    print("Summary tables saved.")
+        print(f"  {exp}: cluster avg logAUC = {avg_rows[-1]['mean_cluster_avg_logAUC']:.2f} "
+              f"(BCa 95% CI: [{bca_lo:.2f}, {bca_hi:.2f}], n={len(receptor_scores)} receptors)")
 
-    # Ridgeline plot
-    ridgeline_plot(experiment_avg_bootstraps, OUT_DIR / "ridgeline_ablation_logAUC.png")
+    pd.DataFrame(avg_rows).to_csv(OUT_DIR / "summary_avg_logAUC.csv", index=False)
+
+    # Task 3c: paired difference vs. baseline for every other experiment,
+    # resampling the same receptors/ligands in both arms so receptor
+    # difficulty cancels instead of adding noise. This is the correct way to
+    # test arm-vs-arm claims -- overlapping independently-bootstrapped CIs do
+    # not imply "not significantly different."
+    if args.baseline_experiment in experiment_receptor_scores:
+        print(f"\nComputing paired differences vs. {args.baseline_experiment!r} (Task 3c)...")
+        baseline_scores_raw = experiment_receptor_scores[args.baseline_experiment]
+        paired_rows = []
+        for exp in experiments:
+            if exp == args.baseline_experiment:
+                continue
+            paired_a, paired_b = _paired_receptor_scores(df, exp, args.baseline_experiment, receptors)
+            if not paired_a:
+                continue
+            diffs = cluster_bootstrap_paired_difference(paired_a, paired_b, n_bootstraps, rng)
+            if not diffs:
+                continue
+            mean_diff = float(np.nanmean(diffs))
+            ci_lo, ci_hi = float(np.nanpercentile(diffs, 2.5)), float(np.nanpercentile(diffs, 97.5))
+            significant = (ci_lo > 0) or (ci_hi < 0)
+            paired_rows.append({
+                "experiment": exp,
+                "baseline_experiment": args.baseline_experiment,
+                "n_receptors": len(paired_a),
+                "mean_diff_logAUC": mean_diff,
+                "ci_low": ci_lo,
+                "ci_high": ci_hi,
+                "significant_95pct": significant,
+            })
+            print(f"  {exp} - {args.baseline_experiment}: Δ = {mean_diff:.2f} "
+                  f"(95% CI: [{ci_lo:.2f}, {ci_hi:.2f}]){' *' if significant else ''}")
+        if paired_rows:
+            pd.DataFrame(paired_rows).to_csv(OUT_DIR / f"pairwise_vs_{args.baseline_experiment}.csv", index=False)
+    else:
+        print(f"\nBaseline experiment {args.baseline_experiment!r} not found in data -- "
+              f"skipping paired-difference report.")
+
+    print("\nSummary tables saved.")
+
+    # Ridgeline plot -- best-effort. All CSVs above are already written by
+    # this point, so a plotting-backend failure shouldn't take down a run
+    # that otherwise succeeded.
+    try:
+        ridgeline_plot(experiment_avg_bootstraps, OUT_DIR / "ridgeline_ablation_logAUC.png")
+    except Exception as e:
+        print(f"WARNING: ridgeline plot failed ({e}); CSV outputs above are unaffected.")
 
 
 if __name__ == "__main__":

@@ -56,22 +56,64 @@ python ablation_experiment/experiment_scripts/run_feature_ablation.py \
     --max-ligands ${MAX_LIGANDS} \
     ${EXPERIMENTS} \
     --use-msa-server \
+    --trunk-cache-dir ablation_experiment/results/trunk_cache \
     --output ablation_experiment/results/ablation/feature_ablation_results.csv \
     --log-level INFO
+ABLATION_RC=$?
 
-echo "Feature ablation finished at $(date) with exit code $?"
+echo "Feature ablation finished at $(date) with exit code ${ABLATION_RC}"
+if [[ ${ABLATION_RC} -ne 0 ]]; then
+    echo "ERROR: ablation run failed; not proceeding to the fidelity gate." >&2
+    exit ${ABLATION_RC}
+fi
 
-# ── Post-processing ───────────────────────────────────────────────────
-# Bootstrap logAUC (existing analysis).
-python ablation_experiment/analysis_scripts/compute_ablation_bootstrap.py \
-    || echo "compute_ablation_bootstrap.py failed (continuing)"
+# ── Trunk-cache fidelity gate (Task 4) ────────────────────────────────
+# Every ablation number above came from replaying the affinity head against
+# a CACHED trunk rather than recomputing it. This re-runs a stratified
+# sample end-to-end, uncached, and asserts the two agree to |dpIC50| < 1e-4.
+# A silent cache or featurization mismatch would corrupt every downstream
+# number while leaving the analysis scripts running happily -- so this is a
+# hard gate: if it fails, the results must not be analyzed.
+echo "Running trunk-cache fidelity gate at $(date)"
+python ablation_experiment/experiment_scripts/verify_trunk_cache.py \
+    --all-receptors \
+    --n-samples 200 \
+    --trunk-cache-dir ablation_experiment/results/trunk_cache \
+    --use-msa-server \
+    --output ablation_experiment/analysis_data/cache_fidelity.csv \
+    --log-level INFO
+GATE_RC=$?
 
-# Distribution stats per ablation (proposal #3): mean/std/AUROC/Cohen's d
-# split by actives vs decoys; produces bar charts + ridgeline.
-python ablation_experiment/analysis_scripts/compute_distribution_stats.py \
-    --input ablation_experiment/results/ablation/feature_ablation_results.csv \
-    --output-dir ablation_experiment/analysis_data/distribution_stats \
-    --ridgeline \
-    || echo "compute_distribution_stats.py failed (continuing)"
+if [[ ${GATE_RC} -ne 0 ]]; then
+    echo "ERROR: trunk-cache fidelity gate FAILED (exit ${GATE_RC})." >&2
+    echo "Do NOT analyze these results. See ablation_experiment/analysis_data/cache_fidelity.csv" >&2
+    exit ${GATE_RC}
+fi
+echo "Fidelity gate passed at $(date)"
 
-echo "Post-processing finished at $(date)"
+# ── Tie-density audit (Task 0b) ───────────────────────────────────────
+# Cheap, CPU-only, and the gate that everything else waits on. Run here so
+# the audit CSV is ready for review as soon as the GPU job lands.
+python ablation_experiment/analysis_scripts/audit_tie_density.py \
+    || echo "audit_tie_density.py failed (review manually)"
+
+cat <<'EOF'
+
+────────────────────────────────────────────────────────────────────────
+GPU stage complete. The remaining analysis is CPU-only and gated on human
+review of the tie-density audit -- it is deliberately NOT run here.
+
+  1. Read  ablation_experiment/analysis_data/tie_density_audit.csv
+     Confirm bias_only (the v(0) anchor for every Shapley value and NAE
+     denominator) is sound, and that no condition you intend to interpret
+     is marked 'unusable'.
+
+  2. Then run the analysis chain (login node or a small CPU allocation):
+       cd ablation_experiment && ./run_analysis.sh --tie-audit-reviewed
+
+     Add --n-bootstraps 2000 for a faster first pass (default is 10000,
+     roughly 1.5-2 h over ~14 experiments x ~18 receptors).
+────────────────────────────────────────────────────────────────────────
+EOF
+
+echo "Job finished at $(date)"
