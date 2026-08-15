@@ -43,7 +43,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from logauc_utils import tie_stats  # noqa: E402
+from logauc_utils import label_actives_decoys, tie_stats  # noqa: E402
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # ablation_experiment/
 DEFAULT_ABLATION_CSV = BASE_DIR / "results" / "ablation" / "feature_ablation_results.csv"
@@ -106,9 +106,12 @@ def audit_ablation_csv(ablation_csv: Path) -> list[dict]:
     for (exp, receptor), df_group in df.groupby(["experiment", "receptor_id"]):
         # Same dedup rule as the bootstrap scripts: best (lowest) score per compound.
         best = df_group.groupby("ligand_id")["affinity_pred_value"].min().reset_index()
-        names = set(best["ligand_id"])
-        lig_set = {n for n in names if not is_decoy(n)}
-        dec_set = {n for n in names if is_decoy(n)}
+        if "is_binder" in df_group.columns:
+            best = best.merge(
+                df_group[["ligand_id", "is_binder"]].drop_duplicates("ligand_id"),
+                on="ligand_id", how="left",
+            )
+        lig_set, dec_set, _label_source = label_actives_decoys(best)
 
         scores = list(zip(best["ligand_id"], best["affinity_pred_value"]))
         stats = tie_stats(scores)

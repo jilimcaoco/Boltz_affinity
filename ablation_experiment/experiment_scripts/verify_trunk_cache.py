@@ -52,6 +52,7 @@ from run_feature_ablation import (  # noqa: E402
     _featurize_ligand,
     default_paths,
     discover_pairs,
+    featurize_complex,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,8 +66,17 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--receptor", type=Path, help="Single receptor PDB file.")
-    group.add_argument("--all-receptors", action="store_true")
+    group.add_argument("--receptor", type=Path, help="Single receptor PDB file (MOL2 flow).")
+    group.add_argument("--all-receptors", action="store_true", help="All receptor/pose pairs (MOL2 flow).")
+    group.add_argument(
+        "--dudez-receptor", default=None,
+        help="DUDEZ target ID (e.g. AA2AR) — verifies the predicted-complex "
+             "flow driven by run_feature_ablation_dudez.py instead of the "
+             "MOL2 flow. Reads the same manifest/structures/MSA inputs.",
+    )
+    parser.add_argument("--boltz-outputs-root", type=Path, default=None)
+    parser.add_argument("--dudez-inputs-root", type=Path, default=None)
+    parser.add_argument("--msa-dir", type=Path, default=None)
 
     parser.add_argument("--ligands", type=Path, default=None)
     parser.add_argument("--receptors-dir", type=Path, default=receptors_dir)
@@ -86,6 +96,36 @@ def parse_args() -> argparse.Namespace:
     if args.receptor and not args.ligands:
         parser.error("--ligands is required when using --receptor.")
     return args
+
+
+def _dudez_setup(args):
+    """Resolve DUDEZ inputs and return (candidates, featurize_fn).
+
+    ``candidates`` is {compound_id: cif_path} for everything already in the
+    trunk cache; ``featurize_fn(compound_id)`` rebuilds that complex's batch
+    through the same shared path the DUDEZ runner uses.
+    """
+    import argparse as _argparse
+    import run_feature_ablation_dudez as dudez
+
+    ns = _argparse.Namespace(
+        receptor=args.dudez_receptor,
+        boltz_outputs_root=args.boltz_outputs_root or dudez.DEFAULT_BOLTZ_OUTPUTS,
+        dudez_inputs_root=args.dudez_inputs_root or dudez.DEFAULT_DUDEZ_INPUTS,
+        msa_dir=args.msa_dir or dudez.DEFAULT_MSA_DIR,
+        structures_dir=None, smiles_csv=None, msa_path=None,
+        output=None, trunk_cache_dir=args.trunk_cache_dir,
+    )
+    structures_dir, smiles_csv, msa_path, _out, _cache = dudez.resolve_inputs(ns)
+    smiles_table = dudez.load_smiles_table(smiles_csv)
+
+    cif_by_cid = {}
+    for p in sorted(structures_dir.glob("*.cif")):
+        cid = dudez._compound_id_from_cif(p)
+        if cid in smiles_table:
+            cif_by_cid[cid] = p
+
+    return cif_by_cid, smiles_table, msa_path, dudez
 
 
 def _stratified_sample(receptor_to_ligands: dict, n_samples: int, rng) -> List[Tuple[str, str]]:
@@ -141,7 +181,10 @@ def main():
     model_dtype = next(model.parameters()).dtype
     logger.info(f"Model loaded on {manager.device}")
 
-    if args.all_receptors:
+    dudez_mode = args.dudez_receptor is not None
+    if dudez_mode:
+        pairs = []  # populated below from the DUDEZ manifest
+    elif args.all_receptors:
         pairs = discover_pairs(args.receptors_dir, args.poses_dir)
     else:
         receptor_id = args.receptor.stem.removesuffix("_receptor")
@@ -159,20 +202,89 @@ def main():
     # (run run_feature_ablation.py first).
     receptor_to_ligands = {}
     receptor_paths = {}
-    for receptor_id, receptor_path, ligands_path in pairs:
-        cached = trunk_cache.list_cached_ligands(args.trunk_cache_dir, receptor_id)
-        if not cached:
-            logger.warning(f"[{receptor_id}] no cached trunk entries -- skipping "
-                            f"(run run_feature_ablation.py first).")
-            continue
-        receptor_to_ligands[receptor_id] = cached
-        receptor_paths[receptor_id] = (receptor_path, ligands_path)
+
+    if dudez_mode:
+        receptor_id = args.dudez_receptor
+        cif_by_cid, smiles_table, dudez_msa_path, dudez_mod = _dudez_setup(args)
+        cached = [
+            c for c in trunk_cache.list_cached_ligands(args.trunk_cache_dir, receptor_id)
+            if c in cif_by_cid
+        ]
+        if cached:
+            receptor_to_ligands[receptor_id] = cached
+    else:
+        for receptor_id, receptor_path, ligands_path in pairs:
+            cached = trunk_cache.list_cached_ligands(args.trunk_cache_dir, receptor_id)
+            if not cached:
+                logger.warning(f"[{receptor_id}] no cached trunk entries -- skipping "
+                                f"(run run_feature_ablation.py first).")
+                continue
+            receptor_to_ligands[receptor_id] = cached
+            receptor_paths[receptor_id] = (receptor_path, ligands_path)
 
     if not receptor_to_ligands:
         raise SystemExit(
-            "No cached trunk entries found under "
-            f"{args.trunk_cache_dir}. Run run_feature_ablation.py first to populate the cache."
+            f"No cached trunk entries found under {args.trunk_cache_dir}. Run the "
+            f"corresponding ablation runner first to populate the cache "
+            f"({'run_feature_ablation_dudez.py' if dudez_mode else 'run_feature_ablation.py'})."
         )
+
+    def _mol2_featurize(receptor_id: str, ligand_name: str):
+        """MOL2 flow: re-parse the receptor + pose file for this ligand."""
+        receptor_path, ligands_path = receptor_paths[receptor_id]
+        protein_atoms, _ = parse_structure_file(receptor_path)
+        protein_chain_id = "A"
+        merged_refs = get_seqres_sequences(receptor_path)
+        sequences = get_chain_sequences(protein_atoms, reference_sequences=merged_refs)
+        if protein_chain_id not in sequences:
+            protein_chain_id = next(iter(sequences))
+        protein_seq = sequences[protein_chain_id]
+
+        # Verification uses the single-sequence path by default for speed;
+        # cache entries built with an MSA must be verified with
+        # --use-msa-server or the two sides won't be comparable.
+        msa_path = None
+        if args.use_msa_server:
+            import tempfile
+            from boltz.main import compute_msa
+            msa_dir = Path(tempfile.mkdtemp(prefix="boltz_verify_msa_"))
+            target_id = f"receptor_{protein_chain_id}"
+            compute_msa(
+                data={target_id: protein_seq}, target_id=target_id, msa_dir=msa_dir,
+                msa_server_url="https://api.colabfold.com",
+                msa_pairing_strategy="paired+unpaired",
+            )
+            found = list(msa_dir.glob("*.a3m")) or list(msa_dir.glob("*.csv"))
+            if found:
+                msa_path = str(found[0].resolve())
+
+        ligands = mol2_parser.extract_ligands_with_names(ligands_path)
+        ligand = next((lg for lg in ligands if lg.name == ligand_name), None)
+        if ligand is None:
+            return None, f"ligand {ligand_name} not found in {ligands_path}"
+
+        return _featurize_ligand(
+            ligand, receptor_id, protein_chain_id, protein_seq, protein_atoms,
+            msa_path, ccd, mol_dir, tokenizer, cropper, featurizer, device,
+        )
+
+    def featurize_for(receptor_id: str, ligand_name: str):
+        """Rebuild one complex's batch, via whichever flow is active."""
+        if dudez_mode:
+            smiles = smiles_table[ligand_name]["smiles"]
+            prot, lig, chain_id, seq, err = dudez_mod._parse_complex(
+                cif_by_cid[ligand_name], smiles,
+            )
+            if err is not None:
+                return None, err
+            return featurize_complex(
+                protein_atoms=prot, ligand_atoms_remapped=lig, smiles=smiles,
+                protein_chain_id=chain_id, protein_seq=seq,
+                msa_path=str(dudez_msa_path), ccd=ccd, mol_dir=mol_dir,
+                tokenizer=tokenizer, cropper=cropper, featurizer=featurizer,
+                device=device,
+            )
+        return _mol2_featurize(receptor_id, ligand_name)
 
     rng = np.random.default_rng(args.seed)
     sample = _stratified_sample(receptor_to_ligands, args.n_samples, rng)
@@ -184,40 +296,8 @@ def main():
     n_error = 0
 
     for receptor_id, ligand_name in sample:
-        receptor_path, ligands_path = receptor_paths[receptor_id]
         try:
-            protein_atoms, _ = parse_structure_file(receptor_path)
-            protein_chain_id = "A"
-            merged_refs = get_seqres_sequences(receptor_path)
-            sequences = get_chain_sequences(protein_atoms, reference_sequences=merged_refs)
-            if protein_chain_id not in sequences:
-                protein_chain_id = next(iter(sequences))
-            protein_seq = sequences[protein_chain_id]
-
-            msa_path = None  # verification uses the model's own single-sequence path for speed;
-                              # cache entries built with an MSA should be verified with --use-msa-server.
-            if args.use_msa_server:
-                import tempfile
-                from boltz.main import compute_msa
-                msa_dir = Path(tempfile.mkdtemp(prefix="boltz_verify_msa_"))
-                target_id = f"receptor_{protein_chain_id}"
-                compute_msa(
-                    data={target_id: protein_seq}, target_id=target_id, msa_dir=msa_dir,
-                    msa_server_url="https://api.colabfold.com", msa_pairing_strategy="paired+unpaired",
-                )
-                found = list(msa_dir.glob("*.a3m")) or list(msa_dir.glob("*.csv"))
-                if found:
-                    msa_path = str(found[0].resolve())
-
-            ligands = mol2_parser.extract_ligands_with_names(ligands_path)
-            ligand = next((lg for lg in ligands if lg.name == ligand_name), None)
-            if ligand is None:
-                raise RuntimeError(f"ligand {ligand_name} not found in {ligands_path}")
-
-            batch, err = _featurize_ligand(
-                ligand, receptor_id, protein_chain_id, protein_seq, protein_atoms,
-                msa_path, ccd, mol_dir, tokenizer, cropper, featurizer, device,
-            )
+            batch, err = featurize_for(receptor_id, ligand_name)
             if err is not None:
                 raise RuntimeError(f"featurization failed: {err}")
 

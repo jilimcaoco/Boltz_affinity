@@ -59,13 +59,16 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from logauc_utils import compute_logauc  # noqa: E402
+from logauc_utils import compute_logauc, label_actives_decoys  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ABLATION_CSV = BASE_DIR / "results" / "ablation" / "feature_ablation_results.csv"
 POSES_DIR = BASE_DIR / "DOCK3.8_poses"
+DEFAULT_DUDEZ_INPUTS = Path(
+    "/home/limcaoco/turbo/limcaoco/boltz_benchmark/input_files/DUDEZ_benchmark"
+)
 OUT_DIR = BASE_DIR / "analysis_data"
 
 ECFP4_RADIUS = 2
@@ -238,7 +241,12 @@ def compute_2d_logauc_and_ave(
 
 def load_ligand_smiles_for_receptor(poses_path: Path) -> Dict[str, str]:
     """Extract {ligand_name: smiles} from a DOCK3.8 MOL2 pose file, using
-    the same SMILES-inference path run_feature_ablation.py uses."""
+    the same SMILES-inference path run_feature_ablation.py uses.
+
+    Only for the MOL2 flow. The DUDEZ flow uses
+    :func:`load_manifest_smiles_for_receptor` instead -- its SMILES are
+    authoritative and need no RDKit bond perception.
+    """
     from boltz.affinity_rescoring.mol2_parser import MOL2Parser
     from boltz.affinity_rescoring.smiles_inference import infer_smiles_from_atoms
 
@@ -255,12 +263,64 @@ def load_ligand_smiles_for_receptor(poses_path: Path) -> Dict[str, str]:
     return out
 
 
+def load_manifest_smiles_for_receptor(manifest_path: Path) -> Dict[str, str]:
+    """Extract {compound_ID: smiles} from a DUDEZ manifest CSV
+    (``<RECEPTOR>_combined_ids.csv``, columns SMILES / compound_ID /
+    is_binder). Pure stdlib csv -- no boltz or RDKit dependency, unlike the
+    MOL2 path, because the SMILES are already authoritative."""
+    import csv as _csv
+
+    out: Dict[str, str] = {}
+    with manifest_path.open() as fh:
+        reader = _csv.DictReader(fh)
+        fields = reader.fieldnames or []
+        smiles_key = next((k for k in fields if k.strip().upper() == "SMILES"), None)
+        cid_key = next((k for k in fields if k.strip().lower() == "compound_id"), None)
+        if smiles_key is None or cid_key is None:
+            raise ValueError(
+                f"Cannot locate SMILES/compound_ID columns in {manifest_path}: got {fields}"
+            )
+        for row in reader:
+            cid = (row.get(cid_key) or "").strip()
+            sm = (row.get(smiles_key) or "").strip()
+            if cid and sm:
+                out[cid] = sm
+    return out
+
+
+def resolve_smiles_source(receptor: str, poses_dir: Path, manifest_dir: Optional[Path]):
+    """Return ``(smiles_by_name, source)`` for one receptor, preferring the
+    DUDEZ manifest when available and falling back to MOL2 poses.
+
+    Both ablation runners feed the same analysis chain, so this control has
+    to accept either input shape. ``(None, reason)`` when neither exists.
+    """
+    if manifest_dir is not None:
+        manifest_path = manifest_dir / f"{receptor}_combined_ids.csv"
+        if manifest_path.exists():
+            return load_manifest_smiles_for_receptor(manifest_path), f"manifest:{manifest_path.name}"
+
+    poses_path = poses_dir / f"{receptor}_poses.mol2"
+    if poses_path.exists():
+        return load_ligand_smiles_for_receptor(poses_path), f"mol2:{poses_path.name}"
+
+    return None, (
+        f"no SMILES source: neither {manifest_dir}/{receptor}_combined_ids.csv "
+        f"(DUDEZ manifest) nor {poses_dir}/{receptor}_poses.mol2 (MOL2 poses) exists"
+    )
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ablation-csv", type=Path, default=ABLATION_CSV)
-    parser.add_argument("--poses-dir", type=Path, default=POSES_DIR)
+    parser.add_argument("--poses-dir", type=Path, default=POSES_DIR,
+                         help="MOL2 pose files (run_feature_ablation.py flow).")
+    parser.add_argument("--dudez-inputs-root", type=Path, default=DEFAULT_DUDEZ_INPUTS,
+                         help="Directory of <RECEPTOR>_combined_ids.csv manifests "
+                              "(run_feature_ablation_dudez.py flow). Preferred over "
+                              "--poses-dir when a manifest exists for the receptor.")
     parser.add_argument("--output-dir", type=Path, default=OUT_DIR)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-level", default="INFO")
@@ -288,12 +348,13 @@ def main():
     residual_rows = []
 
     for receptor in receptors:
-        poses_path = args.poses_dir / f"{receptor}_poses.mol2"
-        if not poses_path.exists():
-            logger.warning(f"[{receptor}] no pose file at {poses_path}, skipping.")
+        smiles_by_name, source = resolve_smiles_source(
+            receptor, args.poses_dir, args.dudez_inputs_root,
+        )
+        if smiles_by_name is None:
+            logger.warning(f"[{receptor}] skipping -- {source}")
             continue
-
-        smiles_by_name = load_ligand_smiles_for_receptor(poses_path)
+        logger.info(f"[{receptor}] SMILES source: {source} ({len(smiles_by_name)} compounds)")
         properties = {}
         fingerprints = {}
         for name, smiles in smiles_by_name.items():
@@ -305,9 +366,9 @@ def main():
                 fingerprints[name] = fp
 
         df_rec = df[df["receptor_id"] == receptor]
-        all_names = set(df_rec["ligand_id"])
-        lig_set = {n for n in all_names if not is_decoy(n)}
-        dec_set = {n for n in all_names if is_decoy(n)}
+        lig_set, dec_set, _label_source = label_actives_decoys(
+            df_rec.drop_duplicates("ligand_id")
+        )
         ratio = (len(lig_set) / len(dec_set)) if dec_set else float("nan")
 
         result = compute_2d_logauc_and_ave(fingerprints, lig_set, dec_set, seed=args.seed)

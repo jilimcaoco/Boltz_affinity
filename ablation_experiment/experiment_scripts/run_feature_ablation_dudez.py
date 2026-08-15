@@ -1,62 +1,88 @@
 #!/usr/bin/env python3
 """DUDEZ feature-ablation runner — one receptor at a time.
 
-Differs from ``run_feature_ablation.py`` (which expects a receptor PDB +
-multi-pose MOL2) by consuming the *predicted* DUDEZ Boltz outputs:
+**This is the primary runner for the ablation study.** It consumes
+*precomputed* Boltz-2 predicted complexes rather than a receptor PDB plus a
+multi-pose MOL2 (which is what ``run_feature_ablation.py`` does), because
+the study's premise is that a valid structure is already in hand: the
+affinity head is fed that structure directly, sidestepping diffusion
+sampling entirely.
 
-  /scratch/maom_root/maom/limcaoco/Boltz_outputs/<RECEPTOR>/
-      combined_structures/<COMPOUND_ID>_model_0.cif
+Inputs, per receptor
+--------------------
+  <boltz-outputs>/<RECEPTOR>/combined_structures/<COMPOUND_ID>_model_0.cif
+  <dudez-inputs>/<RECEPTOR>_combined_ids.csv   (cols: SMILES, compound_ID, is_binder)
+  <msa-dir>/<RECEPTOR>_mmseqs2.a3m
 
-and the SMILES manifest at
+Why this path rather than the MOL2 runner
+-----------------------------------------
+1. **SMILES are authoritative** — read from the manifest, not inferred by
+   RDKit bond perception, which silently drops ligands when it fails.
+2. **Labels are authoritative** — ``is_binder`` comes from the manifest
+   rather than being guessed from a "ZINC" name prefix.
+3. **The MSA is pinned** to a cached ``.a3m``, so the ColabFold server is
+   never contacted (works on air-gapped compute nodes).
 
-  /home/limcaoco/turbo/limcaoco/boltz_benchmark/input_files/DUDEZ_benchmark/
-      <RECEPTOR>_combined_ids.csv          (cols: SMILES, compound_ID, is_binder)
+Flow (mirrors run_feature_ablation.py)
+--------------------------------------
+Two passes per receptor:
 
-For every CIF found, this script:
+  Pass 1  Featurize every complex and run the trunk **once**, caching the
+          result to ``--trunk-cache-dir`` (see ``trunk_cache.py``).
+  Pass 2  Replay only the affinity head (~10 ms) for every requested
+          experiment against that cache.
 
-1. Splits the predicted complex into chain-A protein atoms and chain-B
-   ligand atoms (HETATM ``LIG1`` written by Boltz).
-2. Looks up the SMILES from the receptor's *_combined_ids.csv* (no RDKit
-   bond-perception — the SMILES is authoritative).
-3. Re-maps the ligand atom names to canonical RDKit ranks (re-using
-   ``_remap_ligand_atoms`` from the MOL2 runner).
-4. Builds a Boltz YAML pinning the MSA to the cached
-   ``<RECEPTOR>_mmseqs2.a3m`` so the colab MSA server is never contacted.
-5. Featurises once, then runs every requested ablation against the
-   affinity head.
+This matters: the previous version of this script called
+``affinity_forward`` — the *full* trunk plus head — once per experiment, so
+a 14-experiment run recomputed the ~10 s trunk 14 times per ligand. The
+cache also makes the ``resample``/``mean`` operators possible at all, since
+they need another ligand's trunk output as a donor.
 
-Outputs one CSV per receptor with the same columns as the MOL2 runner
-plus the receptor-of-origin and a ``compound_class`` column (active /
-decoy) read from the SMILES CSV's ``is_binder`` flag.
+Note on comparability: ``--recycling-steps`` defaults to 5, matching
+``run_feature_ablation.py``. It previously defaulted to 1 here, which made
+results from the two runners silently non-comparable.
+
+Outputs one CSV per receptor, sharing the schema of the MOL2 runner
+(``ligand_name`` carries the compound ID) plus an authoritative
+``is_binder`` column, so a single analysis chain reads both.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import logging
 import shutil
 import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
-# Ensure repo src/ is on sys.path
+# Ensure repo src/ and this directory are on sys.path
 _script_dir = Path(__file__).resolve().parent
 _repo_root = _script_dir.parents[1]
 _src_dir = _repo_root / "src"
 if str(_src_dir) not in sys.path:
     sys.path.insert(0, str(_src_dir))
+if str(_script_dir) not in sys.path:
+    sys.path.insert(0, str(_script_dir))
 
-# Re-use the MOL2 runner's experiment registry and ligand-atom
-# canonicalisation helper.
-from run_feature_ablation import (
+import numpy as np  # noqa: E402
+import trunk_cache  # noqa: E402
+
+# Re-use the MOL2 runner's registry, shared featurization, and head-replay
+# machinery. The two runners differ only in how inputs are obtained.
+from run_feature_ablation import (  # noqa: E402
     ALL_EXPERIMENT_NAMES,
     DEFAULT_EXPERIMENT_NAMES,
     EXPERIMENTS,
     AblationExperiment,
-    _remap_ligand_atoms,
+    _coords_affinity,
+    _run_resample_or_mean,
+    featurize_complex,
+    remap_or_passthrough,
     setup_logging,
 )
 
@@ -81,6 +107,16 @@ DEFAULT_DUDEZ_INPUTS = Path(
 DEFAULT_MSA_DIR = Path(
     "/home/limcaoco/turbo/limcaoco/boltz_benchmark/input_files/msa"
 )
+
+# Shared with the MOL2 runner so a single analysis chain reads both.
+FIELDNAMES = [
+    "receptor_id", "ligand_name", "is_binder", "experiment",
+    "operator", "resample_channels", "donor_seed", "donor_complex_ids",
+    "query_n_tokens",
+    "affinity_pred_value", "affinity_probability_binary",
+    "pose_noise_sigma", "pose_noise_target", "pose_noise_seed",
+    "error", "time_ms",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -123,12 +159,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Experiment selection — defaults to noise-free subset; pass
-    # --experiments explicitly to include pose-noise experiments.
+    # --experiments explicitly to include pose-noise or resample/mean.
     parser.add_argument(
         "--experiments", nargs="+", default=list(DUDEZ_DEFAULT_EXPERIMENT_NAMES),
         choices=ALL_EXPERIMENT_NAMES,
         help="Which ablation experiments to run (default: channel + "
-             "sub-component ablations, no pose-noise).",
+             "sub-component ablations, no pose-noise, no resample/mean).",
     )
     parser.add_argument("--max-ligands", type=int, default=None)
     parser.add_argument(
@@ -142,7 +178,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default="auto")
     parser.add_argument("--device", default="auto",
                         choices=["auto", "cuda", "cpu", "mps"])
-    parser.add_argument("--recycling-steps", type=int, default=1)
+    parser.add_argument(
+        "--recycling-steps", type=int, default=5,
+        help="Trunk recycling steps. Matches run_feature_ablation.py so "
+             "results from the two runners stay comparable.",
+    )
+    parser.add_argument(
+        "--trunk-cache-dir", type=Path, default=None,
+        help="Disk cache for per-(receptor,ligand) trunk output. Default: "
+             "ablation_experiment/results/trunk_cache_dudez. Keep this "
+             "SEPARATE from the MOL2 runner's cache -- entries are keyed on "
+             "(receptor, ligand) with no record of which pose source "
+             "produced them, so mixing the two would serve the wrong z.",
+    )
+    parser.add_argument(
+        "--rebuild-trunk-cache", action="store_true", default=False,
+        help="Recompute and overwrite cached trunk entries even if present.",
+    )
+    parser.add_argument(
+        "--donor-pool-size", type=int, default=trunk_cache.DEFAULT_DONOR_POOL_SIZE,
+        help="How many ligands to cache as the donor pool for resample/mean. "
+             "Each entry is ~16 MB (z is N*N*token_z), so caching every ligand "
+             "would cost hundreds of GB per receptor. 0 = no limit. Ignored "
+             "entirely when no resample/mean experiment is requested, in which "
+             "case NOTHING is written to disk.",
+    )
+    parser.add_argument(
+        "--donor-pool-seed", type=int, default=0,
+        help="Seed for which ligands land in the donor pool.",
+    )
+    parser.add_argument(
+        "--keep-trunk-cache", action="store_true", default=False,
+        help="Keep the donor-pool cache after the run. By default it is "
+             "deleted once the replay pass finishes, since it is a scratch "
+             "artefact reproducible from the inputs and costs ~16 MB/ligand.",
+    )
     parser.add_argument(
         "--output", "-o", type=Path, default=None,
         help="Output CSV (default: ablation_experiment/results/dudez_ablation/"
@@ -160,8 +230,8 @@ def parse_args() -> argparse.Namespace:
 # ── Per-receptor input resolution ─────────────────────────────────────
 
 
-def resolve_inputs(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
-    """Resolve and validate the four per-receptor input artefacts."""
+def resolve_inputs(args: argparse.Namespace) -> tuple[Path, Path, Path, Path, Path]:
+    """Resolve and validate the per-receptor input artefacts."""
     receptor_id = args.receptor
     structures_dir = args.structures_dir or (
         args.boltz_outputs_root / receptor_id / "combined_structures"
@@ -174,6 +244,9 @@ def resolve_inputs(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
     output = args.output or (
         _repo_root / "ablation_experiment" / "results" / "dudez_ablation"
         / f"{receptor_id}_dudez_ablation.csv"
+    )
+    trunk_cache_dir = args.trunk_cache_dir or (
+        _repo_root / "ablation_experiment" / "results" / "trunk_cache_dudez"
     )
 
     if not structures_dir.exists():
@@ -190,7 +263,7 @@ def resolve_inputs(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
         raise FileNotFoundError(f"Cached MSA not found: {msa_path}")
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    return structures_dir, smiles_csv, msa_path, output
+    return structures_dir, smiles_csv, msa_path, output, trunk_cache_dir
 
 
 def load_smiles_table(smiles_csv: Path) -> dict[str, dict[str, str]]:
@@ -223,24 +296,28 @@ def load_smiles_table(smiles_csv: Path) -> dict[str, dict[str, str]]:
                 f"Cannot locate SMILES/compound_ID columns in {smiles_csv}: "
                 f"got {reader.fieldnames}"
             )
+        if binder_key is None:
+            raise ValueError(
+                f"No is_binder column in {smiles_csv} (got {reader.fieldnames}). "
+                f"This runner uses the manifest label as ground truth rather "
+                f"than guessing actives/decoys from a name prefix, so the "
+                f"column is required."
+            )
         for row in reader:
             cid = (row.get(cid_key) or "").strip()
             sm = (row.get(smiles_key) or "").strip()
             if not cid or not sm:
                 continue
-            is_binder = False
-            if binder_key:
-                v = (row.get(binder_key) or "").strip().lower()
-                is_binder = v in ("true", "1", "yes", "y")
-            table[cid] = {"smiles": sm, "is_binder": is_binder}
+            v = (row.get(binder_key) or "").strip().lower()
+            table[cid] = {"smiles": sm, "is_binder": v in ("true", "1", "yes", "y")}
     return table
 
 
-# ── Lightweight ligand shim for ``_remap_ligand_atoms`` ────────────────
+# ── Lightweight ligand shim for the shared atom-remapper ───────────────
 
 
 class _LigandFromCif:
-    """Adapter so ``_remap_ligand_atoms`` (built for MOL2 ``Ligand``) works."""
+    """Adapter so ``remap_or_passthrough`` (built for MOL2 ``Ligand``) works."""
     __slots__ = ("name", "atoms")
 
     def __init__(self, name: str, atoms):
@@ -248,67 +325,131 @@ class _LigandFromCif:
         self.atoms = atoms
 
 
-# ── Per-receptor runner ────────────────────────────────────────────────
+# ── CSV rows ───────────────────────────────────────────────────────────
 
 
-def run_for_receptor(args: argparse.Namespace) -> int:
-    """Run the requested ablation set for every CIF in the receptor."""
-    import numpy as np
-    import torch
-    import yaml
-    from torch import Tensor
+def _row_base(receptor_id, compound_id, is_binder, exp: AblationExperiment) -> dict:
+    return {
+        "receptor_id": receptor_id,
+        "ligand_name": compound_id,
+        "is_binder": int(bool(is_binder)),
+        "experiment": exp.name,
+        "operator": exp.operator,
+        "resample_channels": ",".join(exp.resample_channels),
+        "donor_seed": "" if exp.donor_seed is None else exp.donor_seed,
+        "donor_complex_ids": "",
+        "query_n_tokens": "",
+        "pose_noise_sigma": exp.pose_noise_sigma,
+        "pose_noise_target": exp.pose_noise_target,
+        "pose_noise_seed": "" if exp.pose_noise_seed is None else exp.pose_noise_seed,
+    }
 
-    from boltz.affinity_rescoring.coord_injection import (
-        build_chain_id_map,
-        inject_pdb_coords_into_structure,
-        save_pre_affinity_structure,
-    )
-    from boltz.affinity_rescoring.inference import (
-        AffinityModelManager,
-        affinity_forward,
-    )
-    from boltz.affinity_rescoring.models import DeviceOption
+
+def _error_row(receptor_id, compound_id, is_binder, exp, message) -> dict:
+    row = _row_base(receptor_id, compound_id, is_binder, exp)
+    row.update({
+        "affinity_pred_value": "", "affinity_probability_binary": "",
+        "error": message, "time_ms": "",
+    })
+    return row
+
+
+def _result_row(receptor_id, compound_id, is_binder, exp, out, elapsed_ms,
+                query_n_tokens, donor_ids, skip_reason) -> dict:
+    row = _row_base(receptor_id, compound_id, is_binder, exp)
+    row.update({
+        "donor_complex_ids": ";".join(f"{ch}={lid}" for ch, lid in donor_ids.items()),
+        "query_n_tokens": query_n_tokens,
+        "affinity_pred_value": out["affinity_pred_value"],
+        "affinity_probability_binary": out["affinity_probability_binary"],
+        "error": f"partial: {skip_reason}" if skip_reason else "",
+        "time_ms": f"{elapsed_ms:.1f}",
+    })
+    return row
+
+
+def _write_rows(output_path: Path, rows) -> None:
+    if rows:
+        with output_path.open("a", newline="") as f:
+            csv.DictWriter(f, fieldnames=FIELDNAMES).writerows(rows)
+
+
+# ── Complex parsing ────────────────────────────────────────────────────
+
+
+def _compound_id_from_cif(cif_path: Path) -> str:
+    """Strip Boltz's ``_model_0`` suffix written by the predictor."""
+    stem = cif_path.stem
+    return stem[: -len("_model_0")] if stem.endswith("_model_0") else stem
+
+
+def _parse_complex(cif_path: Path, smiles: str):
+    """Split a predicted complex into protein atoms + canonicalised ligand
+    atoms, and recover the protein sequence. Returns
+    ``(protein_atoms, ligand_atoms, protein_chain_id, protein_seq, error)``.
+    """
     from boltz.affinity_rescoring.parsers import (
         get_chain_sequences,
         get_seqres_sequences,
         parse_structure_file,
     )
-    from boltz.data import const
+
+    try:
+        all_atoms, _meta = parse_structure_file(cif_path)
+    except Exception as exc:  # noqa: BLE001
+        return None, None, None, None, f"parse_structure_file: {exc}"
+
+    protein_chain_id = "A"
+    ligand_chain_id_in_cif = "B"
+    protein_atoms = [a for a in all_atoms if a.chain_id == protein_chain_id]
+    cif_ligand_atoms = [
+        a for a in all_atoms
+        if a.chain_id == ligand_chain_id_in_cif and a.is_hetatm
+    ]
+    if not protein_atoms or not cif_ligand_atoms:
+        return None, None, None, None, (
+            f"missing_protein_or_ligand_chain "
+            f"(A={len(protein_atoms)} B_HETATM={len(cif_ligand_atoms)})"
+        )
+
+    merged_refs = get_seqres_sequences(cif_path)
+    sequences = get_chain_sequences(protein_atoms, reference_sequences=merged_refs)
+    if protein_chain_id not in sequences:
+        protein_chain_id = next(iter(sequences))
+    protein_seq = sequences[protein_chain_id]
+
+    shim = _LigandFromCif(_compound_id_from_cif(cif_path), cif_ligand_atoms)
+    ligand_atoms = remap_or_passthrough(shim, smiles, "L")
+
+    return protein_atoms, ligand_atoms, protein_chain_id, protein_seq, None
+
+
+# ── Per-receptor runner ────────────────────────────────────────────────
+
+
+def run_for_receptor(args: argparse.Namespace) -> int:
+    """Run the requested ablation set for every predicted complex."""
+    from boltz.affinity_rescoring.inference import (
+        _affinity_input_embed_with_ablation,
+        _build_cross_pair_mask,
+        _get_module,
+        affinity_head_forward,
+        affinity_trunk_forward,
+    )
+    from boltz.affinity_rescoring.inference import AffinityModelManager
+    from boltz.affinity_rescoring.models import DeviceOption
     from boltz.data.crop.affinity import AffinityCropper
     from boltz.data.feature.featurizerv2 import Boltz2Featurizer
-    from boltz.data.mol import load_canonicals, load_molecules
-    from boltz.data.module.inferencev2 import load_input
+    from boltz.data.mol import load_canonicals
     from boltz.data.tokenize.boltz2 import Boltz2Tokenizer
-    from boltz.data.types import Record, StructureV2
-    from boltz.main import process_input
 
     receptor_id = args.receptor
-
-    # This runner only implements the ``zero`` operator: it drives the
-    # affinity head straight off ``exp.zero_*``/``distogram_mask_mode``.
-    # A resample/mean experiment leaves every one of those flags unset, so
-    # running one here would silently produce an *unablated baseline* number
-    # filed under the resample name -- corrupting any downstream Shapley/NAE
-    # that consumed it. Those operators need the donor trunk cache and the
-    # two-pass flow in run_feature_ablation.py. Checked before the model
-    # load so this fails in seconds, not after a checkpoint load.
-    non_zero_ops = [n for n in args.experiments if EXPERIMENTS[n].operator != "zero"]
-    if non_zero_ops:
-        logger.error(
-            f"[{receptor_id}] This DUDEZ runner supports only the 'zero' ablation "
-            f"operator, but {len(non_zero_ops)} requested experiment(s) use "
-            f"resample/mean: {non_zero_ops[:5]}"
-            f"{' ...' if len(non_zero_ops) > 5 else ''}. "
-            f"Run those through run_feature_ablation.py, which owns the donor "
-            f"trunk cache the resample/mean operators need."
-        )
-        return 2
-
-    structures_dir, smiles_csv, msa_path, output_path = resolve_inputs(args)
-    logger.info(f"[{receptor_id}] structures: {structures_dir}")
-    logger.info(f"[{receptor_id}] smiles    : {smiles_csv}")
-    logger.info(f"[{receptor_id}] MSA       : {msa_path}")
-    logger.info(f"[{receptor_id}] output    : {output_path}")
+    structures_dir, smiles_csv, msa_path, output_path, trunk_cache_dir = resolve_inputs(args)
+    logger.info(f"[{receptor_id}] structures : {structures_dir}")
+    logger.info(f"[{receptor_id}] smiles     : {smiles_csv}")
+    logger.info(f"[{receptor_id}] MSA        : {msa_path}")
+    logger.info(f"[{receptor_id}] trunk cache: {trunk_cache_dir}")
+    logger.info(f"[{receptor_id}] output     : {output_path}")
 
     smiles_table = load_smiles_table(smiles_csv)
     logger.info(f"[{receptor_id}] SMILES table rows: {len(smiles_table)}")
@@ -321,6 +462,7 @@ def run_for_receptor(args: argparse.Namespace) -> int:
     )
     cache_dir = manager.cache_dir
     device = next(model.parameters()).device
+    model_dtype = next(model.parameters()).dtype
     mol_dir = cache_dir / "mols"
     ccd = load_canonicals(mol_dir)
     tokenizer = Boltz2Tokenizer()
@@ -328,23 +470,24 @@ def run_for_receptor(args: argparse.Namespace) -> int:
     featurizer = Boltz2Featurizer()
 
     experiments: list[AblationExperiment] = [EXPERIMENTS[n] for n in args.experiments]
-    logger.info(f"Running {len(experiments)} experiments per ligand.")
+    n_ops = len({e.operator for e in experiments})
+    logger.info(
+        f"Running {len(experiments)} experiments per ligand "
+        f"({n_ops} operator(s): {sorted({e.operator for e in experiments})})."
+    )
 
-    # Discover CIFs and apply class filter
+    # ── Discover complexes and apply class filter
     cif_files = sorted(structures_dir.glob("*.cif"))
     if not cif_files:
         logger.error(f"[{receptor_id}] No CIFs found under {structures_dir}.")
         return 2
 
-    def _compound_id(cif_path: Path) -> str:
-        # Strip Boltz's "_model_0" suffix written by the predictor
-        stem = cif_path.stem
-        return stem[: -len("_model_0")] if stem.endswith("_model_0") else stem
-
-    candidates = []
+    candidates: List[Tuple[str, Path]] = []
+    n_no_manifest = 0
     for p in cif_files:
-        cid = _compound_id(p)
+        cid = _compound_id_from_cif(p)
         if cid not in smiles_table:
+            n_no_manifest += 1
             continue
         if args.actives_only and not smiles_table[cid]["is_binder"]:
             continue
@@ -353,315 +496,238 @@ def run_for_receptor(args: argparse.Namespace) -> int:
         candidates.append((cid, p))
     if args.max_ligands is not None:
         candidates = candidates[: args.max_ligands]
+
+    n_actives = sum(1 for c, _ in candidates if smiles_table[c]["is_binder"])
     logger.info(
-        f"[{receptor_id}] {len(candidates)} ligands to process "
-        f"(actives_only={args.actives_only}, decoys_only={args.decoys_only}, "
-        f"max_ligands={args.max_ligands})"
+        f"[{receptor_id}] {len(candidates)} complexes to process "
+        f"({n_actives} actives / {len(candidates) - n_actives} decoys; "
+        f"{n_no_manifest} CIFs skipped: not in manifest)"
     )
 
-    # ── CSV writer (incremental)
-    fieldnames = [
-        "receptor_id", "compound_id", "is_binder", "experiment",
-        "affinity_pred_value", "affinity_probability_binary",
-        "pose_noise_sigma", "pose_noise_target", "pose_noise_seed",
-        "error", "time_ms",
-    ]
+    def featurize(compound_id: str, cif_path: Path):
+        """Parse + featurize one predicted complex. Returns (batch, error)."""
+        smiles = smiles_table[compound_id]["smiles"]
+        prot, lig, chain_id, seq, err = _parse_complex(cif_path, smiles)
+        if err is not None:
+            return None, err
+        return featurize_complex(
+            protein_atoms=prot,
+            ligand_atoms_remapped=lig,
+            smiles=smiles,
+            protein_chain_id=chain_id,
+            protein_seq=seq,
+            msa_path=str(msa_path),
+            ccd=ccd,
+            mol_dir=mol_dir,
+            tokenizer=tokenizer,
+            cropper=cropper,
+            featurizer=featurizer,
+            device=device,
+        )
+
+    # ── CSV header
     with output_path.open("w", newline="") as f:
-        csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+        csv.DictWriter(f, fieldnames=FIELDNAMES).writeheader()
 
-    work_root = Path(tempfile.mkdtemp(prefix=f"dudez_{receptor_id}_"))
-    n_done = n_failed = 0
     t_start = time.perf_counter()
-    try:
-        for lig_idx, (compound_id, cif_path) in enumerate(candidates, 1):
-            class_label = "active" if smiles_table[compound_id]["is_binder"] else "decoy"
-            logger.info(
-                f"[{receptor_id}] {lig_idx}/{len(candidates)} {compound_id} "
-                f"({class_label})"
-            )
 
-            # ── Parse the predicted complex CIF
+    # ── Donor pool (storage-aware) ──────────────────────────────────
+    # The disk cache exists ONLY to supply donor channels for
+    # resample/mean. A zero-only run never looks at another ligand's trunk,
+    # so it writes nothing at all -- the query's trunk is computed once and
+    # kept in memory just long enough to replay that ligand's experiments.
+    # When donors ARE needed we cache a bounded, stratified pool rather than
+    # every ligand: entries are ~16 MB each (z is N*N*token_z fp16), so a
+    # full cache would be hundreds of GB per receptor.
+    needs_donors = any(e.operator != "zero" for e in experiments)
+    donor_pool: List[str] = []
+    n_cache_built = n_cache_failed = 0
+
+    if not needs_donors:
+        logger.info(
+            f"[{receptor_id}] zero-operator experiments only -- no trunk cache "
+            f"will be written (saves ~"
+            f"{trunk_cache.format_bytes(trunk_cache.bytes_per_entry() * len(candidates))})."
+        )
+    else:
+        strata = {cid: smiles_table[cid]["is_binder"] for cid, _ in candidates}
+        donor_pool = trunk_cache.select_donor_pool(
+            [cid for cid, _ in candidates],
+            pool_size=args.donor_pool_size,
+            rng=np.random.default_rng(args.donor_pool_seed),
+            strata=strata,
+        )
+        est = trunk_cache.bytes_per_entry() * len(donor_pool)
+        logger.info(
+            f"[{receptor_id}] resample/mean requested -- caching a donor pool of "
+            f"{len(donor_pool)}/{len(candidates)} ligands "
+            f"(~{trunk_cache.format_bytes(est)} on disk) at {trunk_cache_dir}"
+        )
+
+        cif_by_cid = dict(candidates)
+        for i, cid in enumerate(donor_pool, 1):
+            if not args.rebuild_trunk_cache and trunk_cache.load_cache_entry(
+                trunk_cache_dir, receptor_id, cid
+            ) is not None:
+                continue
+            batch, err = featurize(cid, cif_by_cid[cid])
+            if err is not None:
+                logger.warning(f"[{receptor_id}] donor {cid}: featurization failed: {err}")
+                n_cache_failed += 1
+                continue
             try:
-                all_atoms, _meta = parse_structure_file(cif_path)
+                trunk_out = affinity_trunk_forward(model, batch, recycling_steps=args.recycling_steps)
+                s_inputs = _affinity_input_embed_with_ablation(model, batch)
+                token_repr_pos = batch["token_to_rep_atom"][0].float() @ _coords_affinity(batch)[0]
+                trunk_cache.save_cache_entry(
+                    trunk_cache_dir, receptor_id, cid,
+                    z=trunk_out["z"], s_inputs=s_inputs, token_repr_pos=token_repr_pos,
+                    use_kernels=trunk_out["use_kernels"],
+                    meta={"recycling_steps": args.recycling_steps, "source": "dudez_cif",
+                          "role": "donor_pool"},
+                )
+                n_cache_built += 1
+                logger.info(f"[{receptor_id}] cached donor {i}/{len(donor_pool)}: {cid}")
             except Exception as exc:  # noqa: BLE001
-                logger.error(f"  parse failed: {exc}")
-                _write_failed_rows(
-                    output_path, fieldnames, receptor_id, compound_id,
-                    smiles_table[compound_id]["is_binder"], experiments,
-                    f"parse_structure_file: {exc}",
-                )
-                n_failed += 1
-                continue
+                logger.error(f"[{receptor_id}] donor {cid}: trunk forward failed: {exc}")
+                n_cache_failed += 1
 
-            protein_chain_id = "A"
-            ligand_chain_id_in_cif = "B"
-            protein_atoms = [a for a in all_atoms if a.chain_id == protein_chain_id]
-            cif_ligand_atoms = [
-                a for a in all_atoms
-                if a.chain_id == ligand_chain_id_in_cif and a.is_hetatm
-            ]
-            if not protein_atoms or not cif_ligand_atoms:
-                logger.warning(
-                    f"  skipping {compound_id}: chains A={len(protein_atoms)} "
-                    f"B(HETATM)={len(cif_ligand_atoms)}"
-                )
-                _write_failed_rows(
-                    output_path, fieldnames, receptor_id, compound_id,
-                    smiles_table[compound_id]["is_binder"], experiments,
-                    "missing_protein_or_ligand_chain",
-                )
-                n_failed += 1
-                continue
+        logger.info(
+            f"[{receptor_id}] donor cache: {n_cache_built} built, {n_cache_failed} failed, "
+            f"{trunk_cache.format_bytes(trunk_cache.cache_size_bytes(trunk_cache_dir, receptor_id))} on disk"
+        )
 
-            merged_refs = get_seqres_sequences(cif_path)
-            sequences = get_chain_sequences(
-                protein_atoms, reference_sequences=merged_refs,
-            )
-            if protein_chain_id not in sequences:
-                protein_chain_id = next(iter(sequences))
-            protein_seq = sequences[protein_chain_id]
+    # ── Replay pass ─────────────────────────────────────────────────
+    # The query's own trunk is computed here and held in memory only for the
+    # duration of this ligand -- it is never written to disk. Only donor-pool
+    # members live on disk, and only when resample/mean is in play.
+    n_done = n_failed = 0
+    for idx, (compound_id, cif_path) in enumerate(candidates, 1):
+        is_binder = smiles_table[compound_id]["is_binder"]
+        class_label = "active" if is_binder else "decoy"
+        logger.info(f"[{receptor_id}] {idx}/{len(candidates)} {compound_id} ({class_label})")
 
-            smiles = smiles_table[compound_id]["smiles"]
+        batch, err = featurize(compound_id, cif_path)
+        if err is not None:
+            logger.warning(f"  featurization failed: {err}")
+            _write_rows(output_path, [
+                _error_row(receptor_id, compound_id, is_binder, e, err) for e in experiments
+            ])
+            n_failed += 1
+            continue
 
-            # Re-map ligand atom names to canonical RDKit ranks.
-            ligand_chain_id = "L"
-            shim = _LigandFromCif(compound_id, cif_ligand_atoms)
-            remapped = _remap_ligand_atoms(shim, smiles, ligand_chain_id)
-            if remapped is None:
-                from boltz.affinity_rescoring.models import AtomInfo as _AI
-                remapped = [
-                    _AI(
-                        index=a.index, name=a.name, element=a.element,
-                        x=a.x, y=a.y, z=a.z, chain_id=ligand_chain_id,
-                        residue_name=a.residue_name,
-                        residue_number=a.residue_number,
-                        occupancy=a.occupancy, b_factor=a.b_factor,
-                        is_hetatm=True,
+        # Reuse the donor-pool entry when this ligand happens to be in it,
+        # otherwise run the trunk once, in memory.
+        entry = trunk_cache.load_cache_entry(trunk_cache_dir, receptor_id, compound_id) \
+            if needs_donors else None
+        try:
+            if entry is not None:
+                query_n_tokens = entry["n_tokens"]
+                trunk_out = {
+                    "z": entry["z"].to(device=device, dtype=model_dtype).unsqueeze(0),
+                    "use_kernels": entry["use_kernels"],
+                }
+            else:
+                _t = affinity_trunk_forward(model, batch, recycling_steps=args.recycling_steps)
+                trunk_out = {"z": _t["z"], "use_kernels": _t["use_kernels"]}
+                query_n_tokens = int(_t["z"].shape[1])
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"  trunk forward failed: {exc}")
+            _write_rows(output_path, [
+                _error_row(receptor_id, compound_id, is_binder, e, f"trunk forward: {exc}")
+                for e in experiments
+            ])
+            n_failed += 1
+            continue
+
+        rows = []
+        for exp in experiments:
+            t0 = time.perf_counter()
+            try:
+                if exp.operator == "zero":
+                    out = affinity_head_forward(
+                        model, batch, trunk_out,
+                        zero_z_trunk=exp.zero_z_trunk,
+                        zero_s_inputs=exp.zero_s_inputs,
+                        disable_distogram=(exp.distogram_mask_mode == "zero_all"),
+                        zero_atom_encoder=exp.zero_atom_encoder,
+                        zero_msa_profile=exp.zero_msa_profile,
+                        zero_res_type=exp.zero_res_type,
+                        pose_noise_sigma=exp.pose_noise_sigma,
+                        pose_noise_seed=exp.pose_noise_seed,
+                        pose_noise_target=exp.pose_noise_target,
                     )
-                    for a in cif_ligand_atoms
-                ]
-            combined_atoms = list(protein_atoms) + remapped
+                    donor_ids: Dict[str, str] = {}
+                    skip_reason = None
+                else:
+                    out, donor_ids, skip_reason = _run_resample_or_mean(
+                        model, batch, trunk_out, exp,
+                        trunk_cache_dir, receptor_id, compound_id, query_n_tokens,
+                        _affinity_input_embed_with_ablation, _build_cross_pair_mask, _get_module,
+                    )
+                    if out is None:
+                        raise RuntimeError(f"resample/mean skipped: {skip_reason}")
 
-            work_dir = Path(tempfile.mkdtemp(prefix="lig_", dir=work_root))
-            try:
-                # ── Build YAML pinning the cached MSA path
-                yaml_data = {
-                    "version": 1,
-                    "sequences": [
-                        {
-                            "protein": {
-                                "id": protein_chain_id,
-                                "sequence": protein_seq,
-                                "msa": str(msa_path),
-                            }
-                        },
-                        {"ligand": {"id": ligand_chain_id, "smiles": smiles}},
-                    ],
-                    "properties": [
-                        {"affinity": {"binder": ligand_chain_id}},
-                    ],
-                }
-                yaml_path = work_dir / "input.yaml"
-                yaml_path.write_text(yaml.dump(yaml_data, default_flow_style=False))
-
-                out_dir = work_dir / "output"
-                msa_dir = out_dir / "msa"
-                records_dir = out_dir / "processed" / "records"
-                structure_dir = out_dir / "processed" / "structures"
-                processed_msa_dir = out_dir / "processed" / "msa"
-                processed_constraints_dir = out_dir / "processed" / "constraints"
-                processed_templates_dir = out_dir / "processed" / "templates"
-                processed_mols_dir = out_dir / "processed" / "mols"
-                predictions_dir = out_dir / "predictions"
-                for d in [out_dir, msa_dir, records_dir, structure_dir,
-                          processed_msa_dir, processed_constraints_dir,
-                          processed_templates_dir, processed_mols_dir,
-                          predictions_dir]:
-                    d.mkdir(parents=True, exist_ok=True)
-
-                process_input(
-                    path=yaml_path, ccd=ccd, msa_dir=msa_dir, mol_dir=mol_dir,
-                    boltz2=True, use_msa_server=False,
-                    msa_server_url="https://api.colabfold.com",
-                    msa_pairing_strategy="paired+unpaired",
-                    msa_server_username=None, msa_server_password=None,
-                    api_key_header=None, api_key_value=None,
-                    max_msa_seqs=8192,
-                    processed_msa_dir=processed_msa_dir,
-                    processed_constraints_dir=processed_constraints_dir,
-                    processed_templates_dir=processed_templates_dir,
-                    processed_mols_dir=processed_mols_dir,
-                    structure_dir=structure_dir, records_dir=records_dir,
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                rows.append(_result_row(
+                    receptor_id, compound_id, is_binder, exp, out, elapsed_ms,
+                    query_n_tokens, donor_ids, skip_reason,
+                ))
+                logger.info(
+                    f"  [{exp.name}] pred={out['affinity_pred_value']:.4f} "
+                    f"prob={out['affinity_probability_binary']:.4f} ({elapsed_ms:.0f}ms)"
                 )
-
-                record_files = list(records_dir.glob("*.json"))
-                if not record_files:
-                    raise RuntimeError("process_input produced no records.")
-                record = Record.load(record_files[0])
-                processed_struct = StructureV2.load(
-                    structure_dir / f"{record.id}.npz"
-                )
-
-                chain_id_map_yaml = {
-                    protein_chain_id: protein_chain_id,
-                    ligand_chain_id: ligand_chain_id,
-                }
-                yaml_chain_ids = list(chain_id_map_yaml.values())
-                asym_map = build_chain_id_map(processed_struct, yaml_chain_ids)
-                full_map = {
-                    pdb_cid: asym_map[yaml_cid]
-                    for pdb_cid, yaml_cid in chain_id_map_yaml.items()
-                    if yaml_cid in asym_map
-                }
-                injected, _ = inject_pdb_coords_into_structure(
-                    processed_struct, combined_atoms, full_map,
-                )
-                save_pre_affinity_structure(injected, predictions_dir, record.id)
-
-                input_data = load_input(
-                    record=record, target_dir=predictions_dir,
-                    msa_dir=processed_msa_dir,
-                    constraints_dir=processed_constraints_dir,
-                    template_dir=processed_templates_dir,
-                    extra_mols_dir=processed_mols_dir, affinity=True,
-                )
-                tokenized = tokenizer.tokenize(input_data)
-                tokenized = cropper.crop(
-                    tokenized, max_tokens=256, max_atoms=2048,
-                )
-
-                molecules = dict(ccd)
-                if input_data.extra_mols:
-                    molecules.update(input_data.extra_mols)
-                needed = (
-                    set(tokenized.tokens["res_name"].tolist()) - set(molecules.keys())
-                )
-                molecules.update(load_molecules(mol_dir, needed))
-
-                random = np.random.default_rng(42)
-                features = featurizer.process(
-                    tokenized, molecules=molecules, random=random,
-                    training=False, max_atoms=None, max_tokens=None,
-                    max_seqs=const.max_msa_seqs, pad_to_max_seqs=False,
-                    single_sequence_prop=0.0, compute_frames=True,
-                    inference_pocket_constraints=None,
-                    inference_contact_constraints=None,
-                    compute_constraint_features=True, override_method=None,
-                    compute_affinity=True,
-                )
-
-                batch = {}
-                for k, v in features.items():
-                    if isinstance(v, Tensor):
-                        batch[k] = v.unsqueeze(0).to(device)
-                    elif isinstance(v, np.ndarray):
-                        batch[k] = torch.from_numpy(v).unsqueeze(0).to(device)
-                    elif k == "affinity_mw":
-                        batch[k] = [v]
-                    else:
-                        batch[k] = v
-
-                # ── Run every requested ablation against the affinity head
-                rows = []
-                for exp in experiments:
-                    t0 = time.perf_counter()
-                    try:
-                        disable_distogram = exp.distogram_mask_mode == "zero_all"
-                        out = affinity_forward(
-                            model, batch,
-                            recycling_steps=args.recycling_steps,
-                            zero_z_trunk=exp.zero_z_trunk,
-                            zero_s_inputs=exp.zero_s_inputs,
-                            disable_distogram=disable_distogram,
-                            zero_atom_encoder=exp.zero_atom_encoder,
-                            zero_msa_profile=exp.zero_msa_profile,
-                            zero_res_type=exp.zero_res_type,
-                            pose_noise_sigma=exp.pose_noise_sigma,
-                            pose_noise_seed=exp.pose_noise_seed,
-                            pose_noise_target=exp.pose_noise_target,
-                        )
-                        elapsed_ms = (time.perf_counter() - t0) * 1000
-                        rows.append({
-                            "receptor_id": receptor_id,
-                            "compound_id": compound_id,
-                            "is_binder": int(smiles_table[compound_id]["is_binder"]),
-                            "experiment": exp.name,
-                            "affinity_pred_value": out["affinity_pred_value"],
-                            "affinity_probability_binary": out["affinity_probability_binary"],
-                            "pose_noise_sigma": exp.pose_noise_sigma,
-                            "pose_noise_target": exp.pose_noise_target,
-                            "pose_noise_seed": (
-                                "" if exp.pose_noise_seed is None
-                                else exp.pose_noise_seed
-                            ),
-                            "error": "",
-                            "time_ms": f"{elapsed_ms:.1f}",
-                        })
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error(f"  [{exp.name}] FAILED: {exc}")
-                        rows.append({
-                            "receptor_id": receptor_id,
-                            "compound_id": compound_id,
-                            "is_binder": int(smiles_table[compound_id]["is_binder"]),
-                            "experiment": exp.name,
-                            "affinity_pred_value": "",
-                            "affinity_probability_binary": "",
-                            "pose_noise_sigma": exp.pose_noise_sigma,
-                            "pose_noise_target": exp.pose_noise_target,
-                            "pose_noise_seed": (
-                                "" if exp.pose_noise_seed is None
-                                else exp.pose_noise_seed
-                            ),
-                            "error": str(exc),
-                            "time_ms": "",
-                        })
-
-                with output_path.open("a", newline="") as f:
-                    csv.DictWriter(f, fieldnames=fieldnames).writerows(rows)
-                n_done += 1
-
             except Exception as exc:  # noqa: BLE001
-                logger.exception(f"  failed to process {compound_id}: {exc}")
-                _write_failed_rows(
-                    output_path, fieldnames, receptor_id, compound_id,
-                    smiles_table[compound_id]["is_binder"], experiments, str(exc),
-                )
-                n_failed += 1
-            finally:
-                shutil.rmtree(work_dir, ignore_errors=True)
-    finally:
-        shutil.rmtree(work_root, ignore_errors=True)
+                logger.error(f"  [{exp.name}] FAILED: {exc}")
+                rows.append(_error_row(receptor_id, compound_id, is_binder, exp, str(exc)))
+
+        _write_rows(output_path, rows)
+        n_done += 1
+
+    cache_bytes = trunk_cache.cache_size_bytes(trunk_cache_dir, receptor_id)
+    if needs_donors and not args.keep_trunk_cache:
+        shutil.rmtree(trunk_cache_dir / receptor_id, ignore_errors=True)
+        logger.info(
+            f"[{receptor_id}] removed donor cache "
+            f"({trunk_cache.format_bytes(cache_bytes)} reclaimed). "
+            f"Pass --keep-trunk-cache to retain it."
+        )
 
     elapsed = time.perf_counter() - t_start
     logger.info(
         f"[{receptor_id}] DONE — {n_done} ok, {n_failed} failed, "
+        f"{n_cache_failed} cache failures, {n_no_manifest} not in manifest, "
         f"{elapsed:.1f}s, output: {output_path}"
     )
+
+    meta = trunk_cache.run_metadata({
+        "runner": "run_feature_ablation_dudez.py",
+        "receptor": receptor_id,
+        "config_hash": hashlib.sha256(",".join(sorted(args.experiments)).encode()).hexdigest()[:16],
+        "experiments": args.experiments,
+        "recycling_steps": args.recycling_steps,
+        "max_ligands": args.max_ligands,
+        "structures_dir": str(structures_dir),
+        "smiles_csv": str(smiles_csv),
+        "msa_path": str(msa_path),
+        "trunk_cache_dir": str(trunk_cache_dir),
+        "checkpoint": args.checkpoint,
+        "n_candidates": len(candidates),
+        "n_ok": n_done,
+        "n_failed": n_failed,
+        "n_cache_failed": n_cache_failed,
+        "n_not_in_manifest": n_no_manifest,
+        "needs_donors": needs_donors,
+        "donor_pool_size": len(donor_pool),
+        "donor_pool_seed": args.donor_pool_seed,
+        "donor_cache_bytes": cache_bytes,
+        "donor_cache_kept": bool(args.keep_trunk_cache),
+        "wall_time_s": elapsed,
+    })
+    sidecar = trunk_cache.write_json_sidecar(output_path, meta)
+    logger.info(f"[{receptor_id}] sidecar: {sidecar}")
+
     return 0
-
-
-def _write_failed_rows(output_path, fieldnames, receptor_id, compound_id,
-                       is_binder, experiments, message: str) -> None:
-    rows = [
-        {
-            "receptor_id": receptor_id,
-            "compound_id": compound_id,
-            "is_binder": int(bool(is_binder)),
-            "experiment": exp.name,
-            "affinity_pred_value": "",
-            "affinity_probability_binary": "",
-            "pose_noise_sigma": exp.pose_noise_sigma,
-            "pose_noise_target": exp.pose_noise_target,
-            "pose_noise_seed": (
-                "" if exp.pose_noise_seed is None else exp.pose_noise_seed
-            ),
-            "error": message,
-            "time_ms": "",
-        }
-        for exp in experiments
-    ]
-    with output_path.open("a", newline="") as f:
-        csv.DictWriter(f, fieldnames=fieldnames).writerows(rows)
 
 
 def main() -> int:

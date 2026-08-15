@@ -252,6 +252,78 @@ class TestJackknifeAndBCa:
         assert np.isnan(lo) and np.isnan(hi)
 
 
+class TestLabelActivesDecoys:
+    """The DUDEZ runner writes an authoritative is_binder column; the MOL2
+    runner does not. Getting this wrong is silent and total -- a dataset
+    whose decoys aren't ZINC-prefixed would come back with zero decoys."""
+
+    def _frame(self, rows):
+        import pandas as pd
+        return pd.DataFrame(rows)
+
+    def test_prefers_is_binder_when_present(self):
+        df = self._frame([
+            {"ligand_id": "CHEMBL1", "is_binder": 1},
+            {"ligand_id": "CHEMBL2", "is_binder": 0},
+            {"ligand_id": "CHEMBL3", "is_binder": 1},
+        ])
+        act, dec, src = lu.label_actives_decoys(df)
+        assert src == "is_binder"
+        assert act == {"CHEMBL1", "CHEMBL3"}
+        assert dec == {"CHEMBL2"}
+
+    def test_is_binder_accepts_string_truthy_forms(self):
+        df = self._frame([
+            {"ligand_id": "a", "is_binder": "True"},
+            {"ligand_id": "b", "is_binder": "false"},
+            {"ligand_id": "c", "is_binder": "yes"},
+            {"ligand_id": "d", "is_binder": "0"},
+        ])
+        act, dec, src = lu.label_actives_decoys(df)
+        assert src == "is_binder"
+        assert act == {"a", "c"}
+        assert dec == {"b", "d"}
+
+    def test_non_zinc_decoys_labelled_correctly_via_is_binder(self):
+        # The exact failure the column exists to prevent: none of these are
+        # ZINC-prefixed, so the heuristic would call them all actives.
+        df = self._frame([
+            {"ligand_id": "CHEMBL100", "is_binder": 1},
+            {"ligand_id": "DECOY_a", "is_binder": 0},
+            {"ligand_id": "DECOY_b", "is_binder": 0},
+        ])
+        act, dec, src = lu.label_actives_decoys(df)
+        assert src == "is_binder"
+        assert dec == {"DECOY_a", "DECOY_b"}
+
+    def test_falls_back_to_name_prefix_without_column(self):
+        df = self._frame([
+            {"ligand_id": "lig1"}, {"ligand_id": "ZINC000123"},
+        ])
+        act, dec, src = lu.label_actives_decoys(df)
+        assert src == "name_prefix"
+        assert act == {"lig1"}
+        assert dec == {"ZINC000123"}
+
+    def test_falls_back_when_column_is_all_null(self):
+        df = self._frame([
+            {"ligand_id": "lig1", "is_binder": None},
+            {"ligand_id": "ZINC000123", "is_binder": None},
+        ])
+        act, dec, src = lu.label_actives_decoys(df)
+        assert src == "name_prefix"
+        assert dec == {"ZINC000123"}
+
+    def test_name_prefix_heuristic_would_mislabel_non_zinc_decoys(self):
+        # Documents why the is_binder column matters: same compounds, no
+        # label column -> every decoy silently becomes an active.
+        df = self._frame([{"ligand_id": "CHEMBL100"}, {"ligand_id": "DECOY_a"}])
+        act, dec, src = lu.label_actives_decoys(df)
+        assert src == "name_prefix"
+        assert dec == set()          # <- the silent failure
+        assert act == {"CHEMBL100", "DECOY_a"}
+
+
 class TestPolarityWarning:
     def test_no_warning_near_zero(self):
         assert lu.polarity_warning("Method", 2.0) is None

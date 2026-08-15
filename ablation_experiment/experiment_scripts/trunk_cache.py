@@ -47,7 +47,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +191,93 @@ def find_donor(
 
 def all_other_ligands(cache_dir: Path, receptor_id: str, query_ligand_id: str) -> List[str]:
     return [lid for lid in list_cached_ligands(cache_dir, receptor_id) if lid != query_ligand_id]
+
+
+# ── donor pool sizing (storage) ─────────────────────────────────────────────
+
+DEFAULT_DONOR_POOL_SIZE = 64
+
+def bytes_per_entry(n_tokens: int = 256, token_z: int = 128, token_s: int = 384) -> int:
+    """Approximate on-disk size of one cache entry.
+
+    ``z`` dominates: it is (N, N, token_z) float16, so it grows with the
+    *square* of the token count -- ~16 MB at the cropper's 256-token limit.
+    That is why the cache must never hold every ligand (see
+    ``select_donor_pool``).
+    """
+    return n_tokens * n_tokens * token_z * 2 + n_tokens * token_s * 4 + n_tokens * 3 * 4
+
+
+def cache_size_bytes(cache_dir: Path, receptor_id: Optional[str] = None) -> int:
+    """Actual bytes on disk under the cache (optionally one receptor)."""
+    root = cache_dir / receptor_id if receptor_id else cache_dir
+    if not root.exists():
+        return 0
+    return sum(p.stat().st_size for p in root.rglob("*.pt") if p.is_file())
+
+
+def format_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024.0
+    return f"{n:.1f} TB"
+
+
+def select_donor_pool(
+    candidate_ids: Sequence[str],
+    pool_size: int = DEFAULT_DONOR_POOL_SIZE,
+    rng=None,
+    strata: Optional[Dict[str, object]] = None,
+) -> List[str]:
+    """Choose a bounded, representative subset of ligands to cache as donors.
+
+    The cache exists solely to supply *donor* channels for the
+    ``resample``/``mean`` operators -- nothing needs every ligand's trunk on
+    disk. Caching all of them costs ~16 MB each (see ``bytes_per_entry``),
+    which is hundreds of GB per receptor at DUD-E/DUDEZ scale; a bounded
+    pool costs ~1 GB and is statistically ample, since ``resample`` draws
+    only 5 donors per query and ``mean`` is a sample mean either way.
+
+    Selection is random (seeded via ``rng``) rather than "first N", because
+    candidates usually arrive sorted and the head of the list can be all
+    actives -- which would make every donor an active. When ``strata`` maps
+    ligand id -> group (e.g. is_binder), the pool is drawn proportionally
+    from each group so it stays representative.
+
+    ``pool_size <= 0`` means "no limit" (cache everything) -- only sensible
+    for small receptors.
+    """
+    ids = list(candidate_ids)
+    if pool_size is None or pool_size <= 0 or len(ids) <= pool_size:
+        return ids
+
+    if rng is None:
+        import numpy as _np
+        rng = _np.random.default_rng(0)
+
+    if not strata:
+        idx = rng.choice(len(ids), size=pool_size, replace=False)
+        return [ids[i] for i in sorted(idx)]
+
+    groups: Dict[object, List[str]] = {}
+    for lid in ids:
+        groups.setdefault(strata.get(lid), []).append(lid)
+
+    chosen: List[str] = []
+    total = len(ids)
+    for key, members in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        # Proportional allocation, but never zero for a non-empty group --
+        # a donor pool with no decoys in it would be unrepresentative.
+        want = max(1, round(pool_size * len(members) / total))
+        want = min(want, len(members))
+        idx = rng.choice(len(members), size=want, replace=False)
+        chosen.extend(members[i] for i in idx)
+
+    if len(chosen) > pool_size:
+        idx = rng.choice(len(chosen), size=pool_size, replace=False)
+        chosen = [chosen[i] for i in sorted(idx)]
+    return sorted(chosen)
 
 
 # ── channel substitution ─────────────────────────────────────────────────────

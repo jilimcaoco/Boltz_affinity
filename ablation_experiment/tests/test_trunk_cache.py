@@ -193,3 +193,82 @@ class TestChannelSubstitution:
         out = tc.mean_channel("s_inputs", 4, [e_small, e_big])
         expected = (e_small["s_inputs"] + e_big["s_inputs"][:4]) / 2
         assert torch.allclose(out, expected)
+
+
+class TestDonorPoolSizing:
+    """The cache exists only to supply donors for resample/mean. Caching
+    every ligand costs ~16 MB each -- hundreds of GB per receptor at
+    DUD-E/DUDEZ scale -- so the pool must stay bounded and representative."""
+
+    def test_bytes_per_entry_is_dominated_by_z(self):
+        n, tz, ts = 256, 128, 384
+        total = tc.bytes_per_entry(n, tz, ts)
+        z_only = n * n * tz * 2
+        assert z_only / total > 0.95  # z is >95% of the entry
+
+    def test_bytes_per_entry_grows_quadratically_in_tokens(self):
+        small = tc.bytes_per_entry(128)
+        big = tc.bytes_per_entry(256)
+        assert big / small > 3.5  # ~4x for 2x tokens
+
+    def test_pool_caps_at_requested_size(self):
+        import numpy as np
+        ids = [f"lig{i}" for i in range(1000)]
+        pool = tc.select_donor_pool(ids, 64, np.random.default_rng(0))
+        assert len(pool) == 64
+        assert len(set(pool)) == 64
+        assert set(pool) <= set(ids)
+
+    def test_pool_passthrough_when_smaller_than_cap(self):
+        import numpy as np
+        ids = [f"lig{i}" for i in range(10)]
+        assert tc.select_donor_pool(ids, 64, np.random.default_rng(0)) == ids
+
+    def test_pool_size_zero_means_unlimited(self):
+        ids = [f"lig{i}" for i in range(500)]
+        assert len(tc.select_donor_pool(ids, 0)) == 500
+
+    def test_pool_is_not_just_the_head_of_the_list(self):
+        """Candidates usually arrive sorted, so 'first N' would make every
+        donor an active. Selection must be random."""
+        import numpy as np
+        ids = [f"CHEMBL{i:04d}" for i in range(100)] + [f"DECOY_{i:04d}" for i in range(900)]
+        pool = tc.select_donor_pool(ids, 64, np.random.default_rng(0))
+        assert pool != ids[:64]
+        assert any(p.startswith("DECOY_") for p in pool)
+
+    def test_stratified_pool_keeps_both_classes(self):
+        import numpy as np
+        ids = [f"CHEMBL{i:04d}" for i in range(50)] + [f"DECOY_{i:04d}" for i in range(950)]
+        strata = {i: i.startswith("CHEMBL") for i in ids}
+        pool = tc.select_donor_pool(ids, 64, np.random.default_rng(0), strata)
+        n_act = sum(1 for p in pool if p.startswith("CHEMBL"))
+        assert n_act >= 1                 # never zero actives
+        assert n_act < len(pool)          # never all actives
+        assert len(pool) <= 64
+
+    def test_pool_is_deterministic_for_a_seed(self):
+        import numpy as np
+        ids = [f"lig{i}" for i in range(500)]
+        a = tc.select_donor_pool(ids, 32, np.random.default_rng(7))
+        b = tc.select_donor_pool(ids, 32, np.random.default_rng(7))
+        assert a == b
+
+
+class TestCacheSizeReporting:
+    def test_empty_cache_is_zero_bytes(self, tmp_path):
+        assert tc.cache_size_bytes(tmp_path) == 0
+        assert tc.cache_size_bytes(tmp_path, "NOSUCH") == 0
+
+    def test_counts_written_entries(self, tmp_path):
+        for lig in ["a", "b"]:
+            tc.save_cache_entry(tmp_path, "REC", lig, z=torch.randn(1, 8, 8, 4),
+                                 s_inputs=torch.randn(1, 8, 3),
+                                 token_repr_pos=torch.randn(8, 3), use_kernels=False)
+        assert tc.cache_size_bytes(tmp_path, "REC") > 0
+        assert tc.cache_size_bytes(tmp_path) == tc.cache_size_bytes(tmp_path, "REC")
+
+    def test_format_bytes_units(self):
+        assert tc.format_bytes(512).endswith("B")
+        assert "MB" in tc.format_bytes(5 * 1024**2)
+        assert "GB" in tc.format_bytes(5 * 1024**3)

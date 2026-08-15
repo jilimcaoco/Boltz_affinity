@@ -350,6 +350,17 @@ def parse_args() -> argparse.Namespace:
                              "for resample/mean operators.")
     parser.add_argument("--rebuild-trunk-cache", action="store_true", default=False,
                         help="Recompute and overwrite cached trunk entries even if present.")
+    parser.add_argument("--donor-pool-size", type=int, default=trunk_cache.DEFAULT_DONOR_POOL_SIZE,
+                        help="How many ligands to cache as the donor pool for "
+                             "resample/mean. Each entry is ~16 MB (z is N*N*token_z), "
+                             "so caching every ligand costs hundreds of GB per receptor. "
+                             "0 = no limit. Ignored when no resample/mean experiment is "
+                             "requested -- then nothing is written to disk at all.")
+    parser.add_argument("--donor-pool-seed", type=int, default=0,
+                        help="Seed for which ligands land in the donor pool.")
+    parser.add_argument("--keep-trunk-cache", action="store_true", default=False,
+                        help="Keep the donor-pool cache after the run (default: delete it; "
+                             "it is a scratch artefact reproducible from the inputs).")
 
     # Output
     parser.add_argument("--output", "-o", type=Path,
@@ -451,12 +462,40 @@ def _remap_ligand_atoms(ligand, smiles, ligand_chain_id):
 
 # ── Per-ligand featurization (shared by both cache and replay passes) ──
 
-def _featurize_ligand(
-    ligand,
-    receptor_id: str,
+def remap_or_passthrough(ligand_like, smiles: str, ligand_chain_id: str = "L"):
+    """Canonicalise ligand atom names via RDKit, falling back to a
+    chain-reassigned copy of the input atoms when remapping fails.
+
+    Shared by both runners: the MOL2 path and the predicted-complex (CIF)
+    path need identical atom naming for ``process_input`` to line up.
+    """
+    remapped = _remap_ligand_atoms(ligand_like, smiles, ligand_chain_id)
+    if remapped is not None:
+        return remapped
+
+    from boltz.affinity_rescoring.models import AtomInfo as _AI
+    return [
+        _AI(
+            index=a.index, name=a.name, element=a.element,
+            x=a.x, y=a.y, z=a.z,
+            chain_id=ligand_chain_id,
+            residue_name=a.residue_name,
+            residue_number=a.residue_number,
+            occupancy=a.occupancy,
+            b_factor=a.b_factor,
+            is_hetatm=True,
+        )
+        for a in ligand_like.atoms
+    ]
+
+
+def featurize_complex(
+    *,
+    protein_atoms,
+    ligand_atoms_remapped,
+    smiles: str,
     protein_chain_id: str,
     protein_seq: str,
-    protein_atoms,
     msa_path: Optional[str],
     ccd,
     mol_dir: Path,
@@ -464,12 +503,23 @@ def _featurize_ligand(
     cropper,
     featurizer,
     device,
+    ligand_chain_id: str = "L",
 ) -> Tuple[Optional[dict], Optional[str]]:
-    """Run the full (cheap, CPU-side) featurization pipeline for one ligand
-    pose and return ``(batch, error)``. ``batch`` is None iff ``error`` is
-    set. This is intentionally re-run once per pass (cache pass + replay
-    pass) rather than cached itself -- unlike the trunk forward, this is not
-    the expensive step (see module docstring)."""
+    """Featurize one protein+ligand complex into a model-ready batch.
+
+    This is the shared CPU-side pipeline (YAML -> process_input -> coord
+    injection -> tokenize -> crop -> featurize) used by *both* ablation
+    runners. The runners differ only in how they obtain the inputs:
+    ``run_feature_ablation.py`` infers SMILES from MOL2 poses, while
+    ``run_feature_ablation_dudez.py`` reads authoritative SMILES from a
+    manifest and takes coordinates from a predicted complex CIF. Everything
+    downstream of that is identical, so it lives here rather than being
+    duplicated.
+
+    Returns ``(batch, error)``; ``batch`` is None iff ``error`` is set. Cheap
+    relative to the trunk forward, so it is re-run per pass rather than
+    cached (see module docstring).
+    """
     import numpy as np
     import torch
     from torch import Tensor
@@ -479,46 +529,13 @@ def _featurize_ligand(
         inject_pdb_coords_into_structure,
         save_pre_affinity_structure,
     )
-    from boltz.affinity_rescoring.mol2_parser import MOL2Parser  # noqa: F401 (import parity)
     from boltz.data import const
-    from boltz.data.crop.affinity import AffinityCropper  # noqa: F401 (import parity)
-    from boltz.data.feature.featurizerv2 import Boltz2Featurizer  # noqa: F401
     from boltz.data.mol import load_molecules
     from boltz.data.module.inferencev2 import load_input
     from boltz.data.types import Record, StructureV2
     from boltz.main import process_input
 
-    ligand_name = ligand.name
-
-    smiles = None
-    try:
-        from boltz.affinity_rescoring.smiles_inference import infer_smiles_from_atoms
-        smiles = infer_smiles_from_atoms(ligand.atoms)
-    except Exception:
-        pass
-
-    if smiles is None:
-        return None, "SMILES inference failed"
-
-    ligand_chain_id = "L"
-    ligand_atoms_remapped = _remap_ligand_atoms(ligand, smiles, ligand_chain_id)
-    if ligand_atoms_remapped is None:
-        from boltz.affinity_rescoring.models import AtomInfo as _AI
-        ligand_atoms_remapped = [
-            _AI(
-                index=a.index, name=a.name, element=a.element,
-                x=a.x, y=a.y, z=a.z,
-                chain_id=ligand_chain_id,
-                residue_name=a.residue_name,
-                residue_number=a.residue_number,
-                occupancy=a.occupancy,
-                b_factor=a.b_factor,
-                is_hetatm=True,
-            )
-            for a in ligand.atoms
-        ]
-
-    combined_atoms = list(protein_atoms) + ligand_atoms_remapped
+    combined_atoms = list(protein_atoms) + list(ligand_atoms_remapped)
 
     import tempfile
     import yaml
@@ -660,6 +677,57 @@ def _featurize_ligand(
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _featurize_ligand(
+    ligand,
+    receptor_id: str,
+    protein_chain_id: str,
+    protein_seq: str,
+    protein_atoms,
+    msa_path: Optional[str],
+    ccd,
+    mol_dir: Path,
+    tokenizer,
+    cropper,
+    featurizer,
+    device,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """MOL2-pose adapter over :func:`featurize_complex`.
+
+    Infers SMILES from the pose's atoms (RDKit bond perception) and
+    canonicalises atom names, then hands off to the shared featurizer. The
+    DUDEZ runner skips this adapter entirely because its SMILES come from a
+    manifest and need no inference.
+    """
+    smiles = None
+    try:
+        from boltz.affinity_rescoring.smiles_inference import infer_smiles_from_atoms
+        smiles = infer_smiles_from_atoms(ligand.atoms)
+    except Exception:
+        pass
+
+    if smiles is None:
+        return None, "SMILES inference failed"
+
+    ligand_chain_id = "L"
+    ligand_atoms_remapped = remap_or_passthrough(ligand, smiles, ligand_chain_id)
+
+    return featurize_complex(
+        protein_atoms=protein_atoms,
+        ligand_atoms_remapped=ligand_atoms_remapped,
+        smiles=smiles,
+        protein_chain_id=protein_chain_id,
+        protein_seq=protein_seq,
+        msa_path=msa_path,
+        ccd=ccd,
+        mol_dir=mol_dir,
+        tokenizer=tokenizer,
+        cropper=cropper,
+        featurizer=featurizer,
+        device=device,
+        ligand_chain_id=ligand_chain_id,
+    )
+
+
 def _coords_affinity(batch) -> "object":
     coords_affinity = batch["coords"].detach()
     if coords_affinity.dim() == 3:
@@ -683,6 +751,9 @@ def run_ablation_for_pair(
     cache_dir: Path,
     trunk_cache_dir: Path,
     rebuild_trunk_cache: bool,
+    donor_pool_size: int = trunk_cache.DEFAULT_DONOR_POOL_SIZE,
+    donor_pool_seed: int = 0,
+    keep_trunk_cache: bool = False,
     output_path: Optional[Path] = None,
     fieldnames: Optional[List[str]] = None,
 ) -> tuple:
@@ -779,41 +850,63 @@ def run_ablation_for_pair(
             msa_path, ccd, mol_dir, tokenizer, cropper, featurizer, device,
         )
 
-    # ── Pass 1: populate the trunk cache ────────────────────────────
-    n_cache_built = 0
-    n_cache_failed = 0
-    for lig_idx, ligand in enumerate(ligands):
-        ligand_name = ligand.name
-        if not rebuild_trunk_cache and trunk_cache.load_cache_entry(
-            trunk_cache_dir, receptor_id, ligand_name
-        ) is not None:
-            continue
+    # ── Donor pool (storage-aware) ──────────────────────────────────
+    # The disk cache exists ONLY to supply donor channels for
+    # resample/mean. A zero-only run never reads another ligand's trunk, so
+    # it writes nothing: the query's trunk is computed once and held in
+    # memory just long enough to replay that ligand's experiments. When
+    # donors ARE needed, cache a bounded pool rather than every ligand --
+    # entries are ~16 MB each (z is N*N*token_z fp16).
+    needs_donors = any(e.operator != "zero" for e in experiments)
+    donor_pool: List[str] = []
+    n_cache_built = n_cache_failed = 0
 
-        batch, err = featurize(ligand)
-        if err is not None:
-            logger.warning(f"[{receptor_id}] cache pass: {ligand_name} featurization failed: {err}")
-            n_cache_failed += 1
-            continue
-        try:
-            trunk_out = affinity_trunk_forward(model, batch, recycling_steps=recycling_steps)
-            s_inputs = _affinity_input_embed_with_ablation(model, batch)
-            token_to_rep_atom = batch["token_to_rep_atom"][0].float()
-            coords_affinity = _coords_affinity(batch)[0]
-            token_repr_pos = token_to_rep_atom @ coords_affinity
-            trunk_cache.save_cache_entry(
-                trunk_cache_dir, receptor_id, ligand_name,
-                z=trunk_out["z"], s_inputs=s_inputs, token_repr_pos=token_repr_pos,
-                use_kernels=trunk_out["use_kernels"],
-                meta={"recycling_steps": recycling_steps},
-            )
-            n_cache_built += 1
-            logger.info(f"[{receptor_id}] cached trunk {lig_idx + 1}/{len(ligands)}: {ligand_name}")
-        except Exception as e:
-            logger.error(f"[{receptor_id}] cache pass: {ligand_name} trunk forward failed: {e}")
-            n_cache_failed += 1
-
-    logger.info(f"[{receptor_id}] trunk cache: {n_cache_built} built, {n_cache_failed} failed, "
-                f"{len(trunk_cache.list_cached_ligands(trunk_cache_dir, receptor_id))} total cached")
+    if not needs_donors:
+        logger.info(
+            f"[{receptor_id}] zero-operator experiments only -- no trunk cache written "
+            f"(saves ~{trunk_cache.format_bytes(trunk_cache.bytes_per_entry() * len(ligands))})."
+        )
+    else:
+        ligand_by_name = {lg.name: lg for lg in ligands}
+        donor_pool = trunk_cache.select_donor_pool(
+            list(ligand_by_name.keys()),
+            pool_size=donor_pool_size,
+            rng=np.random.default_rng(donor_pool_seed),
+        )
+        est = trunk_cache.bytes_per_entry() * len(donor_pool)
+        logger.info(
+            f"[{receptor_id}] resample/mean requested -- caching a donor pool of "
+            f"{len(donor_pool)}/{len(ligands)} ligands (~{trunk_cache.format_bytes(est)})"
+        )
+        for i, lname in enumerate(donor_pool, 1):
+            if not rebuild_trunk_cache and trunk_cache.load_cache_entry(
+                trunk_cache_dir, receptor_id, lname
+            ) is not None:
+                continue
+            batch, err = featurize(ligand_by_name[lname])
+            if err is not None:
+                logger.warning(f"[{receptor_id}] donor {lname}: featurization failed: {err}")
+                n_cache_failed += 1
+                continue
+            try:
+                trunk_out = affinity_trunk_forward(model, batch, recycling_steps=recycling_steps)
+                s_inputs = _affinity_input_embed_with_ablation(model, batch)
+                token_repr_pos = batch["token_to_rep_atom"][0].float() @ _coords_affinity(batch)[0]
+                trunk_cache.save_cache_entry(
+                    trunk_cache_dir, receptor_id, lname,
+                    z=trunk_out["z"], s_inputs=s_inputs, token_repr_pos=token_repr_pos,
+                    use_kernels=trunk_out["use_kernels"],
+                    meta={"recycling_steps": recycling_steps, "role": "donor_pool"},
+                )
+                n_cache_built += 1
+                logger.info(f"[{receptor_id}] cached donor {i}/{len(donor_pool)}: {lname}")
+            except Exception as e:
+                logger.error(f"[{receptor_id}] donor {lname}: trunk forward failed: {e}")
+                n_cache_failed += 1
+        logger.info(
+            f"[{receptor_id}] donor cache: {n_cache_built} built, {n_cache_failed} failed, "
+            f"{trunk_cache.format_bytes(trunk_cache.cache_size_bytes(trunk_cache_dir, receptor_id))}"
+        )
 
     # ── Pass 2: replay every experiment against the cache ───────────
     n_done = 0
@@ -891,6 +984,14 @@ def run_ablation_for_pair(
         n_done += 1
 
     shutil.rmtree(msa_cache_dir, ignore_errors=True)
+
+    if needs_donors and not keep_trunk_cache:
+        reclaimed = trunk_cache.cache_size_bytes(trunk_cache_dir, receptor_id)
+        shutil.rmtree(trunk_cache_dir / receptor_id, ignore_errors=True)
+        logger.info(f"[{receptor_id}] removed donor cache "
+                    f"({trunk_cache.format_bytes(reclaimed)} reclaimed); "
+                    f"pass --keep-trunk-cache to retain it.")
+
     return n_done, n_failed
 
 
@@ -1165,6 +1266,9 @@ def main():
             cache_dir=cache_dir,
             trunk_cache_dir=args.trunk_cache_dir,
             rebuild_trunk_cache=args.rebuild_trunk_cache,
+            donor_pool_size=args.donor_pool_size,
+            donor_pool_seed=args.donor_pool_seed,
+            keep_trunk_cache=args.keep_trunk_cache,
             output_path=args.output,
             fieldnames=fieldnames,
         )

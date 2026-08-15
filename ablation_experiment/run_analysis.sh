@@ -9,6 +9,8 @@
 # a small CPU allocation.
 #
 # Stages:
+#   0a combine_dudez_results.py       (only with --from-dudez) merge the
+#                                    per-receptor DUDEZ CSVs into one table
 #   0  audit_tie_density.py           Task 0b -- HARD GATE, see below
 #   1  compute_ablation_bootstrap.py  Task 0/3: tie-aware, cluster+BCa, paired
 #   2  compute_shapley_interactions.py Task 2: Shapley + Mobius
@@ -31,6 +33,8 @@
 # Usage:
 #   ./run_analysis.sh                          # stage 0 only, then stop
 #   ./run_analysis.sh --tie-audit-reviewed     # full chain
+#   ./run_analysis.sh --from-dudez ...         # merge per-receptor DUDEZ
+#                                              #   CSVs first (the primary flow)
 #   ./run_analysis.sh --tie-audit-reviewed --from 2
 #   ./run_analysis.sh --tie-audit-reviewed --n-bootstraps 2000   # faster
 #
@@ -51,24 +55,37 @@ ANALYSIS_DIR="analysis_data"
 FROM_STAGE=0
 TIE_AUDIT_REVIEWED="false"
 N_BOOTSTRAPS=""
+FROM_DUDEZ="false"
 
 while [[ $# -gt 0 ]]; do
     case "${1}" in
         --from)                FROM_STAGE="${2}"; shift 2 ;;
         --tie-audit-reviewed)  TIE_AUDIT_REVIEWED="true"; shift ;;
         --n-bootstraps)        N_BOOTSTRAPS="${2}"; shift 2 ;;
+        --from-dudez)          FROM_DUDEZ="true"; shift ;;
         -h|--help)             sed -n '2,45p' "$0"; exit 0 ;;
         *) echo "Unknown flag: ${1}" >&2; exit 1 ;;
     esac
 done
 
-if [[ ! -f "${RESULTS_CSV}" ]]; then
-    echo "ERROR: ${RESULTS_CSV} not found." >&2
-    echo "Run the ablation first (slurm_scripts/feature_ablation.slurm)." >&2
-    exit 1
+mkdir -p "${ANALYSIS_DIR}"
+
+# ── stage 0a: merge per-receptor DUDEZ outputs ──────────────────────────
+# The DUDEZ runner is one-receptor-per-array-task, so its results arrive as
+# many CSVs; the rest of the chain reads a single combined table.
+if [[ "${FROM_DUDEZ}" == "true" ]]; then
+    printf '\n=== stage 0a: combine per-receptor DUDEZ results ===\n'
+    python "${SCRIPTS}/combine_dudez_results.py" --output "${RESULTS_CSV}"
 fi
 
-mkdir -p "${ANALYSIS_DIR}"
+if [[ ! -f "${RESULTS_CSV}" ]]; then
+    echo "ERROR: ${RESULTS_CSV} not found." >&2
+    echo "Run the ablation first:" >&2
+    echo "  DUDEZ flow (primary): sbatch slurm_scripts/feature_ablation_dudez.slurm" >&2
+    echo "                        then re-run this with --from-dudez" >&2
+    echo "  MOL2 flow           : sbatch slurm_scripts/feature_ablation.slurm" >&2
+    exit 1
+fi
 
 FAILED_STAGES=()
 # Plain counter alongside the array: under `set -u`, bash 3.2 (macOS system

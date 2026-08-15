@@ -72,6 +72,8 @@ analysis_scripts/
                                  skipped (not failed) when its input is
                                  absent, which is a normal intermediate
                                  state here.
+  combine_dudez_results.py      Merges the per-receptor DUDEZ CSVs into the
+                                 single table the rest of the chain reads.
   compute_distribution_stats.py, combine_scores.py, bootstrap_tldr.py,
   plot_ridgeline.py, plot_scatter.py
                                  Supporting utilities, unchanged. The two
@@ -87,23 +89,72 @@ run_analysis.sh                 The CPU analysis chain (stages 0-6) with the
 
 ## Running it
 
-Two stages, split by what needs a GPU.
+Two stages, split by what needs a GPU. There are two input flows; **the
+DUDEZ flow is the primary one.**
 
-**1. GPU — `slurm_scripts/feature_ablation.slurm`**
+### Input flows
+
+| Flow | Runner | Input | Labels |
+|---|---|---|---|
+| **DUDEZ (primary)** | `run_feature_ablation_dudez.py` | precomputed Boltz-2 predicted complexes (`.cif`) + SMILES manifest + cached MSA | authoritative `is_binder` from the manifest |
+| MOL2 (legacy) | `run_feature_ablation.py` | static receptor PDB + multi-pose MOL2 | inferred from a `ZINC` name prefix |
+
+The DUDEZ flow is preferred because the study's premise is that a valid
+structure is already in hand — the head is fed that structure directly,
+sidestepping diffusion. It also avoids two silent failure modes: RDKit
+SMILES inference dropping ligands, and the name-prefix heuristic
+mislabelling decoys that aren't named `ZINC*` (which would leave a receptor
+with zero decoys).
+
+Both runners share the trunk cache, the operator machinery, the output
+schema, and the whole analysis chain. **Keep their trunk caches separate**
+(`--trunk-cache-dir`): entries are keyed on `(receptor, ligand)` with no
+record of which pose source produced them.
+
+### Storage
+
+A cached trunk entry is **~16 MB** — `z` is `(N, N, token_z)` fp16, so it
+grows with the *square* of the token count (256 tokens × 128 channels).
+Caching every ligand would cost 80–320 GB per receptor, i.e. multiple TB
+across 43 receptors. Two things keep that bounded:
+
+- **A zero-only run writes nothing to disk.** The cache exists solely to
+  supply donor channels for `resample`/`mean`; a zero-operator experiment
+  never reads another ligand's trunk. The query's trunk is computed once
+  and held in memory only for that ligand.
+- **When donors are needed, only a bounded pool is cached** —
+  `--donor-pool-size` (default 64), drawn at random and stratified by
+  `is_binder` so the pool isn't all actives. `resample` draws 5 donors per
+  query and `mean` is a sample mean, so a pool of 64 is ample. That's ~1 GB
+  per receptor instead of hundreds, and it's deleted at the end of the run
+  unless you pass `--keep-trunk-cache`.
+
+The SLURM script puts the cache on `$SCRATCH_BASE` (not the repo tree),
+removes structures it extracted itself unless `KEEP_STRUCTURES=1`, and
+prints `du -sh` of both before cleanup. The tarball stays the source of
+truth — nothing extracted is worth keeping.
+
+**1. GPU — one array task per receptor**
 
 ```bash
-sbatch slurm_scripts/feature_ablation.slurm
+sbatch slurm_scripts/feature_ablation_dudez.slurm
 ```
 
-Runs the ablation, then the trunk-cache fidelity gate (hard stop if the
-cached replay disagrees with an uncached recomputation), then writes the
-tie-density audit. It deliberately stops there.
+Untars structures, runs the ablation, then the trunk-cache fidelity gate
+(hard stop if cached replay disagrees with an uncached recomputation).
+Writes `results/dudez_ablation/<RECEPTOR>_dudez_ablation.csv`.
+
+For the legacy MOL2 flow instead: `sbatch slurm_scripts/feature_ablation.slurm`.
 
 **2. CPU — `run_analysis.sh`**
 
 ```bash
-cd ablation_experiment && ./run_analysis.sh
+cd ablation_experiment && ./run_analysis.sh --from-dudez
 ```
+
+`--from-dudez` first merges the per-receptor CSVs into the single table the
+chain reads (stage 0a). Omit it for the MOL2 flow, which already writes one
+combined file.
 
 Writes `analysis_data/tie_density_audit.csv` and **stops for review** — a
 tie-dense `bias_only` is the expected *finding*, not something a script can
@@ -111,7 +162,7 @@ adjudicate, and `bias_only` is the `v(∅)` anchor under every Shapley value
 and NAE denominator downstream. Once you've read it:
 
 ```bash
-./run_analysis.sh --tie-audit-reviewed
+./run_analysis.sh --from-dudez --tie-audit-reviewed
 ```
 
 which runs bootstrap → Shapley/Möbius → property control → normalization →

@@ -6,7 +6,10 @@ a ridgeline plot.
 
 Reads: experiment_files/results/ablation/feature_ablation_results.csv
 Score column: affinity_pred_value (lower = better binding)
-Convention: ZINC-prefixed compound IDs = decoys; everything else = ligands.
+Active/decoy labels come from the ``is_binder`` column when present (the
+DUDEZ runner writes it from the benchmark manifest); otherwise they fall
+back to the "ZINC" name-prefix convention. See
+``logauc_utils.label_actives_decoys``.
 """
 
 import argparse
@@ -24,6 +27,7 @@ from scipy.stats import gaussian_kde
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from logauc_utils import (  # noqa: E402
     DEFAULT_BOOTSTRAPS,
+    label_actives_decoys,
     MIN_BOOTSTRAPS,
     bca_interval,
     bootstrap_logauc,
@@ -137,8 +141,18 @@ def _paired_receptor_scores(df, exp_a, exp_b, receptors):
         common = sorted(set(best_a.index) & set(best_b.index))
         if not common:
             continue
-        lig_ids = [n for n in common if not is_decoy(n)]
-        dec_ids = [n for n in common if is_decoy(n)]
+        common_df = pd.DataFrame({"ligand_id": common})
+        if "is_binder" in df.columns:
+            common_df = common_df.merge(
+                df[["ligand_id", "is_binder"]].drop_duplicates("ligand_id"),
+                on="ligand_id", how="left",
+            )
+        act, dec, _ = label_actives_decoys(common_df)
+        # Preserve `common`'s deterministic order: the paired bootstrap
+        # pairs arms by list index, so both arms must see the same compound
+        # at the same position.
+        lig_ids = [n for n in common if n in act]
+        dec_ids = [n for n in common if n in dec]
         if not lig_ids or not dec_ids:
             continue
 
@@ -210,9 +224,15 @@ def main():
 
             # Deduplicate: keep best (lowest) score per compound
             best = df_rec.groupby("ligand_id")["affinity_pred_value"].min().reset_index()
-            names = set(best["ligand_id"])
-            lig_set = {n for n in names if not is_decoy(n)}
-            dec_set = {n for n in names if is_decoy(n)}
+            # Carry is_binder through the dedup so the authoritative label
+            # survives (DUDEZ output); falls back to the ZINC-prefix
+            # heuristic for MOL2-runner output that has no such column.
+            if "is_binder" in df_rec.columns:
+                best = best.merge(
+                    df_rec[["ligand_id", "is_binder"]].drop_duplicates("ligand_id"),
+                    on="ligand_id", how="left",
+                )
+            lig_set, dec_set, label_source = label_actives_decoys(best)
 
             if len(lig_set) == 0 or len(dec_set) == 0:
                 print(f"  [{exp}] {receptor}: no ligs ({len(lig_set)}) or decs ({len(dec_set)}), skipping")
@@ -234,6 +254,7 @@ def main():
 
             tie_flag = "  [TIED TOP-1%]" if ties["tied_top1pct_flag"] else ""
             print(f"  [{exp}] {receptor}: mean logAUC = {mean_val:.2f} ({len(lig_set)} ligs, {len(dec_set)} decs, "
+                  f"labels={label_source}, "
                   f"{ties['distinct_values']} distinct scores, largest tie block {ties['largest_tie_block']}){tie_flag}")
             if ties["tied_top1pct_flag"]:
                 print(f"    WARNING: top-1% of the ranking is >=99% inside a single tied score block — "

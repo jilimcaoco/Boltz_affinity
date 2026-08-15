@@ -103,6 +103,49 @@ def compute_logauc(ranked_list: Sequence[Score], lig_set, decoy_set) -> float:
     return logAUC(points) * 100
 
 
+# ── active/decoy labelling ──────────────────────────────────────────────────
+
+def is_decoy_by_name(name) -> bool:
+    """Legacy heuristic: a compound is a decoy iff its ID starts with "ZINC".
+
+    Only correct for datasets that follow that naming convention. Prefer
+    :func:`label_actives_decoys`, which uses an explicit label when one is
+    available.
+    """
+    return str(name).startswith("ZINC")
+
+
+def label_actives_decoys(df, id_col: str = "ligand_id", binder_col: str = "is_binder"):
+    """Split a per-receptor frame into ``(actives, decoys)`` id sets.
+
+    Uses the explicit ``is_binder`` column when present -- the DUDEZ runner
+    writes it straight from the benchmark manifest, so it is ground truth.
+    Falls back to the "ZINC" name-prefix heuristic otherwise, which is what
+    the MOL2 runner's output requires.
+
+    The distinction matters: predicted-complex datasets do not necessarily
+    name their decoys "ZINC*", and the heuristic fails *silently* on them --
+    every compound would be labelled an active, leaving zero decoys and
+    a receptor that gets skipped or, worse, scored against an empty decoy
+    set. Returns ``(actives, decoys, source)`` where ``source`` is
+    ``"is_binder"`` or ``"name_prefix"`` so callers can report which was used.
+    """
+    ids = df[id_col]
+    if binder_col in df.columns and df[binder_col].notna().any():
+        truthy = {"1", "true", "yes", "y", "t"}
+        flags = df[binder_col].map(
+            lambda v: str(v).strip().lower() in truthy if v is not None else False
+        )
+        actives = set(ids[flags])
+        decoys = set(ids[~flags])
+        return actives, decoys, "is_binder"
+
+    names = set(ids)
+    actives = {n for n in names if not is_decoy_by_name(n)}
+    decoys = {n for n in names if is_decoy_by_name(n)}
+    return actives, decoys, "name_prefix"
+
+
 # ── tie handling ─────────────────────────────────────────────────────────────
 
 def break_ties(scores: Sequence[Score], rng: np.random.Generator) -> List[Score]:

@@ -74,6 +74,44 @@ TARBALL="${RECEPTOR_DIR}/combined_structures.tar.gz"
 SMILES_CSV="${DUDEZ_INPUTS_ROOT}/${RECEPTOR}_combined_ids.csv"
 MSA_PATH="${MSA_DIR}/${RECEPTOR}_mmseqs2.a3m"
 OUTPUT="ablation_experiment/results/dudez_ablation/${RECEPTOR}_dudez_ablation.csv"
+# Keep the DUDEZ trunk cache SEPARATE from the MOL2 runner's: entries are
+# keyed on (receptor, ligand) with no record of which pose source produced
+# them, so a shared directory would serve the wrong z.
+# Donor cache lives on SCRATCH, not in the repo tree: entries are ~16 MB
+# each (z is N*N*token_z fp16) and the cache is a throwaway artefact fully
+# reproducible from the inputs. It is bounded to --donor-pool-size ligands
+# and deleted by the runner unless --keep-trunk-cache is passed.
+SCRATCH_BASE="${SCRATCH_BASE:-/scratch/maom_root/maom/limcaoco}"
+TRUNK_CACHE_DIR="${TRUNK_CACHE_DIR:-${SCRATCH_BASE}/ablation_trunk_cache_dudez/${SLURM_JOB_ID:-manual}}"
+mkdir -p "${TRUNK_CACHE_DIR}"
+
+# Untarred structures are the other big consumer. Keep them only if they
+# were already there when we arrived; if this task extracted them, remove
+# them on exit so a 43-receptor sweep doesn't leave every receptor's CIFs
+# expanded on scratch at once. Set KEEP_STRUCTURES=1 to retain (useful when
+# re-running the same receptor repeatedly).
+KEEP_STRUCTURES="${KEEP_STRUCTURES:-0}"
+# Set KEEP_TRUNK_CACHE=1 (and pass --keep-trunk-cache) to retain the donor
+# cache for debugging; both are needed or one will undo the other.
+KEEP_TRUNK_CACHE="${KEEP_TRUNK_CACHE:-0}"
+WE_EXTRACTED=0
+
+cleanup() {
+    rc=$?
+    if [[ "${WE_EXTRACTED}" == "1" && "${KEEP_STRUCTURES}" != "1" ]]; then
+        echo "[$(date)] cleaning up extracted structures at ${STRUCTURES_DIR}"
+        rm -rf "${STRUCTURES_DIR}"
+    fi
+    # The runner removes its own donor cache; this catches the case where it
+    # died before doing so. Respect an explicit keep request, otherwise this
+    # trap would silently undo --keep-trunk-cache.
+    if [[ -d "${TRUNK_CACHE_DIR}" && "${KEEP_TRUNK_CACHE:-0}" != "1" ]]; then
+        echo "[$(date)] cleaning up trunk cache at ${TRUNK_CACHE_DIR}"
+        rm -rf "${TRUNK_CACHE_DIR}"
+    fi
+    exit ${rc}
+}
+trap cleanup EXIT
 
 # ── Untar combined_structures if missing ────────────────────────────
 # Treat "directory exists with at least one .cif" as already-extracted.
@@ -91,6 +129,7 @@ if [[ "${needs_untar}" == "1" ]]; then
     echo "[$(date)] extracting ${TARBALL} ..."
     mkdir -p "${RECEPTOR_DIR}"
     tar -xf "${TARBALL}" -C "${RECEPTOR_DIR}"
+    WE_EXTRACTED=1
     if ! compgen -G "${STRUCTURES_DIR}/*.cif" > /dev/null; then
         echo "ERROR: extraction did not produce CIFs in ${STRUCTURES_DIR}" >&2
         exit 5
@@ -116,8 +155,37 @@ python ablation_experiment/experiment_scripts/run_feature_ablation_dudez.py \
     --boltz-outputs-root "${BOLTZ_OUTPUTS_ROOT}" \
     --dudez-inputs-root "${DUDEZ_INPUTS_ROOT}" \
     --msa-dir "${MSA_DIR}" \
+    --trunk-cache-dir "${TRUNK_CACHE_DIR}" \
+    --donor-pool-size "${DONOR_POOL_SIZE:-64}" \
     --output "${OUTPUT}" \
     --log-level INFO \
-    "${EXTRA_ARGS[@]}"
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+ABLATION_RC=$?
 
-echo "[$(date)] task ${SLURM_ARRAY_TASK_ID} (${RECEPTOR}) finished with $?"
+echo "[$(date)] task ${SLURM_ARRAY_TASK_ID} (${RECEPTOR}) ablation finished with ${ABLATION_RC}"
+if [[ ${ABLATION_RC} -ne 0 ]]; then
+    echo "ERROR: ablation failed for ${RECEPTOR}; not running the fidelity gate." >&2
+    exit ${ABLATION_RC}
+fi
+
+# ── Trunk-cache fidelity gate ───────────────────────────────────────
+# Every number above came from replaying the affinity head against a CACHED
+# trunk. Re-run a stratified sample end-to-end, uncached, and assert the two
+# agree. A silent cache/featurisation mismatch would corrupt every
+# downstream number while the analysis scripts ran happily.
+echo "[$(date)] running trunk-cache fidelity gate for ${RECEPTOR}"
+python ablation_experiment/experiment_scripts/verify_trunk_cache.py \
+    --receptor "${RECEPTOR}" \
+    --trunk-cache-dir "${TRUNK_CACHE_DIR}" \
+    --n-samples 50 \
+    --output "ablation_experiment/analysis_data/cache_fidelity_${RECEPTOR}.csv" \
+    --log-level INFO
+GATE_RC=$?
+if [[ ${GATE_RC} -ne 0 ]]; then
+    echo "ERROR: fidelity gate FAILED for ${RECEPTOR} (exit ${GATE_RC})." >&2
+    echo "Do NOT analyse ${OUTPUT}." >&2
+    exit ${GATE_RC}
+fi
+echo "[$(date)] task ${SLURM_ARRAY_TASK_ID} (${RECEPTOR}) DONE — fidelity gate passed"
+echo "[$(date)] scratch footprint before cleanup:"
+du -sh "${STRUCTURES_DIR}" "${TRUNK_CACHE_DIR}" 2>/dev/null || true
