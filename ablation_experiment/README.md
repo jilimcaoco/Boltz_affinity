@@ -137,14 +137,57 @@ truth — nothing extracted is worth keeping.
 **1. GPU — one array task per receptor**
 
 ```bash
-sbatch slurm_scripts/feature_ablation_dudez.slurm
+./ablation_experiment/experiment_scripts/submit_feature_ablation_dudez.sh
 ```
+
+This is the entry point, **not** `sbatch` on the `.slurm` file directly: the
+job indexes into a receptor manifest via `SLURM_ARRAY_TASK_ID` and exits 2
+without one. The submitter discovers runnable receptors (skipping any
+missing structures or a SMILES manifest), writes the manifest, and submits
+a `1-N` array — **one receptor per task, one GPU per task**, so N receptors
+occupy up to N H200s concurrently.
+
+```bash
+MAX_CONCURRENT=8 ./ablation_experiment/experiment_scripts/submit_feature_ablation_dudez.sh
+```
+
+throttles to 8 simultaneous GPUs; omit it to let the scheduler use as many
+as it will give you. `DRY_RUN=1` prints the plan without submitting, and
+anything after `--` is forwarded to the runner. Parallelism is
+across receptors — a single receptor's ligands are processed sequentially
+on one GPU (see "GPU utilization" below).
 
 Untars structures, runs the ablation, then the trunk-cache fidelity gate
 (hard stop if cached replay disagrees with an uncached recomputation).
 Writes `results/dudez_ablation/<RECEPTOR>_dudez_ablation.csv`.
 
-For the legacy MOL2 flow instead: `sbatch slurm_scripts/feature_ablation.slurm`.
+For the legacy MOL2 flow instead: `sbatch slurm_scripts/feature_ablation.slurm`
+(single job, not an array).
+
+### GPU utilization
+
+Parallelism is **coarse-grained: one receptor per GPU.** Within a task,
+complexes are processed one at a time — every forward runs at batch size 1
+(`unsqueeze(0)`), and there is no `DataParallel`/DDP anywhere. A single
+256-token complex leaves an H200 far from saturated, so the practical
+throughput lever today is *more concurrent receptors*, not a faster single
+task.
+
+Two consequences worth knowing before scaling up:
+
+- **More receptors in flight beats a bigger GPU.** 43 receptors across 43
+  H200s is ~43× faster than 43 sequential; a bigger card changes little.
+- **Featurization is CPU-bound and runs between GPU forwards**
+  (`process_input` → tokenize → crop → featurize), so too few CPUs per task
+  stalls the GPU. `--cpus-per-task=4` is the current floor; if the job log
+  shows long gaps between per-ligand lines, raise it before assuming the
+  GPU is the bottleneck.
+
+Batching multiple complexes per forward would raise per-GPU utilization
+substantially, but it is a real change (variable token counts need padding
+plus a mask, and `affinity_head_forward` currently assumes a leading batch
+dim of 1). Worth measuring actual GPU occupancy first — if the CPU side is
+the true bottleneck, batching buys nothing.
 
 **2. CPU — `run_analysis.sh`**
 

@@ -1,9 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=dudez_ablation
-#SBATCH --account=maom0
-#SBATCH --partition=spgpu
+#SBATCH --account=maom
+#SBATCH --partition=maom-h200
 #SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=2
+# Featurisation (process_input -> tokenize -> crop -> featurize) is CPU-bound
+# and runs between GPU forwards, so starving it stalls the GPU. 4 is a
+# reasonable floor; raise if the log shows long gaps between ligands.
+#SBATCH --cpus-per-task=4
 #SBATCH --mem-per-gpu=48000m
 #SBATCH --time=48:00:00
 #SBATCH --mail-type=FAIL,END
