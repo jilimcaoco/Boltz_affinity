@@ -272,3 +272,111 @@ class TestCacheSizeReporting:
         assert tc.format_bytes(512).endswith("B")
         assert "MB" in tc.format_bytes(5 * 1024**2)
         assert "GB" in tc.format_bytes(5 * 1024**3)
+
+
+class TestTokenIndex:
+    """Donor matching must never open a 16 MB payload just to read n_tokens."""
+
+    def test_index_written_on_save(self, tmp_path):
+        for lig, n in [("a", 10), ("b", 14)]:
+            tc.save_cache_entry(tmp_path, "REC", lig, z=torch.randn(1, n, n, 4),
+                                 s_inputs=torch.randn(1, n, 3),
+                                 token_repr_pos=torch.randn(n, 3), use_kernels=False)
+        assert tc.token_index_path(tmp_path, "REC").exists()
+        assert tc.load_token_index(tmp_path, "REC") == {"a": 10, "b": 14}
+
+    def test_index_backfills_for_entries_written_without_it(self, tmp_path):
+        for lig, n in [("a", 10), ("b", 14)]:
+            tc.save_cache_entry(tmp_path, "REC", lig, z=torch.randn(1, n, n, 4),
+                                 s_inputs=torch.randn(1, n, 3),
+                                 token_repr_pos=torch.randn(n, 3), use_kernels=False)
+        tc.token_index_path(tmp_path, "REC").unlink()   # simulate an older cache
+        assert tc.load_token_index(tmp_path, "REC") == {"a": 10, "b": 14}
+
+    def test_corrupt_index_is_rebuilt_not_fatal(self, tmp_path):
+        tc.save_cache_entry(tmp_path, "REC", "a", z=torch.randn(1, 8, 8, 4),
+                             s_inputs=torch.randn(1, 8, 3),
+                             token_repr_pos=torch.randn(8, 3), use_kernels=False)
+        tc.token_index_path(tmp_path, "REC").write_text("{not json")
+        assert tc.load_token_index(tmp_path, "REC") == {"a": 8}
+
+
+class TestDonorPool:
+    def _pool(self, tmp_path, sizes):
+        for lig, n in sizes.items():
+            g = torch.Generator().manual_seed(abs(hash(lig)) % 10_000)
+            tc.save_cache_entry(tmp_path, "REC", lig,
+                                 z=torch.randn(1, n, n, 4, generator=g),
+                                 s_inputs=torch.randn(1, n, 3, generator=g),
+                                 token_repr_pos=torch.randn(n, 3, generator=g),
+                                 use_kernels=False)
+        return tc.DonorPool(tmp_path, "REC")
+
+    def test_loads_pool_once(self, tmp_path):
+        pool = self._pool(tmp_path, {"a": 8, "b": 8, "c": 12})
+        assert len(pool) == 3
+        assert pool.ligand_ids == ["a", "b", "c"]
+
+    def test_find_donor_prefers_exact_and_excludes_self(self, tmp_path):
+        import numpy as np
+        pool = self._pool(tmp_path, {"q": 8, "exact": 8, "far": 30})
+        m = pool.find_donor("q", 8, np.random.default_rng(0))
+        assert m.donor_ligand_id == "exact"
+        assert m.match_kind == "exact"
+
+    def test_find_donor_nearest_fallback(self, tmp_path):
+        import numpy as np
+        pool = self._pool(tmp_path, {"q": 10, "near": 12, "far": 40})
+        m = pool.find_donor("q", 10, np.random.default_rng(0))
+        assert m.donor_ligand_id == "near"
+        assert m.match_kind == "nearest"
+        assert m.token_delta == -2
+
+    def test_find_donor_none_when_pool_is_only_self(self, tmp_path):
+        import numpy as np
+        pool = self._pool(tmp_path, {"q": 8})
+        assert pool.find_donor("q", 8, np.random.default_rng(0)) is None
+
+    def test_mean_matches_naive_recomputation(self, tmp_path):
+        """The memoized pool mean must equal the straightforward average."""
+        pool = self._pool(tmp_path, {"a": 8, "b": 8, "c": 8})
+        got = pool.mean_channel("s_inputs", 8)
+        naive = tc.mean_channel("s_inputs", 8, [pool.entry(l) for l in pool.ligand_ids])
+        assert torch.allclose(got, naive, atol=1e-5)
+
+    def test_leave_one_out_mean_matches_naive(self, tmp_path):
+        """Exact LOO via (S - x_q)/(n-1) must equal averaging the others."""
+        pool = self._pool(tmp_path, {"a": 8, "b": 8, "c": 8})
+        got = pool.mean_channel("s_inputs", 8, exclude="b")
+        naive = tc.mean_channel("s_inputs", 8,
+                                 [pool.entry(l) for l in pool.ligand_ids if l != "b"])
+        assert torch.allclose(got, naive, atol=1e-5)
+
+    def test_exclude_unknown_id_is_a_plain_mean(self, tmp_path):
+        # The common case: the query is not in the (subsampled) pool.
+        pool = self._pool(tmp_path, {"a": 8, "b": 8})
+        got = pool.mean_channel("s_inputs", 8, exclude="not_in_pool")
+        naive = tc.mean_channel("s_inputs", 8, [pool.entry(l) for l in pool.ligand_ids])
+        assert torch.allclose(got, naive, atol=1e-5)
+
+    def test_mean_is_memoized_across_calls(self, tmp_path):
+        pool = self._pool(tmp_path, {"a": 8, "b": 8})
+        pool.mean_channel("s_inputs", 8)
+        assert ("s_inputs", 8) in pool._sum_cache
+        n_before = len(pool._sum_cache)
+        pool.mean_channel("s_inputs", 8)          # same key -> no new entry
+        assert len(pool._sum_cache) == n_before
+        pool.mean_channel("s_inputs", 12)         # new token count -> new entry
+        assert len(pool._sum_cache) == n_before + 1
+
+    def test_mean_handles_mixed_token_counts(self, tmp_path):
+        pool = self._pool(tmp_path, {"small": 4, "big": 12})
+        got = pool.mean_channel("s_inputs", 6)
+        naive = tc.mean_channel("s_inputs", 6, [pool.entry(l) for l in pool.ligand_ids])
+        assert got.shape == (6, 3)
+        assert torch.allclose(got, naive, atol=1e-5)
+
+    def test_loo_raises_when_query_is_the_only_member(self, tmp_path):
+        pool = self._pool(tmp_path, {"q": 8})
+        with pytest.raises(ValueError):
+            pool.mean_channel("s_inputs", 8, exclude="q")

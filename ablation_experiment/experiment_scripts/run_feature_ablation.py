@@ -339,6 +339,11 @@ def parse_args() -> argparse.Namespace:
 
     # Processing
     parser.add_argument("--max-ligands", type=int, default=None)
+    parser.add_argument(
+        "--no-mw-correction", action="store_true", default=False,
+        help="Disable Boltz's post-hoc molecular-weight correction. Strongly "
+             "recommended for ablation work -- see run_feature_ablation_dudez.py.",
+    )
     parser.add_argument("--checkpoint", default="auto")
     parser.add_argument("--device", default="auto",
                         choices=["auto", "cuda", "cpu", "mps"])
@@ -859,6 +864,7 @@ def run_ablation_for_pair(
     # entries are ~16 MB each (z is N*N*token_z fp16).
     needs_donors = any(e.operator != "zero" for e in experiments)
     donor_pool: List[str] = []
+    donor_pool_obj = None
     n_cache_built = n_cache_failed = 0
 
     if not needs_donors:
@@ -907,6 +913,11 @@ def run_ablation_for_pair(
             f"[{receptor_id}] donor cache: {n_cache_built} built, {n_cache_failed} failed, "
             f"{trunk_cache.format_bytes(trunk_cache.cache_size_bytes(trunk_cache_dir, receptor_id))}"
         )
+        # Load the pool into memory ONCE for the whole receptor. Doing this
+        # per query was an O(n_ligands x pool_size) full-payload read that
+        # dominated the entire run.
+        donor_pool_obj = trunk_cache.DonorPool(trunk_cache_dir, receptor_id, donor_pool)
+        logger.info(f"[{receptor_id}] donor pool resident in memory: {len(donor_pool_obj)} entries")
 
     # ── Pass 2: replay every experiment against the cache ───────────
     n_done = 0
@@ -961,7 +972,7 @@ def run_ablation_for_pair(
                 else:
                     out, donor_ids, skip_reason = _run_resample_or_mean(
                         model, batch, trunk_out, exp,
-                        trunk_cache_dir, receptor_id, ligand_name, query_n_tokens,
+                        donor_pool_obj, receptor_id, ligand_name, query_n_tokens,
                         _affinity_input_embed_with_ablation, _build_cross_pair_mask, _get_module,
                     )
                     if out is None:
@@ -997,7 +1008,7 @@ def run_ablation_for_pair(
 
 def _run_resample_or_mean(
     model, batch, trunk_out, exp: AblationExperiment,
-    trunk_cache_dir: Path, receptor_id: str, ligand_name: str, query_n_tokens: int,
+    donor_pool, receptor_id: str, ligand_name: str, query_n_tokens: int,
     _affinity_input_embed_with_ablation, _build_cross_pair_mask, _get_module,
 ):
     """Task 1: replay the affinity head with donor-substituted channels.
@@ -1026,11 +1037,11 @@ def _run_resample_or_mean(
     if exp.operator == "resample":
         rng = np.random.default_rng(exp.donor_seed)
         for channel in exp.resample_channels:
-            match = trunk_cache.find_donor(trunk_cache_dir, receptor_id, ligand_name, query_n_tokens, rng)
+            match = donor_pool.find_donor(ligand_name, query_n_tokens, rng)
             if match is None:
                 skip_reasons.append(f"{channel}: no donor available")
                 continue
-            donor_entry = trunk_cache.load_cache_entry(trunk_cache_dir, receptor_id, match.donor_ligand_id)
+            donor_entry = donor_pool.entry(match.donor_ligand_id)
             donor_ids[channel] = match.donor_ligand_id
             substituted, delta = trunk_cache.substitute_channel(channel, query_n_tokens, donor_entry)
             if match.match_kind == "nearest":
@@ -1047,16 +1058,16 @@ def _run_resample_or_mean(
                 substituted_repr_pos = substituted
     elif exp.operator == "mean":
         for channel in exp.resample_channels:
-            donor_lig_ids = trunk_cache.all_other_ligands(trunk_cache_dir, receptor_id, ligand_name)
-            if not donor_lig_ids:
+            n_donors = len(donor_pool) - (1 if donor_pool.entry(ligand_name) is not None else 0)
+            if n_donors < 1:
                 skip_reasons.append(f"{channel}: no donors available for mean")
                 continue
-            donor_entries = [
-                trunk_cache.load_cache_entry(trunk_cache_dir, receptor_id, lid) for lid in donor_lig_ids
-            ]
-            donor_entries = [e for e in donor_entries if e is not None]
-            donor_ids[channel] = "mean(" + ",".join(donor_lig_ids) + ")"
-            substituted = trunk_cache.mean_channel(channel, query_n_tokens, donor_entries)
+            # Memoized across queries -- the pool mean is recomputed only when
+            # a new (channel, token count) combination appears.
+            substituted = donor_pool.mean_channel(
+                channel, query_n_tokens, exclude=ligand_name,
+            )
+            donor_ids[channel] = f"mean(pool_n={n_donors})"
             if channel == "z_trunk":
                 substituted_z = substituted
             elif channel == "s_inputs":
@@ -1189,7 +1200,13 @@ def main():
     manager = AffinityModelManager(device=DeviceOption(args.device))
     model = manager.load_model(
         checkpoint_path=args.checkpoint if args.checkpoint != "auto" else None,
+        affinity_mw_correction=not args.no_mw_correction,
     )
+    if not args.no_mw_correction:
+        logger.warning(
+            "Molecular-weight correction is ON -- it survives every ablation, so "
+            "bias_only ranks by molecular weight, not randomly. Use --no-mw-correction."
+        )
     cache_dir = manager.cache_dir
     logger.info(f"Model loaded on {manager.device}")
 
@@ -1291,6 +1308,7 @@ def main():
         "config_hash": config_hash,
         "experiments": args.experiments,
         "recycling_steps": args.recycling_steps,
+        "mw_correction": not args.no_mw_correction,
         "max_ligands": args.max_ligands,
         "trunk_cache_dir": str(args.trunk_cache_dir),
         "checkpoint": args.checkpoint,

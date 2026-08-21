@@ -175,6 +175,16 @@ def parse_args() -> argparse.Namespace:
         "--decoys-only", action="store_true",
         help="Restrict to compounds with is_binder=False in the SMILES CSV.",
     )
+    parser.add_argument(
+        "--no-mw-correction", action="store_true", default=False,
+        help="Disable Boltz's post-hoc molecular-weight correction "
+             "(pred = 1.035*net - 0.600*MW^0.3 + 2.833). STRONGLY RECOMMENDED "
+             "for ablation work: the term is added OUTSIDE the network, so it "
+             "survives every ablation -- including bias_only, which therefore "
+             "ranks purely by molecular weight instead of being a random "
+             "baseline. Leaving it on contaminates v(0) and every Shapley / "
+             "NAE denominator built on it.",
+    )
     parser.add_argument("--checkpoint", default="auto")
     parser.add_argument("--device", default="auto",
                         choices=["auto", "cuda", "cpu", "mps"])
@@ -459,7 +469,17 @@ def run_for_receptor(args: argparse.Namespace) -> int:
     manager = AffinityModelManager(device=DeviceOption(args.device))
     model = manager.load_model(
         checkpoint_path=args.checkpoint if args.checkpoint != "auto" else None,
+        affinity_mw_correction=not args.no_mw_correction,
     )
+    if args.no_mw_correction:
+        logger.info("Molecular-weight correction DISABLED (--no-mw-correction).")
+    else:
+        logger.warning(
+            "Molecular-weight correction is ON. It is applied outside the network, "
+            "so it survives every ablation: bias_only will rank by molecular weight "
+            "rather than being a random baseline. Pass --no-mw-correction for a "
+            "clean v(0)."
+        )
     cache_dir = manager.cache_dir
     device = next(model.parameters()).device
     model_dtype = next(model.parameters()).dtype
@@ -541,6 +561,7 @@ def run_for_receptor(args: argparse.Namespace) -> int:
     # full cache would be hundreds of GB per receptor.
     needs_donors = any(e.operator != "zero" for e in experiments)
     donor_pool: List[str] = []
+    donor_pool_obj = None
     n_cache_built = n_cache_failed = 0
 
     if not needs_donors:
@@ -596,6 +617,11 @@ def run_for_receptor(args: argparse.Namespace) -> int:
             f"[{receptor_id}] donor cache: {n_cache_built} built, {n_cache_failed} failed, "
             f"{trunk_cache.format_bytes(trunk_cache.cache_size_bytes(trunk_cache_dir, receptor_id))} on disk"
         )
+        # Load the pool into memory ONCE for the whole receptor. Doing this
+        # per query was an O(n_ligands x pool_size) full-payload read that
+        # dominated the entire run.
+        donor_pool_obj = trunk_cache.DonorPool(trunk_cache_dir, receptor_id, donor_pool)
+        logger.info(f"[{receptor_id}] donor pool resident in memory: {len(donor_pool_obj)} entries")
 
     # ── Replay pass ─────────────────────────────────────────────────
     # The query's own trunk is computed here and held in memory only for the
@@ -662,7 +688,7 @@ def run_for_receptor(args: argparse.Namespace) -> int:
                 else:
                     out, donor_ids, skip_reason = _run_resample_or_mean(
                         model, batch, trunk_out, exp,
-                        trunk_cache_dir, receptor_id, compound_id, query_n_tokens,
+                        donor_pool_obj, receptor_id, compound_id, query_n_tokens,
                         _affinity_input_embed_with_ablation, _build_cross_pair_mask, _get_module,
                     )
                     if out is None:
@@ -706,6 +732,7 @@ def run_for_receptor(args: argparse.Namespace) -> int:
         "config_hash": hashlib.sha256(",".join(sorted(args.experiments)).encode()).hexdigest()[:16],
         "experiments": args.experiments,
         "recycling_steps": args.recycling_steps,
+        "mw_correction": not args.no_mw_correction,
         "max_ligands": args.max_ligands,
         "structures_dir": str(structures_dir),
         "smiles_csv": str(smiles_csv),

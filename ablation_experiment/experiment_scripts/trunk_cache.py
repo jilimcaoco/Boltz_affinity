@@ -87,6 +87,7 @@ def save_cache_entry(
         "meta": meta or {},
     }
     torch.save(payload, out_path)
+    update_token_index(cache_dir, receptor_id, ligand_id, n_tokens)
     return out_path
 
 
@@ -97,6 +98,51 @@ def load_cache_entry(cache_dir: Path, receptor_id: str, ligand_id: str) -> Optio
     if not path.exists():
         return None
     return torch.load(path, map_location="cpu")
+
+
+def token_index_path(cache_dir: Path, receptor_id: str) -> Path:
+    return cache_dir / receptor_id / "_token_index.json"
+
+
+def update_token_index(cache_dir: Path, receptor_id: str, ligand_id: str, n_tokens: int) -> None:
+    """Record ligand -> n_tokens in a small sidecar index.
+
+    Donor matching only needs the token count, but an entry is ~16 MB (z is
+    N*N*token_z). Without this index, ``find_donor`` opens every entry in the
+    pool just to read one integer -- an O(queries x pool) full-payload read
+    that dwarfs every other cost in the run.
+    """
+    idx_path = token_index_path(cache_dir, receptor_id)
+    idx_path.parent.mkdir(parents=True, exist_ok=True)
+    index = {}
+    if idx_path.exists():
+        try:
+            index = json.loads(idx_path.read_text())
+        except Exception:
+            index = {}
+    index[ligand_id] = int(n_tokens)
+    idx_path.write_text(json.dumps(index))
+
+
+def load_token_index(cache_dir: Path, receptor_id: str) -> Dict[str, int]:
+    """{ligand_id: n_tokens}. Falls back to reading payloads (slow) only for
+    entries the index doesn't cover, so an index built by an older run still
+    works."""
+    idx_path = token_index_path(cache_dir, receptor_id)
+    index: Dict[str, int] = {}
+    if idx_path.exists():
+        try:
+            index = {k: int(v) for k, v in json.loads(idx_path.read_text()).items()}
+        except Exception:
+            index = {}
+
+    missing = [l for l in list_cached_ligands(cache_dir, receptor_id) if l not in index]
+    for lid in missing:
+        entry = load_cache_entry(cache_dir, receptor_id, lid)
+        if entry is not None:
+            index[lid] = int(entry["n_tokens"])
+            update_token_index(cache_dir, receptor_id, lid, index[lid])
+    return index
 
 
 def list_cached_ligands(cache_dir: Path, receptor_id: str) -> List[str]:
@@ -278,6 +324,98 @@ def select_donor_pool(
         idx = rng.choice(len(chosen), size=pool_size, replace=False)
         chosen = [chosen[i] for i in sorted(idx)]
     return sorted(chosen)
+
+
+# ── in-memory donor pool ────────────────────────────────────────────────────
+
+class DonorPool:
+    """Donor entries held in memory for one receptor, with a memoized mean.
+
+    Replaces the naive per-query disk access pattern, which was the single
+    dominant cost of a resample/mean run:
+
+      * ``find_donor`` opened every pool entry (~16 MB each) just to read
+        ``n_tokens`` -- now served from the token index.
+      * ``mean_channel`` reloaded the entire pool for *every query ligand*,
+        recomputing an average that barely changes between queries.
+
+    Both were O(n_queries x pool_size) full-payload reads. Here the pool is
+    read once (pool_size x 16 MB, ~1 GB at the default 64) and the mean is
+    computed once per (channel, token_count).
+
+    Leave-one-out: when the query is itself in the pool it must not donate to
+    its own mean. Rather than recomputing, the memoized sum is adjusted --
+    ``(S - x_q) / (n - 1)`` -- which is exact and O(1). Most queries are not
+    in the pool (it is a small subset), so this is rare.
+    """
+
+    def __init__(self, cache_dir: Path, receptor_id: str, ligand_ids: Optional[Sequence[str]] = None):
+        self.cache_dir = cache_dir
+        self.receptor_id = receptor_id
+        self.token_index = load_token_index(cache_dir, receptor_id)
+        ids = list(ligand_ids) if ligand_ids is not None else list_cached_ligands(cache_dir, receptor_id)
+        self.entries: Dict[str, dict] = {}
+        for lid in ids:
+            entry = load_cache_entry(cache_dir, receptor_id, lid)
+            if entry is not None:
+                self.entries[lid] = entry
+                self.token_index.setdefault(lid, int(entry["n_tokens"]))
+        self._sum_cache: Dict[Tuple[str, int], object] = {}
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    @property
+    def ligand_ids(self) -> List[str]:
+        return sorted(self.entries)
+
+    def find_donor(self, query_ligand_id: str, query_n_tokens: int, rng) -> Optional[DonorMatch]:
+        """Same contract as the module-level ``find_donor``, but served from
+        memory: exact token match preferred (uniformly at random among ties),
+        else nearest, else None."""
+        candidates = {lid: n for lid, n in self.token_index.items()
+                      if lid != query_ligand_id and lid in self.entries}
+        if not candidates:
+            return None
+        exact = [lid for lid, n in candidates.items() if n == query_n_tokens]
+        if exact:
+            chosen = sorted(exact)[int(rng.integers(0, len(exact)))]
+            return DonorMatch(chosen, "exact", candidates[chosen], query_n_tokens, 0)
+        nearest = min(sorted(candidates), key=lambda lid: abs(candidates[lid] - query_n_tokens))
+        n = candidates[nearest]
+        return DonorMatch(nearest, "nearest", n, query_n_tokens, query_n_tokens - n)
+
+    def entry(self, ligand_id: str) -> Optional[dict]:
+        return self.entries.get(ligand_id)
+
+    def _pool_sum(self, channel: str, n_tokens: int):
+        """Sum over all pool members of `channel`, matched to n_tokens."""
+        import torch
+
+        key = (channel, int(n_tokens))
+        if key not in self._sum_cache:
+            total = None
+            for lid in self.ligand_ids:
+                t, _ = substitute_channel(channel, n_tokens, self.entries[lid])
+                total = t.clone().float() if total is None else total + t.float()
+            self._sum_cache[key] = total
+        return self._sum_cache[key]
+
+    def mean_channel(self, channel: str, n_tokens: int, exclude: Optional[str] = None):
+        """Per-position mean of `channel` over the pool, matched to
+        ``n_tokens``, optionally leaving out one member."""
+        if not self.entries:
+            raise ValueError("DonorPool is empty; cannot compute a mean")
+        total = self._pool_sum(channel, n_tokens)
+        n = len(self.entries)
+        if exclude is not None and exclude in self.entries:
+            if n < 2:
+                raise ValueError(
+                    "DonorPool has only the query itself; no donors available for mean"
+                )
+            excl, _ = substitute_channel(channel, n_tokens, self.entries[exclude])
+            return (total - excl.float()) / (n - 1)
+        return total / n
 
 
 # ── channel substitution ─────────────────────────────────────────────────────
