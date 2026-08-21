@@ -467,27 +467,77 @@ def _validate_signature(fn: Callable) -> None:
         raise TypeError(msg)
 
 
+#: Losses resolved on first use rather than at import time.  The selectivity
+#: module imports helpers from *this* module, so eagerly adding its presets to
+#: :data:`BUILTIN_LOSSES` would be a circular import.
+_LAZY_LOSSES: dict[str, tuple[str, str]] = {
+    name: ("boltz.lora.selectivity_losses", name)
+    for name in (
+        "selectivity_joint",
+        "selectivity_rank_only",
+        "selectivity_delta_only",
+        "selectivity_off",
+    )
+}
+
+
+def _resolve_lazy(name: str) -> Optional[LossFn]:
+    target = _LAZY_LOSSES.get(name)
+    if target is None:
+        return None
+    mod_name, attr = target
+    return getattr(importlib.import_module(mod_name), attr)
+
+
 def load_loss_from_spec(spec: str) -> LossFn:
     """Resolve a loss specification.
 
     Accepted forms:
     * ``"mse"``, ``"mae"``, ... — built-in registry lookup.
+    * ``"selectivity_joint"``, ... — lazily imported selectivity presets
+      (see :mod:`boltz.lora.selectivity_losses`).
     * ``"/abs/path/file.py:fn_name"`` or ``"rel/path.py:fn"`` — import the
       file as an isolated module and return ``fn``.
+    * ``"pkg.module:fn_name"`` — import an installed module and return ``fn``.
     """
     if spec in BUILTIN_LOSSES:
         return BUILTIN_LOSSES[spec]
 
+    lazy = _resolve_lazy(spec)
+    if lazy is not None:
+        return lazy
+
     if ":" not in spec:
         msg = (
-            f"Unknown loss '{spec}'. Built-ins: {sorted(BUILTIN_LOSSES)}. "
-            "For a custom loss use 'path/to/file.py:fn_name'."
+            f"Unknown loss '{spec}'. Built-ins: "
+            f"{sorted(set(BUILTIN_LOSSES) | set(_LAZY_LOSSES))}. "
+            "For a custom loss use 'path/to/file.py:fn_name' or "
+            "'pkg.module:fn_name'."
         )
         raise KeyError(msg)
 
     path_part, fn_name = spec.rsplit(":", 1)
     path = Path(path_part).expanduser().resolve()
     if not path.exists():
+        # Not a file — fall back to a dotted module path before giving up.
+        if not path_part.endswith(".py"):
+            try:
+                module = importlib.import_module(path_part)
+            except ImportError as exc:
+                msg = (
+                    f"Custom loss '{spec}' is neither an existing file "
+                    f"({path}) nor an importable module ({path_part})."
+                )
+                raise FileNotFoundError(msg) from exc
+            if not hasattr(module, fn_name):
+                msg = f"Module {path_part} does not define '{fn_name}'."
+                raise AttributeError(msg)
+            fn = getattr(module, fn_name)
+            if not callable(fn):
+                msg = f"'{fn_name}' in {path_part} is not callable."
+                raise TypeError(msg)
+            _validate_signature(fn)
+            return fn  # type: ignore[return-value]
         msg = f"Custom loss file not found: {path}"
         raise FileNotFoundError(msg)
 

@@ -41,7 +41,12 @@ from boltz.finetune.registry import FinetuneRegistry, default_registry
 from boltz.finetune.targets import resolve_targets
 
 # Reuse the LoRA-side machinery — these helpers are mode-agnostic.
-from boltz.lora.data import AssayGroupedSampler, LoRADataset, lora_collate
+from boltz.lora.data import (
+    AssayGroupedSampler,
+    LoRADataset,
+    PairedReceptorSampler,
+    lora_collate,
+)
 from boltz.lora.losses import LossFn, call_loss, load_loss_from_spec
 from boltz.lora.train import (
     _affinity_forward_trainable,
@@ -152,8 +157,29 @@ def train_finetune(
     dataset = LoRADataset(args.csv_path, mode=args.mode)
 
     has_groups = any(r.group_id for r in dataset.rows)
-    _sampler: Optional[AssayGroupedSampler] = None
-    if args.batch_size > 1 and has_groups:
+    has_pairs = any(r.pair_id for r in dataset.rows)
+    _sampler: Optional[Any] = None
+    if args.batch_size > 1 and has_pairs:
+        # Mirrors boltz.lora.train: cross-receptor pairs take precedence, since
+        # the two arms of a pair sit in different assays and AssayGroupedSampler
+        # would never co-locate them.
+        _sampler = PairedReceptorSampler(
+            dataset.rows, batch_size=args.batch_size, shuffle=True,
+        )
+        loader = DataLoader(
+            dataset, batch_sampler=_sampler,
+            collate_fn=lora_collate, num_workers=0,
+        )
+        logger.info(
+            "PairedReceptorSampler: %d pairs (%d complete), %d unpaired rows.",
+            _sampler.n_pairs, _sampler.n_complete_pairs, _sampler.n_unpaired,
+        )
+        if _sampler.n_complete_pairs == 0:
+            logger.warning(
+                "No pair_id has two or more receptor arms present; the "
+                "cross-receptor selectivity term will contribute nothing."
+            )
+    elif args.batch_size > 1 and has_groups:
         _sampler = AssayGroupedSampler(
             dataset.rows, batch_size=args.batch_size, shuffle=True,
         )
@@ -372,7 +398,14 @@ def train_finetune(
                         batch["target"] = batch["target"].index_select(
                             0, keep_t.to(batch["target"].device)
                         )
-                    for k in ("group_id", "is_binder", "name"):
+                    for k in (
+                        "group_id",
+                        "is_binder",
+                        "is_censored",
+                        "pair_id",
+                        "receptor_id",
+                        "name",
+                    ):
                         v = batch.get(k)
                         if isinstance(v, list):
                             batch[k] = [v[i] for i in kept_indices]

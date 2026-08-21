@@ -2,7 +2,8 @@
 
 Input CSV schema (header required):
 
-    ligand,receptor,target[,structure][,name][,group_id]
+    ligand,receptor,target[,structure][,name][,group_id][,is_binder]
+                                 [,is_censored][,pair_id][,receptor_id]
 
 Columns:
     ligand     : path to a single-molecule MOL2/SDF *or* a SMILES string
@@ -21,6 +22,23 @@ Columns:
                  ``target <= BOLTZ_LORA_BINDER_THRESHOLD`` (default 1.0,
                  i.e. ≤10 µM = binder on the ``log10(IC50_uM)`` scale).
 
+    pair_id    : optional identifier shared by the rows of one ligand
+                 measured against two (or more) receptors.  Used by
+                 :class:`PairedReceptorSampler` to keep both arms of a pair in
+                 the same mini-batch so the cross-receptor selectivity term
+                 can fire.  See :mod:`boltz.lora.selectivity_losses`.
+    receptor_id: optional label for which arm a row is (e.g. ``"MOR"`` /
+                 ``"DOR"``).  Required alongside ``pair_id``: the ligand-axis
+                 pairwise term keys on ``(group_id, receptor_id)`` so it never
+                 pairs rows measured against *different* receptors, which
+                 would reintroduce the assay offset that term exists to
+                 cancel.
+    is_censored: optional 0/1 flag marking a right-censored measurement
+                 (reported as "> X"), consumed by the ``censored_*`` losses.
+
+For selectivity training the convention is that ``group_id`` holds the
+*panel / source* shared by both arms of a pair, not a per-receptor assay id.
+
 The dataset yields a dict per row::
 
     {
@@ -30,6 +48,9 @@ The dataset yields a dict per row::
         "structure": Optional[str],
         "group_id": Optional[str],
         "is_binder": Optional[int],
+        "is_censored": int,
+        "pair_id": Optional[str],
+        "receptor_id": Optional[str],
         "target": torch.Tensor (scalar float32),
         "row_index": int,
     }
@@ -54,7 +75,15 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 REQUIRED_COLUMNS = ("ligand", "receptor", "target")
-OPTIONAL_COLUMNS = ("structure", "name", "group_id", "is_binder", "is_censored")
+OPTIONAL_COLUMNS = (
+    "structure",
+    "name",
+    "group_id",
+    "is_binder",
+    "is_censored",
+    "pair_id",
+    "receptor_id",
+)
 
 
 @dataclass
@@ -69,6 +98,8 @@ class LoRARow:
     group_id: Optional[str] = None
     is_binder: Optional[int] = None
     is_censored: int = 0
+    pair_id: Optional[str] = None
+    receptor_id: Optional[str] = None
     row_index: int = 0
 
     def to_batch_item(self) -> dict[str, Any]:
@@ -80,6 +111,8 @@ class LoRARow:
             "group_id": self.group_id,
             "is_binder": self.is_binder,
             "is_censored": self.is_censored,
+            "pair_id": self.pair_id,
+            "receptor_id": self.receptor_id,
             "target": torch.tensor(self.target, dtype=torch.float32),
             "row_index": self.row_index,
         }
@@ -154,6 +187,8 @@ def parse_lora_csv(path: str | Path) -> tuple[list[LoRARow], str]:
                     group_id=(raw.get("group_id") or "").strip() or None,
                     is_binder=is_binder,
                     is_censored=is_censored,
+                    pair_id=(raw.get("pair_id") or "").strip() or None,
+                    receptor_id=(raw.get("receptor_id") or "").strip() or None,
                     row_index=i,
                 )
             )
@@ -208,6 +243,9 @@ def lora_collate(items: list[dict[str, Any]]) -> dict[str, Any]:
         "structure": [it["structure"] for it in items],
         "group_id": [it.get("group_id") for it in items],
         "is_binder": [it.get("is_binder") for it in items],
+        "is_censored": [it.get("is_censored", 0) for it in items],
+        "pair_id": [it.get("pair_id") for it in items],
+        "receptor_id": [it.get("receptor_id") for it in items],
         "row_index": [it["row_index"] for it in items],
         "target": torch.stack([it["target"] for it in items]),
     }
@@ -306,12 +344,146 @@ class AssayGroupedSampler(Sampler[list[int]]):
         yield from all_batches
 
 
+class PairedReceptorSampler(Sampler[list[int]]):
+    """Batch sampler that keeps both arms of a cross-receptor pair together.
+
+    Selectivity training needs the *same ligand scored against two receptors*
+    to co-occur in one mini-batch, otherwise the cross-receptor term of
+    :func:`boltz.lora.selectivity_losses.make_selectivity_loss` has nothing to
+    fire on.  :class:`AssayGroupedSampler` cannot do this: it fills each batch
+    from a single ``group_id``, and the two arms of a pair are by construction
+    measured in two different assays.
+
+    The intended manifest convention is:
+
+    * ``pair_id``     — shared by the rows of one ligand across receptors.
+    * ``receptor_id`` — which arm a row is (e.g. ``"MOR"`` / ``"DOR"``).
+    * ``group_id``    — the *panel / source* both arms came from, so a batch
+      drawn from one ``group_id`` contains several ligands measured under one
+      protocol.  The ligand-axis pairwise term then keys on
+      ``(group_id, receptor_id)``, which is what actually cancels the assay
+      offset; keying on ``group_id`` alone would pair rows across receptors
+      and reintroduce exactly the offset the term exists to remove.
+
+    Batches are built by packing whole *pair units* (never split across
+    batches) drawn from one ``group_id`` block, up to ``batch_size`` rows.
+    A ligand with only one arm present is a one-row unit and is packed
+    normally, so it still contributes to the point and ligand-axis terms.
+
+    Parameters
+    ----------
+    rows:
+        The :attr:`LoRADataset.rows` list.
+    batch_size:
+        Soft cap on rows per batch.  A single unit larger than ``batch_size``
+        is emitted alone rather than split.
+    shuffle:
+        Shuffle block order, unit order within a block, and final batch order.
+        Call :meth:`set_epoch` each epoch for reproducible variation.
+    seed:
+        Base RNG seed; the epoch index is added before each iteration.
+    """
+
+    def __init__(
+        self,
+        rows: list[LoRARow],
+        batch_size: int,
+        *,
+        shuffle: bool = True,
+        seed: int = 0,
+    ) -> None:
+        self._batch_size = max(1, batch_size)
+        self._shuffle = shuffle
+        self._seed = seed
+        self._epoch = 0
+
+        # pair_id -> row indices (in manifest order, so the sign convention
+        # applied downstream is deterministic).
+        pairs: dict[str, list[int]] = collections.OrderedDict()
+        singles: list[int] = []
+        for i, row in enumerate(rows):
+            pid = row.pair_id
+            if pid:
+                pairs.setdefault(pid, []).append(i)
+            else:
+                singles.append(i)
+
+        # Group units into blocks keyed by the unit's group_id (panel).
+        blocks: dict[str, list[list[int]]] = collections.OrderedDict()
+        for pid, idxs in pairs.items():
+            key = next((rows[i].group_id for i in idxs if rows[i].group_id), "")
+            blocks.setdefault(key, []).append(idxs)
+        for i in singles:
+            key = rows[i].group_id or ""
+            blocks.setdefault(key, []).append([i])
+
+        self._blocks = blocks
+        self._n_pairs = len(pairs)
+        self._n_complete_pairs = sum(1 for v in pairs.values() if len(v) >= 2)
+        self._n_singles = len(singles)
+
+    @property
+    def n_pairs(self) -> int:
+        return self._n_pairs
+
+    @property
+    def n_complete_pairs(self) -> int:
+        return self._n_complete_pairs
+
+    @property
+    def n_unpaired(self) -> int:
+        return self._n_singles
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set current epoch for reproducible shuffling."""
+        self._epoch = epoch
+
+    def _build_batches(
+        self, rng: _random.Random, *, shuffle: bool
+    ) -> list[list[int]]:
+        all_batches: list[list[int]] = []
+        block_keys = list(self._blocks.keys())
+        if shuffle:
+            rng.shuffle(block_keys)
+
+        for key in block_keys:
+            units = list(self._blocks[key])
+            if shuffle:
+                rng.shuffle(units)
+            current: list[int] = []
+            for unit in units:
+                if current and len(current) + len(unit) > self._batch_size:
+                    all_batches.append(current)
+                    current = []
+                current.extend(unit)
+            if current:
+                all_batches.append(current)
+
+        if shuffle:
+            rng.shuffle(all_batches)
+        return all_batches
+
+    def __len__(self) -> int:
+        # Recomputed rather than cached: units have mixed sizes (a complete
+        # pair is two rows, an incomplete one is a single), so greedy packing
+        # yields a different batch count depending on unit order.  Using the
+        # current epoch's RNG keeps this exactly equal to what __iter__ emits,
+        # which DataLoader relies on for len(loader).
+        rng = _random.Random(self._seed + self._epoch)
+        return len(self._build_batches(rng, shuffle=self._shuffle))
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = _random.Random(self._seed + self._epoch)
+        yield from self._build_batches(rng, shuffle=self._shuffle)
+
+
 __all__ = [
     "OPTIONAL_COLUMNS",
     "REQUIRED_COLUMNS",
     "AssayGroupedSampler",
     "LoRADataset",
     "LoRARow",
+    "PairedReceptorSampler",
     "lora_collate",
     "parse_lora_csv",
 ]
