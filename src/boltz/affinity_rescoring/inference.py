@@ -24,6 +24,11 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from boltz.affinity_rescoring.trunk_cache import (
+    feats_digest,
+    get_cache as get_trunk_cache,
+)
+
 from boltz.affinity_rescoring.models import (
     DeviceOption,
     compute_file_sha256,
@@ -350,6 +355,14 @@ def create_affinity_yaml(
 
 
 # ─── Direct Affinity Inference (Plan B) ──────────────────────────────────────
+
+
+def _featurizer_seed() -> int:
+    """Global-torch-RNG seed for rescore featurisation (see run_direct_affinity_inference)."""
+    try:
+        return int(os.environ.get("BOLTZ_FEATURIZER_SEED", "42"))
+    except ValueError:
+        return 42
 
 
 def _get_module(model: Any, attr: str) -> Any:
@@ -739,9 +752,35 @@ def affinity_forward(
     # split helpers below carry the actual implementation; this entry
     # point is preserved for backward compatibility and stays the
     # canonical call for one-shot trunk + head inference.
+    #
+    # The trunk is unaffected by the affinity LoRA/finetune presets (they only
+    # touch modules inside ``affinity_module``), so its output can be memoised
+    # and reused across every arm scored on the same pose. Opt-in via
+    # $BOLTZ_RESCORE_CACHE_DIR; see boltz.affinity_rescoring.trunk_cache.
+    cache = get_trunk_cache(model)
+    cache_key = None
+    if cache is not None:
+        cache_key = cache.key(feats_digest(feats), recycling_steps)
+        z = cache.load(cache_key, feats["token_pad_mask"].device)
+        if z is not None:
+            return affinity_head_forward(
+                model, feats, {"z": z, "use_kernels": model.use_kernels},
+                zero_z_trunk=zero_z_trunk,
+                zero_s_inputs=zero_s_inputs,
+                disable_distogram=disable_distogram,
+                pose_noise_sigma=pose_noise_sigma,
+                pose_noise_seed=pose_noise_seed,
+                pose_noise_target=pose_noise_target,
+                zero_atom_encoder=zero_atom_encoder,
+                zero_msa_profile=zero_msa_profile,
+                zero_res_type=zero_res_type,
+            )
+
     trunk_out = affinity_trunk_forward(
         model, feats, recycling_steps=recycling_steps,
     )
+    if cache is not None and cache_key is not None:
+        cache.save(cache_key, trunk_out["z"])
     return affinity_head_forward(
         model, feats, trunk_out,
         zero_z_trunk=zero_z_trunk,
@@ -938,23 +977,31 @@ def run_direct_affinity_inference(
         molecules.update(load_molecules(mol_dir, mol_names))
 
         random = np.random.default_rng(42)
-        features = featurizer.process(
-            tokenized,
-            molecules=molecules,
-            random=random,
-            training=False,
-            max_atoms=None,
-            max_tokens=None,
-            max_seqs=const.max_msa_seqs,
-            pad_to_max_seqs=False,
-            single_sequence_prop=0.0,
-            compute_frames=True,
-            inference_pocket_constraints=None,
-            inference_contact_constraints=None,
-            compute_constraint_features=True,
-            override_method=None,
-            compute_affinity=True,
-        )
+        # The featuriser applies center_random_augmentation() to ref_pos — a
+        # training-time roto-translation that is NOT gated on training=False and
+        # draws from the *global* torch RNG. Left alone, scoring the same pose
+        # twice yields different ref_pos (up to ~15 A) and different affinity
+        # predictions. Fork the RNG so this call is reproducible without
+        # disturbing the caller's random stream.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(_featurizer_seed())
+            features = featurizer.process(
+                tokenized,
+                molecules=molecules,
+                random=random,
+                training=False,
+                max_atoms=None,
+                max_tokens=None,
+                max_seqs=const.max_msa_seqs,
+                pad_to_max_seqs=False,
+                single_sequence_prop=0.0,
+                compute_frames=True,
+                inference_pocket_constraints=None,
+                inference_contact_constraints=None,
+                compute_constraint_features=True,
+                override_method=None,
+                compute_affinity=True,
+            )
 
         # ── Step 5: Move features to device and run forward ──────────
         if device is None:

@@ -13,8 +13,10 @@ back to the "ZINC" name-prefix convention. See
 """
 
 import argparse
+import os
 import sys
 import warnings
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -169,18 +171,67 @@ def _paired_receptor_scores(df, exp_a, exp_b, receptors):
     return out_a, out_b
 
 
+# ── parallel workers ─────────────────────────────────────────────────────────
+# Each task carries its own SeedSequence child, so the run is reproducible for a
+# given --seed no matter how many workers run or what order they finish in.
+
+def _bootstrap_condition(task):
+    exp, rec, lig_scores, dec_scores, lig_set, dec_set, n_boot, seed = task
+    rng = np.random.default_rng(seed)
+    boot_vals = bootstrap_logauc(lig_scores, dec_scores, lig_set, dec_set, n_boot, rng)
+    point = point_estimate_logauc(lig_scores, dec_scores, lig_set, dec_set, rng)
+    ties = tie_stats(list(lig_scores) + list(dec_scores))
+    return exp, rec, boot_vals, point, ties
+
+
+def _cluster_condition(task):
+    exp, receptor_scores, n_boot, seed = task
+    rng = np.random.default_rng(seed)
+    return exp, cluster_bootstrap_avg_logauc(receptor_scores, n_boot, rng)
+
+
+def _paired_condition(task):
+    exp, paired_a, paired_b, n_boot, seed = task
+    rng = np.random.default_rng(seed)
+    return exp, cluster_bootstrap_paired_difference(paired_a, paired_b, n_boot, rng)
+
+
+def _run_pool(fn, work, jobs):
+    """Map fn over work in a process pool when jobs > 1, else serially.
+    Yields results in completion order; callers key them by name."""
+    if jobs > 1 and len(work) > 1:
+        with ProcessPoolExecutor(max_workers=jobs) as ex:
+            yield from ex.map(fn, work, chunksize=1)
+    else:
+        for w in work:
+            yield fn(w)
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n-bootstraps", type=int, default=DEFAULT_BOOTSTRAPS,
                          help=f"Bootstrap replicates (min {MIN_BOOTSTRAPS}).")
+    parser.add_argument(
+        "--allow-low-bootstraps",
+        action="store_true",
+        help=(
+            "Allow exploratory runs below the standard minimum. "
+            "When set, the minimum is relaxed to 250 replicates."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--baseline-experiment", default=BASELINE_EXPERIMENT,
                          help="Experiment used as the comparison arm for paired differences.")
+    parser.add_argument("--jobs", "-j", type=int, default=min(8, os.cpu_count() or 1),
+                         help="Worker processes for the bootstrap (default: min(8, ncpu)).")
     args = parser.parse_args()
-    if args.n_bootstraps < MIN_BOOTSTRAPS:
-        parser.error(f"--n-bootstraps must be >= {MIN_BOOTSTRAPS} (got {args.n_bootstraps})")
+    min_bootstraps = 250 if args.allow_low_bootstraps else MIN_BOOTSTRAPS
+    if args.n_bootstraps < min_bootstraps:
+        parser.error(f"--n-bootstraps must be >= {min_bootstraps} (got {args.n_bootstraps})")
+    if args.jobs < 1:
+        parser.error(f"--jobs must be >= 1 (got {args.jobs})")
     return args
 
 
@@ -188,7 +239,6 @@ def main():
     args = parse_args()
     n_bootstraps = args.n_bootstraps
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(args.seed)
 
     print(f"Bootstrap replicates: {n_bootstraps}")
     print("Loading ablation data...")
@@ -202,20 +252,14 @@ def main():
     print(f"Experiments: {', '.join(experiments)}")
     print(f"Receptors ({len(receptors)}): {', '.join(receptors)}\n")
 
-    experiment_bootstraps = {}       # {experiment: {receptor: [logAUC vals]}}
     experiment_avg_bootstraps = {}   # {experiment: [naive avg_logAUC vals]} (deprecated, kept for the ridgeline plot)
-    experiment_tie_stats = {}        # {experiment: {receptor: tie_stats dict}}
-    experiment_point_est = {}        # {experiment: {receptor: point-estimate logAUC}}
-    experiment_receptor_scores = {}  # {experiment: {receptor: (lig_scores, dec_scores, lig_set, dec_set)}}
 
+    # Phase A (serial, cheap): dedup to best-per-compound and label actives /
+    # decoys for every (experiment, receptor). Phase B does the heavy lifting.
+    experiment_receptor_scores = {exp: {} for exp in experiments}  # {exp: {rec: (lig_scores, dec_scores, lig_set, dec_set)}}
+    label_sources = {}
     for exp in experiments:
-        print(f"Processing {exp}...")
         df_exp = df[df["experiment"] == exp]
-        per_rec = {}
-        per_rec_ties = {}
-        per_rec_point = {}
-        per_rec_scores = {}
-
         for receptor in receptors:
             df_rec = df_exp[df_exp["receptor_id"] == receptor]
             if df_rec.empty:
@@ -242,47 +286,58 @@ def main():
                           for r in best[best["ligand_id"].isin(lig_set)].itertuples()]
             dec_scores = [(r.ligand_id, r.affinity_pred_value)
                           for r in best[best["ligand_id"].isin(dec_set)].itertuples()]
-            per_rec_scores[receptor] = (lig_scores, dec_scores, lig_set, dec_set)
+            experiment_receptor_scores[exp][receptor] = (lig_scores, dec_scores, lig_set, dec_set)
+            label_sources[(exp, receptor)] = label_source
 
-            boot_vals = bootstrap_logauc(lig_scores, dec_scores, lig_set, dec_set, n_bootstraps, rng)
-            per_rec[receptor] = boot_vals
-            mean_val = np.nanmean(boot_vals)
+    # Phase B (parallel): per-(experiment, receptor) bootstrap + point estimate
+    # + tie stats. A SeedSequence child per condition keeps it reproducible.
+    conditions = [(exp, rec) for exp in experiments
+                  for rec in sorted(experiment_receptor_scores[exp])]
+    child_seeds = np.random.SeedSequence(args.seed).spawn(len(conditions))
+    boot_work = [
+        (exp, rec, *experiment_receptor_scores[exp][rec], n_bootstraps, seed)
+        for (exp, rec), seed in zip(conditions, child_seeds)
+    ]
 
-            ties = tie_stats(lig_scores + dec_scores)
-            per_rec_ties[receptor] = ties
-            per_rec_point[receptor] = point_estimate_logauc(lig_scores, dec_scores, lig_set, dec_set, rng)
+    print(f"\nBootstrapping {len(boot_work)} (experiment, receptor) conditions "
+          f"on {args.jobs} process(es)...")
+    experiment_bootstraps = {exp: {} for exp in experiments}
+    experiment_tie_stats = {exp: {} for exp in experiments}
+    experiment_point_est = {exp: {} for exp in experiments}
 
-            tie_flag = "  [TIED TOP-1%]" if ties["tied_top1pct_flag"] else ""
-            print(f"  [{exp}] {receptor}: mean logAUC = {mean_val:.2f} ({len(lig_set)} ligs, {len(dec_set)} decs, "
-                  f"labels={label_source}, "
-                  f"{ties['distinct_values']} distinct scores, largest tie block {ties['largest_tie_block']}){tie_flag}")
-            if ties["tied_top1pct_flag"]:
-                print(f"    WARNING: top-1% of the ranking is >=99% inside a single tied score block — "
-                      f"logAUC for [{exp}] {receptor} is determined by tie-break order, not by the model.")
+    for exp, rec, boot_vals, point, ties in _run_pool(_bootstrap_condition, boot_work, args.jobs):
+        experiment_bootstraps[exp][rec] = boot_vals
+        experiment_tie_stats[exp][rec] = ties
+        experiment_point_est[exp][rec] = point
+        lig_scores, dec_scores, lig_set, dec_set = experiment_receptor_scores[exp][rec]
+        mean_val = np.nanmean(boot_vals)
+        tie_flag = "  [TIED TOP-1%]" if ties["tied_top1pct_flag"] else ""
+        print(f"  [{exp}] {rec}: mean logAUC = {mean_val:.2f} ({len(lig_set)} ligs, {len(dec_set)} decs, "
+              f"labels={label_sources[(exp, rec)]}, "
+              f"{ties['distinct_values']} distinct scores, largest tie block {ties['largest_tie_block']}){tie_flag}")
+        if ties["tied_top1pct_flag"]:
+            print(f"    WARNING: top-1% of the ranking is >=99% inside a single tied score block — "
+                  f"logAUC for [{exp}] {rec} is determined by tie-break order, not by the model.")
 
-        experiment_bootstraps[exp] = per_rec
-        experiment_receptor_scores[exp] = per_rec_scores
-        experiment_tie_stats[exp] = per_rec_ties
-        experiment_point_est[exp] = per_rec_point
-
-        # Save per-receptor bootstraps
+    # Per-receptor bootstrap CSVs + the deprecated naive avg-bootstrap (kept
+    # only to drive the ridgeline plot's KDE). The naive avg is cheap and rides
+    # one shared RNG stream, so it stays serial.
+    from logauc_utils import compute_avg_logauc_bootstrap as _naive_avg_bootstrap
+    naive_rng = np.random.default_rng(np.random.SeedSequence(args.seed).spawn(1)[0])
+    for exp in experiments:
+        per_rec = experiment_bootstraps[exp]
         for rec, vals in per_rec.items():
-            out_file = OUT_DIR / f"{exp}_{rec}_bootstraps.csv"
-            pd.DataFrame({"logAUC": vals}).to_csv(out_file, index=False)
+            pd.DataFrame({"logAUC": vals}).to_csv(OUT_DIR / f"{exp}_{rec}_bootstraps.csv", index=False)
 
-        # Naive avg-bootstrap (deprecated -- see logauc_utils.compute_avg_logauc_bootstrap)
-        # kept only to drive the existing ridgeline plot's KDE, which needs a
-        # smooth per-experiment distribution, not a rigorous CI.
-        from logauc_utils import compute_avg_logauc_bootstrap as _naive_avg_bootstrap
-        naive_avg_boots = _naive_avg_bootstrap(per_rec, n_bootstraps, rng)
+        naive_avg_boots = _naive_avg_bootstrap(per_rec, n_bootstraps, naive_rng)
         experiment_avg_bootstraps[exp] = np.array(naive_avg_boots)
+        pd.DataFrame({"avg_logAUC": naive_avg_boots}).to_csv(
+            OUT_DIR / f"{exp}_avg_bootstraps.csv", index=False)
+        if len(naive_avg_boots):
+            mean_avg = np.nanmean(naive_avg_boots)
+            ci_low, ci_high = np.nanpercentile(naive_avg_boots, [2.5, 97.5])
+            print(f"  → {exp} avg logAUC: {mean_avg:.2f} (95% CI: [{ci_low:.2f}, {ci_high:.2f}])")
 
-        avg_file = OUT_DIR / f"{exp}_avg_bootstraps.csv"
-        pd.DataFrame({"avg_logAUC": naive_avg_boots}).to_csv(avg_file, index=False)
-
-        mean_avg = np.nanmean(naive_avg_boots)
-        ci_low, ci_high = np.nanpercentile(naive_avg_boots, [2.5, 97.5])
-        print(f"  → {exp} avg logAUC: {mean_avg:.2f} (95% CI: [{ci_low:.2f}, {ci_high:.2f}])\n")
 
     # Save summary tables
     summary_rows = []
@@ -317,10 +372,15 @@ def main():
     # rows in summary_per_receptor.csv are the within-receptor CIs that
     # support "this specific receptor" claims. See logauc_utils.py.
     print("\nComputing population-level cluster bootstrap (Task 3a/3b)...")
+    cluster_seeds = np.random.SeedSequence(args.seed + 1).spawn(len(experiments))
+    cluster_work = [(exp, experiment_receptor_scores[exp], n_bootstraps, seed)
+                    for exp, seed in zip(experiments, cluster_seeds)]
+    cluster_boots_by_exp = {exp: boots
+                            for exp, boots in _run_pool(_cluster_condition, cluster_work, args.jobs)}
+
     avg_rows = []
     for exp in experiments:
-        receptor_scores = experiment_receptor_scores[exp]
-        cluster_boots = cluster_bootstrap_avg_logauc(receptor_scores, n_bootstraps, rng)
+        cluster_boots = cluster_boots_by_exp[exp]
         point_ests = list(experiment_point_est[exp].values())
         point_estimate = float(np.nanmean(point_ests)) if point_ests else float("nan")
         jackknife_vals = jackknife_leave_one_out_means(point_ests)
@@ -331,7 +391,7 @@ def main():
 
         avg_rows.append({
             "experiment": exp,
-            "n_receptors": len(receptor_scores),
+            "n_receptors": len(experiment_receptor_scores[exp]),
             "point_estimate_avg_logAUC": point_estimate,
             "mean_cluster_avg_logAUC": float(np.nanmean(cluster_boots)) if cluster_boots else float("nan"),
             "cluster_ci_percentile_low": float(np.nanpercentile(cluster_boots, 2.5)) if cluster_boots else float("nan"),
@@ -345,7 +405,7 @@ def main():
             "deprecated_naive_ci_high": float(np.nanpercentile(experiment_avg_bootstraps[exp], 97.5)),
         })
         print(f"  {exp}: cluster avg logAUC = {avg_rows[-1]['mean_cluster_avg_logAUC']:.2f} "
-              f"(BCa 95% CI: [{bca_lo:.2f}, {bca_hi:.2f}], n={len(receptor_scores)} receptors)")
+              f"(BCa 95% CI: [{bca_lo:.2f}, {bca_hi:.2f}], n={len(experiment_receptor_scores[exp])} receptors)")
 
     pd.DataFrame(avg_rows).to_csv(OUT_DIR / "summary_avg_logAUC.csv", index=False)
 
@@ -356,15 +416,23 @@ def main():
     # not imply "not significantly different."
     if args.baseline_experiment in experiment_receptor_scores:
         print(f"\nComputing paired differences vs. {args.baseline_experiment!r} (Task 3c)...")
-        baseline_scores_raw = experiment_receptor_scores[args.baseline_experiment]
-        paired_rows = []
+        paired_inputs = []
         for exp in experiments:
             if exp == args.baseline_experiment:
                 continue
             paired_a, paired_b = _paired_receptor_scores(df, exp, args.baseline_experiment, receptors)
             if not paired_a:
                 continue
-            diffs = cluster_bootstrap_paired_difference(paired_a, paired_b, n_bootstraps, rng)
+            paired_inputs.append((exp, paired_a, paired_b))
+        paired_seeds = np.random.SeedSequence(args.seed + 2).spawn(len(paired_inputs))
+        paired_work = [(exp, pa, pb, n_bootstraps, seed)
+                       for (exp, pa, pb), seed in zip(paired_inputs, paired_seeds)]
+        diffs_by_exp = {exp: diffs
+                        for exp, diffs in _run_pool(_paired_condition, paired_work, args.jobs)}
+
+        paired_rows = []
+        for exp, pa, _pb in paired_inputs:
+            diffs = diffs_by_exp.get(exp)
             if not diffs:
                 continue
             mean_diff = float(np.nanmean(diffs))
@@ -373,7 +441,7 @@ def main():
             paired_rows.append({
                 "experiment": exp,
                 "baseline_experiment": args.baseline_experiment,
-                "n_receptors": len(paired_a),
+                "n_receptors": len(pa),
                 "mean_diff_logAUC": mean_diff,
                 "ci_low": ci_lo,
                 "ci_high": ci_hi,

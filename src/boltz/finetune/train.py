@@ -258,6 +258,19 @@ def train_finetune(
 
     # ── Checkpoint / resume ───────────────────────────────────────────────────
     ckpt_dir = registry.adapter_dir(args.name)
+
+    # Guard: refuse to overwrite a *completed* fine-tune (meta.json present)
+    # unless --overwrite was passed. Checked before creating the checkpoint dir
+    # so the error is raised before any work is done. Mirrors train_lora; the
+    # final registry.save below always uses overwrite=True because this trainer
+    # itself owns ckpt_dir (it writes the per-epoch checkpoints into it).
+    if not args.overwrite and (ckpt_dir / "meta.json").exists():
+        msg = (
+            f"Fine-tune '{args.name}' already exists at {ckpt_dir}. "
+            "Use --overwrite or `boltz finetune update` to continue training."
+        )
+        raise FileExistsError(msg)
+
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     start_epoch = 0
 
@@ -489,7 +502,10 @@ def train_finetune(
         k: full_state[k].detach().cpu().clone()
         for k in trainable_names if k in full_state
     }
-    registry.save(record, partial_state, overwrite=args.overwrite)
+    # ckpt_dir already exists (created for checkpoints above), so always
+    # overwrite here; the completion guard before training already rejected a
+    # finished arm re-run without --overwrite. Mirrors train_lora.
+    registry.save(record, partial_state, overwrite=True)
 
     return record
 

@@ -61,6 +61,10 @@ from boltz.affinity_rescoring.validation import (
 
 logger = logging.getLogger(__name__)
 
+# Sentinel chain id: "bind this SMILES to whichever chain(s) turn out to be the
+# ligand", resolved in rescore_pdb once the structure has been parsed.
+ANY_LIGAND_CHAIN = "*"
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -327,6 +331,15 @@ class AffinityRescorer:
                 ligand_atoms = [a for a in atoms if a.chain_id in set(chain_assignment.ligand_chains)]
                 result.ligand_atom_count = len(ligand_atoms)
 
+                # A per-compound SMILES arrives keyed by ANY_LIGAND_CHAIN because
+                # the caller cannot know the ligand's chain id before this point.
+                # Monomers put the ligand in chain B, but homodimers (two protein
+                # chains) put it in C — hardcoding B silently dropped the SMILES
+                # for every homodimer and sent it back to coordinate inference.
+                if ligand_smiles and ANY_LIGAND_CHAIN in ligand_smiles:
+                    smi = ligand_smiles[ANY_LIGAND_CHAIN]
+                    ligand_smiles = {c: smi for c in chain_assignment.ligand_chains}
+
                 # Step 6: Resolve ligand SMILES (user-provided or auto-inferred)
                 resolved_smiles, smiles_warnings = infer_ligand_smiles_from_structure(
                     atoms=atoms,
@@ -483,14 +496,14 @@ class AffinityRescorer:
 
         for pdb_file in files_iter:
             try:
-                # Resolve per-compound SMILES when available.  The labels CSV
-                # uses the file stem as the compound id and always places the
-                # ligand in chain B (set by prepare_validation_inputs.py via
-                # _next_chain_id, which picks the first unused letter after A).
+                # Resolve per-compound SMILES when available. The ligand's chain
+                # id is not known until the PDB is parsed in rescore_pdb (chain B
+                # for a monomer, C for a homodimer), so key it generically and let
+                # rescore_pdb bind it to the detected ligand chain(s).
                 stem = Path(pdb_file).stem
                 per_compound = None
                 if compound_smiles and stem in compound_smiles:
-                    per_compound = {"B": compound_smiles[stem]}
+                    per_compound = {ANY_LIGAND_CHAIN: compound_smiles[stem]}
                 effective_smiles = per_compound if per_compound is not None else ligand_smiles
 
                 result = self.rescore_pdb(

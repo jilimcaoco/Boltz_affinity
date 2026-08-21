@@ -32,7 +32,14 @@ set -euo pipefail
 
 # ── Environment ──────────────────────────────────────────────────────
 #module load cuda/12.8.1
-source ~/miniconda3/etc/profile.d/conda.sh
+CONDA_BASE="${CONDA_BASE:-/home/limcaoco/opt/anaconda3}"
+CONDA_INIT="${CONDA_BASE}/etc/profile.d/conda.sh"
+if [[ ! -f "${CONDA_INIT}" ]]; then
+    echo "ERROR: Conda initialization script not found: ${CONDA_INIT}" >&2
+    echo "Set CONDA_BASE to the Conda installation root when submitting." >&2
+    exit 1
+fi
+source "${CONDA_INIT}"
 conda activate boltz_affinity
 
 # Ensure conda's C/C++ runtime is preferred over system libstdc++ on compute nodes.
@@ -67,7 +74,7 @@ fi
 echo "[$(date)] task ${SLURM_ARRAY_TASK_ID} receptor=${RECEPTOR}"
 
 # ── Paths ───────────────────────────────────────────────────────────
-BOLTZ_OUTPUTS_ROOT="${BOLTZ_OUTPUTS_ROOT:-/scratch/maom_root/maom/limcaoco/Boltz_outputs}"
+BOLTZ_OUTPUTS_ROOT="${BOLTZ_OUTPUTS_ROOT:-/scratch/maom_root/maom/limcaoco/Boltz_benchmark_outputs/Boltz_outputs}"
 DUDEZ_INPUTS_ROOT="${DUDEZ_INPUTS_ROOT:-/home/limcaoco/turbo/limcaoco/boltz_benchmark/input_files/DUDEZ_benchmark}"
 MSA_DIR="${MSA_DIR:-/home/limcaoco/turbo/limcaoco/boltz_benchmark/input_files/msa}"
 
@@ -160,6 +167,7 @@ python ablation_experiment/experiment_scripts/run_feature_ablation_dudez.py \
     --msa-dir "${MSA_DIR}" \
     --trunk-cache-dir "${TRUNK_CACHE_DIR}" \
     --donor-pool-size "${DONOR_POOL_SIZE:-64}" \
+    --keep-trunk-cache \
     --output "${OUTPUT}" \
     --log-level INFO \
     ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
@@ -178,7 +186,10 @@ fi
 # downstream number while the analysis scripts ran happily.
 echo "[$(date)] running trunk-cache fidelity gate for ${RECEPTOR}"
 python ablation_experiment/experiment_scripts/verify_trunk_cache.py \
-    --receptor "${RECEPTOR}" \
+    --dudez-receptor "${RECEPTOR}" \
+    --boltz-outputs-root "${BOLTZ_OUTPUTS_ROOT}" \
+    --dudez-inputs-root "${DUDEZ_INPUTS_ROOT}" \
+    --msa-dir "${MSA_DIR}" \
     --trunk-cache-dir "${TRUNK_CACHE_DIR}" \
     --n-samples 50 \
     --output "ablation_experiment/analysis_data/cache_fidelity_${RECEPTOR}.csv" \
