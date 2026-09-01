@@ -53,6 +53,30 @@ class TestCacheIO:
         # z is stored fp16 for disk compactness
         assert entry["z"].dtype == torch.float16
 
+    def test_token_repr_pos_multiplicity_axis_is_stripped(self, tmp_path):
+        """The runners build token_repr_pos as ``token_to_rep_atom[0] @ coords[0]``,
+        which keeps a leading multiplicity axis: (1, N, 3). Stored as-is, the
+        distogram substitution pads that axis instead of the token axis and every
+        distogram-resampling cell dies with a broadcast error."""
+        tc.save_cache_entry(
+            tmp_path, "AA2AR", "lig1",
+            z=torch.randn(1, 10, 10, 8), s_inputs=torch.randn(1, 10, 6),
+            token_repr_pos=torch.randn(1, 10, 3), use_kernels=False,
+        )
+        entry = tc.load_cache_entry(tmp_path, "AA2AR", "lig1")
+        assert entry["token_repr_pos"].shape == (10, 3)
+        out, delta = tc.substitute_channel("distogram", 10, entry)
+        assert out.shape == (10, 3)
+        assert delta == 0
+
+    def test_misaligned_token_repr_pos_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="token_repr_pos"):
+            tc.save_cache_entry(
+                tmp_path, "AA2AR", "lig1",
+                z=torch.randn(1, 10, 10, 8), s_inputs=torch.randn(1, 10, 6),
+                token_repr_pos=torch.randn(7, 3), use_kernels=False,
+            )
+
     def test_load_missing_returns_none(self, tmp_path):
         assert tc.load_cache_entry(tmp_path, "AA2AR", "nope") is None
 
@@ -107,6 +131,29 @@ class TestCropOrPadTokens:
         assert delta == -4
         assert out.shape == (6, 6, 4)
         assert torch.equal(out, t[:6, :6, :])
+
+
+class TestDonorRng:
+    """Seeding on donor_seed alone made every query in a token-count bucket
+    draw the same donor, so a whole receptor collapsed onto ~1 donor per seed."""
+
+    def test_same_seed_different_ligands_draw_independently(self):
+        pool = [f"d{i}" for i in range(20)]
+        picks = {
+            lig: pool[int(tc.donor_rng(11, lig).integers(0, len(pool)))]
+            for lig in (f"q{i}" for i in range(200))
+        }
+        assert len(set(picks.values())) > 10
+
+    def test_reproducible_across_calls(self):
+        a = tc.donor_rng(11, "CHEMBL123").integers(0, 1_000_000)
+        b = tc.donor_rng(11, "CHEMBL123").integers(0, 1_000_000)
+        assert a == b
+
+    def test_seed_changes_the_draw(self):
+        draws = {int(tc.donor_rng(s, "CHEMBL123").integers(0, 1_000_000))
+                 for s in (11, 22, 33, 44, 55)}
+        assert len(draws) == 5
 
 
 class TestDonorMatching:

@@ -25,9 +25,9 @@
 #   Zero ablation (existing)   -> ablation_experiment/results/dudez_ablation/<R>_dudez_ablation.csv
 #   Replacement ablation (this)-> ablation_experiment/results/dudez_ablation_resample/<R>_dudez_ablation_resample.csv
 #
-# Default --experiments is every "__resample__d<seed>" variant of the 7
-# non-baseline factorial cells (5 donor seeds each = 35 experiments). The
-# resample operator needs a donor pool, so (unlike the zero-only run) this
+# Default --experiments is baseline plus every "__resample__d<seed>" variant
+# of the 7 non-baseline factorial cells (5 donor seeds each = 36 experiments).
+# The resample operator needs a donor pool, so (unlike the zero-only run) this
 # WILL populate/consume the trunk cache -- see run_feature_ablation_dudez.py
 # for the storage accounting.
 #
@@ -153,15 +153,24 @@ for p in "${SMILES_CSV}" "${MSA_PATH}"; do
 done
 
 # ── Experiment selection ────────────────────────────────────────────
-# Default: all 5 donor-seed resample variants of the 7 non-baseline
-# factorial cells (35 experiments). Override with EXPERIMENTS="a b c" to
-# run a subset (e.g. just one cell while debugging).
+# Default: baseline, the identity control, and all 5 donor-seed resample
+# variants of the 7 non-baseline factorial cells (37 experiments). Override
+# with EXPERIMENTS="a b c" to run a subset (e.g. one cell while debugging).
+#
+# baseline is measured in-run rather than borrowed from the zero-ablation
+# results: it is the v(full) denominator for every delta and NAE, so a
+# silent config drift (mw correction, recycling steps, checkpoint, ligand
+# set) between the two runs would bias every number here. The 7 zero cells
+# ARE borrowed from ablation_experiment/results/dudez_ablation/.
+#
+# identity__resample__self must reproduce baseline exactly; any row where it
+# does not indicates a substitution-plumbing bug.
 if [[ -n "${EXPERIMENTS:-}" ]]; then
     read -r -a EXPERIMENT_LIST <<< "${EXPERIMENTS}"
 else
     CELLS=(no_distogram no_z_trunk no_s_inputs distogram_only z_trunk_only s_inputs_only bias_only)
     SEEDS=(11 22 33 44 55)
-    EXPERIMENT_LIST=()
+    EXPERIMENT_LIST=(baseline identity__resample__self)
     for c in "${CELLS[@]}"; do
         for s in "${SEEDS[@]}"; do
             EXPERIMENT_LIST+=("${c}__resample__d${s}")
@@ -179,7 +188,13 @@ if [[ "${INCLUDE_MW_CORRECTION:-0}" == "1" ]]; then
 fi
 
 # ── Run ─────────────────────────────────────────────────────────────
-EXTRA_ARGS=("${@}")
+# Blank args are dropped here too: sbatch forwards whatever it was given, and
+# a single stray whitespace argument makes argparse reject the whole command.
+EXTRA_ARGS=()
+for _a in "${@}"; do
+    [[ -z "${_a//[[:space:]]/}" ]] && continue
+    EXTRA_ARGS+=("${_a}")
+done
 echo "[$(date)] launching run_feature_ablation_dudez.py (replacement/resample)"
 python ablation_experiment/experiment_scripts/run_feature_ablation_dudez.py \
     --receptor "${RECEPTOR}" \

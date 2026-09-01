@@ -176,6 +176,9 @@ class AblationExperiment:
     operator: str = "zero"
     resample_channels: Tuple[str, ...] = ()
     donor_seed: Optional[int] = None
+    # Identity control: donate from the query itself, so every substituted
+    # channel is byte-identical to what baseline would have used.
+    donor_self: bool = False
 
 
 # Registry of all named experiments
@@ -247,6 +250,18 @@ for _cell_name, _kept in _FACTORIAL_CELLS_KEPT_CHANNELS.items():
         operator="mean",
         resample_channels=_ablated,
     )
+
+# Identity control: substitutes all three channels from the query itself, so it
+# MUST reproduce baseline. Any drift means the substitution plumbing (axis
+# handling, cross-pair masking, precision) is wrong -- which is exactly how the
+# distogram axis bug and the unmasked donor z went unnoticed. Only meaningful
+# for ligands that made it into the donor pool; others are skipped.
+_register(
+    "identity__resample__self",
+    operator="resample",
+    resample_channels=_TOP_LEVEL_CHANNELS,
+    donor_self=True,
+)
 
 # ── Pose-noise sweep (proposal #1) ────────────────────────────────────
 # Perturb only ligand atoms by Gaussian noise of σ ∈ {0.25, 0.5, 1, 2, 5, 10} Å.
@@ -1019,7 +1034,6 @@ def _run_resample_or_mean(
     the zero_*/pose_noise flags (orthogonal to this operator; unset for all
     resample/mean registry entries).
     """
-    import numpy as np
     import torch
 
     z = trunk_out["z"]
@@ -1035,27 +1049,38 @@ def _run_resample_or_mean(
     substituted_repr_pos = None
 
     if exp.operator == "resample":
-        rng = np.random.default_rng(exp.donor_seed)
-        for channel in exp.resample_channels:
+        # ONE donor per cell, drawn before the channel loop: a cell that ablates
+        # several channels must substitute a single coherent complex, not a
+        # chimera assembled from a different ligand per channel.
+        if exp.donor_self:
+            donor_id = ligand_name if donor_pool.entry(ligand_name) is not None else None
+            match_kind = "self"
+        else:
+            rng = trunk_cache.donor_rng(exp.donor_seed, ligand_name)
             match = donor_pool.find_donor(ligand_name, query_n_tokens, rng)
-            if match is None:
-                skip_reasons.append(f"{channel}: no donor available")
-                continue
-            donor_entry = donor_pool.entry(match.donor_ligand_id)
-            donor_ids[channel] = match.donor_ligand_id
-            substituted, delta = trunk_cache.substitute_channel(channel, query_n_tokens, donor_entry)
-            if match.match_kind == "nearest":
-                logger.warning(
-                    f"  [{exp.name}] {ligand_name}: donor {match.donor_ligand_id} "
-                    f"n_tokens={match.donor_n_tokens} != query n_tokens={query_n_tokens} "
-                    f"(nearest match, {'padded' if delta > 0 else 'cropped'} by {abs(delta)})"
+            # A non-exact match is crop/zero-padded, which silently reintroduces
+            # zero-ablation over part of the tensor -- and for the distogram puts
+            # padded tokens at the origin, a real location the head reads as a
+            # confident contact. Skip instead, and let the analysis account for
+            # the missing rows.
+            donor_id = match.donor_ligand_id if match and match.match_kind == "exact" else None
+            match_kind = match.match_kind if match else "none"
+
+        if donor_id is None:
+            skip_reasons.append(f"no exact-token-count donor (match={match_kind})")
+        else:
+            donor_entry = donor_pool.entry(donor_id)
+            for channel in exp.resample_channels:
+                donor_ids[channel] = donor_id
+                substituted, _delta = trunk_cache.substitute_channel(
+                    channel, query_n_tokens, donor_entry
                 )
-            if channel == "z_trunk":
-                substituted_z = substituted
-            elif channel == "s_inputs":
-                substituted_s = substituted
-            elif channel == "distogram":
-                substituted_repr_pos = substituted
+                if channel == "z_trunk":
+                    substituted_z = substituted
+                elif channel == "s_inputs":
+                    substituted_s = substituted
+                elif channel == "distogram":
+                    substituted_repr_pos = substituted
     elif exp.operator == "mean":
         for channel in exp.resample_channels:
             n_donors = len(donor_pool) - (1 if donor_pool.entry(ligand_name) is not None else 0)
@@ -1084,16 +1109,26 @@ def _run_resample_or_mean(
     cross_pair_mask = _build_cross_pair_mask(batch)
     z_affinity = z * cross_pair_mask[None, :, :, None]
     if substituted_z is not None:
+        # The donor's z must go through the query's cross-pair mask too, or the
+        # resample cell alone would feed the head receptor-receptor pair entries
+        # that every other condition (including baseline) zeroes out.
         z_affinity = substituted_z.to(device=device, dtype=dtype).unsqueeze(0)
+        z_affinity = z_affinity * cross_pair_mask[None, :, :, None]
 
     coords_affinity = _coords_affinity(batch)
     if substituted_repr_pos is not None:
+        # coords_affinity is (B, multiplicity, n_atoms, 3); the affinity module
+        # derives the distogram as bmm(token_to_rep_atom, x_pred), so writing
+        # donor positions at each token's representative atom substitutes the
+        # distogram exactly. Index the ATOM axis, not the multiplicity axis.
         token_to_rep_atom = batch["token_to_rep_atom"][0]
         rep_atom_idx = token_to_rep_atom.argmax(dim=-1)
         donor_pos = substituted_repr_pos.to(device=coords_affinity.device, dtype=coords_affinity.dtype)
+        if donor_pos.dim() == 3:
+            donor_pos = donor_pos[0]
         n = min(rep_atom_idx.shape[0], donor_pos.shape[0])
         coords_affinity = coords_affinity.clone()
-        coords_affinity[0, rep_atom_idx[:n]] = donor_pos[:n]
+        coords_affinity[:, :, rep_atom_idx[:n]] = donor_pos[:n]
 
     s_inputs = _affinity_input_embed_with_ablation(model, batch)
     if substituted_s is not None:

@@ -43,6 +43,7 @@ resample/mean substitution happens at replay time in
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass
@@ -76,12 +77,22 @@ def save_cache_entry(
 
     z0 = z[0] if z.dim() == 4 else z          # (N, N, C)
     s0 = s_inputs[0] if s_inputs.dim() == 3 else s_inputs  # (N, C)
+    # Callers build this as ``token_to_rep_atom[0] @ coords[0]``, where coords
+    # still carries a multiplicity axis -- so it arrives as (1, N, 3). Storing
+    # it that way makes crop_or_pad_tokens pad the multiplicity axis instead of
+    # the token axis.
+    p0 = token_repr_pos[0] if token_repr_pos.dim() == 3 else token_repr_pos  # (N, 3)
     n_tokens = int(s0.shape[0])
+    if int(p0.shape[0]) != n_tokens:
+        raise ValueError(
+            f"token_repr_pos has {p0.shape[0]} tokens but s_inputs has {n_tokens} "
+            f"({receptor_id}/{ligand_id}); refusing to cache a misaligned entry."
+        )
 
     payload = {
         "z": z0.detach().to("cpu", dtype=torch.float16).contiguous(),
         "s_inputs": s0.detach().to("cpu", dtype=torch.float32).contiguous(),
-        "token_repr_pos": token_repr_pos.detach().to("cpu", dtype=torch.float32).contiguous(),
+        "token_repr_pos": p0.detach().to("cpu", dtype=torch.float32).contiguous(),
         "n_tokens": n_tokens,
         "use_kernels": bool(use_kernels),
         "meta": meta or {},
@@ -191,6 +202,23 @@ def crop_or_pad_tokens(tensor, target_n: int, token_dims: Tuple[int, ...]):
 
 
 # ── donor matching ──────────────────────────────────────────────────────────
+
+def donor_rng(donor_seed: Optional[int], query_ligand_id: str):
+    """RNG for one query's donor draw, seeded on ``(donor_seed, ligand)``.
+
+    Seeding on ``donor_seed`` alone gives every query an identical RNG state,
+    so ``find_donor`` returns the same rank within each token-count bucket and
+    a whole receptor collapses onto ~1 donor per seed -- no donor-draw variance
+    in the data, and donor identity correlated with the query's token count
+    (hence its size/MW). Mixing the ligand id in restores independent draws
+    while staying reproducible; ``hash()`` cannot be used because it is salted
+    per process.
+    """
+    import numpy as np
+
+    digest = hashlib.blake2b(query_ligand_id.encode("utf-8"), digest_size=8).digest()
+    return np.random.default_rng([int(donor_seed or 0), int.from_bytes(digest, "big")])
+
 
 @dataclass
 class DonorMatch:

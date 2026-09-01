@@ -70,6 +70,7 @@ if str(_script_dir) not in sys.path:
     sys.path.insert(0, str(_script_dir))
 
 import numpy as np  # noqa: E402
+import torch  # noqa: E402
 import trunk_cache  # noqa: E402
 
 # Re-use the MOL2 runner's registry, shared featurization, and head-replay
@@ -655,8 +656,15 @@ def run_for_receptor(args: argparse.Namespace) -> int:
                 }
             else:
                 _t = affinity_trunk_forward(model, batch, recycling_steps=args.recycling_steps)
-                trunk_out = {"z": _t["z"], "use_kernels": _t["use_kernels"]}
-                query_n_tokens = int(_t["z"].shape[1])
+                # Donor-pool members come back through the fp16 disk cache, so
+                # round every query's z the same way -- otherwise the query and
+                # the donor it is compared against sit in different precision
+                # regimes, and pool membership becomes a hidden covariate.
+                _z = _t["z"]
+                if needs_donors:
+                    _z = _z.to(torch.float16).to(dtype=model_dtype)
+                trunk_out = {"z": _z, "use_kernels": _t["use_kernels"]}
+                query_n_tokens = int(_z.shape[1])
         except Exception as exc:  # noqa: BLE001
             logger.error(f"  trunk forward failed: {exc}")
             _write_rows(output_path, [
