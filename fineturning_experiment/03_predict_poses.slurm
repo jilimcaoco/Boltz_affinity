@@ -45,7 +45,8 @@ python "${EXP_DIR}/prepare_predict_inputs.py" \
     --drd4-receptor "${DRD4_RECEPTOR_YAML}" \
     --ht2a-receptor "${HT2A_RECEPTOR_YAML}" \
     --msa-dir       "${MSA_DIR}" \
-    --out-dir       "${PREDICT_INPUT_DIR}"
+    --out-dir       "${PREDICT_INPUT_DIR}" \
+    ${KEEP_CENSORED:+--keep-censored}
 
 # ─── 3b. Run Boltz prediction for each target (no MSA server needed) ────────
 for TGT in DRD4 5HT2A; do

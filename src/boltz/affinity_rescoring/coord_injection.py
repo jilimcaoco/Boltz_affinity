@@ -15,6 +15,8 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
+from boltz.affinity_rescoring.parsers import THREE_TO_ONE, normalize_residue_name
+from boltz.data import const
 from boltz.data.types import (
     Coords,
     Ensemble,
@@ -22,6 +24,181 @@ from boltz.data.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A PDB residue as seen by the mapper: ((residue_number, insertion_code), name).
+PdbResidue = Tuple[Tuple[int, str], str]
+
+# Realignment acceptance: aligned residue-name identity and the fraction of the
+# PDB's amino-acid residues that found a partner in the processed chain.
+MIN_ALIGNED_IDENTITY = 0.90
+MIN_ALIGNED_COVERAGE = 0.90
+# Consecutive resolved CA atoms are ~3.8 Å apart (cis-Pro ~2.9 Å).
+MAX_CA_CA_DISTANCE = 4.5
+
+
+class ResidueMappingError(ValueError):
+    """PDB residues could not be confidently matched to the processed chain."""
+
+
+def _one_letter(name: str) -> str:
+    return THREE_TO_ONE.get(normalize_residue_name(name), "X")
+
+
+def map_chain_residues(
+    pdb_residues: List[PdbResidue],
+    processed_names: List[str],
+    *,
+    chain_label: str = "?",
+) -> Tuple[Dict[Tuple[int, str], int], bool]:
+    """Map PDB residues of one protein chain onto processed residue indices.
+
+    1. **Positional check.** If both lists have the same length and every
+       residue name agrees (after normalising force-field / modified names),
+       residue *i* maps to processed residue *i* — the historical behaviour.
+    2. **Realignment.** Otherwise the order cannot be trusted (unmodelled
+       termini or loops, SEQRES gap filling, insertion codes, CA-less or
+       in-chain non-polymer residues). The PDB's amino-acid residues are
+       globally aligned (free end gaps) to the processed sequence, and each
+       aligned pair maps a PDB ``(residue_number, insertion_code)`` to its
+       processed index. Non-amino-acid PDB residues are left unmapped.
+
+    Returns ``(mapping, realigned)``. Raises :class:`ResidueMappingError`
+    when the realignment has < 90% residue identity or covers < 90% of the
+    PDB's amino-acid residues, i.e. the chain is probably the wrong one or
+    the sequences genuinely differ.
+    """
+    pdb_norm = [normalize_residue_name(n) for _, n in pdb_residues]
+    proc_norm = [normalize_residue_name(n) for n in processed_names]
+    if pdb_norm == proc_norm:
+        return {key: i for i, (key, _) in enumerate(pdb_residues)}, False
+
+    aa = [(key, name) for key, name in pdb_residues
+          if normalize_residue_name(name) in THREE_TO_ONE]
+    if not aa:
+        msg = f"Chain {chain_label}: PDB chain has no amino-acid residues to map."
+        raise ResidueMappingError(msg)
+
+    from Bio import Align
+
+    aligner = Align.PairwiseAligner()
+    aligner.mode = "global"
+    aligner.match_score = 2.0
+    aligner.mismatch_score = -1.0
+    aligner.open_gap_score = -5.0
+    aligner.extend_gap_score = -0.5
+    aligner.target_end_gap_score = 0.0
+    aligner.query_end_gap_score = 0.0
+
+    proc_seq = "".join(_one_letter(n) for n in processed_names)
+    pdb_seq = "".join(_one_letter(n) for _, n in aa)
+    alignment = aligner.align(proc_seq, pdb_seq)[0]
+
+    mapping: Dict[Tuple[int, str], int] = {}
+    n_identical = 0
+    for (t0, t1), (q0, q1) in zip(*alignment.aligned):
+        for k in range(t1 - t0):
+            mapping[aa[q0 + k][0]] = t0 + k
+            n_identical += proc_seq[t0 + k] == pdb_seq[q0 + k]
+    n_mapped = len(mapping)
+    identity = n_identical / n_mapped if n_mapped else 0.0
+    coverage = n_mapped / len(aa)
+
+    summary = (
+        f"Chain {chain_label}: {len(pdb_residues)} PDB residues vs "
+        f"{len(processed_names)} processed; realigned {n_mapped}/{len(aa)} "
+        f"amino-acid residues at {identity:.1%} identity"
+    )
+    if identity < MIN_ALIGNED_IDENTITY or coverage < MIN_ALIGNED_COVERAGE:
+        msg = (
+            f"{summary} (need >= {MIN_ALIGNED_IDENTITY:.0%} identity and "
+            f">= {MIN_ALIGNED_COVERAGE:.0%} coverage). The structure's residues "
+            "do not match the sequence used for featurisation."
+        )
+        raise ResidueMappingError(msg)
+    logger.info("Positional residue mapping failed; %s.", summary)
+    return mapping, True
+
+
+def _check_ca_continuity(
+    struct: StructureV2,
+    chain: np.void,
+    injected: Dict[int, np.ndarray],
+    *,
+    chain_label: str,
+    strict: bool,
+) -> None:
+    """Flag adjacent processed residues whose injected CAs are too far apart.
+
+    Two residues adjacent in the processed sequence that both received a CA
+    must be ~3.8 Å apart; larger distances mean neighbouring residues were
+    given coordinates from non-neighbouring PDB residues. ``strict`` (used
+    for realigned chains) raises when violations exceed max(2, 1%) of the
+    adjacent pairs; otherwise they are only logged.
+    """
+    res_start = int(chain["res_idx"])
+    ca_coords: List[Optional[np.ndarray]] = []
+    for res in struct.residues[res_start:res_start + int(chain["res_num"])]:
+        a0 = int(res["atom_idx"])
+        ca = None
+        for idx in range(a0, a0 + int(res["atom_num"])):
+            if str(struct.atoms[idx]["name"]).strip() == "CA":
+                ca = injected.get(idx)
+                break
+        ca_coords.append(ca)
+
+    n_pairs = 0
+    bad: List[Tuple[int, float]] = []
+    for i in range(len(ca_coords) - 1):
+        a, b = ca_coords[i], ca_coords[i + 1]
+        if a is None or b is None:
+            continue
+        n_pairs += 1
+        d = float(np.linalg.norm(a - b))
+        if d > MAX_CA_CA_DISTANCE:
+            bad.append((i, d))
+    if not bad:
+        return
+    detail = ", ".join(f"{i}-{i + 1}: {d:.1f} Å" for i, d in bad[:5])
+    msg = (
+        f"Chain {chain_label}: {len(bad)}/{n_pairs} adjacent residue pairs "
+        f"have CA-CA > {MAX_CA_CA_DISTANCE} Å ({detail})."
+    )
+    if strict and len(bad) > max(2, 0.01 * n_pairs):
+        raise ResidueMappingError(msg + " Residue mapping is inconsistent.")
+    logger.warning(msg)
+
+
+def map_chains_by_name(
+    processed_structure: StructureV2,
+    pdb_chain_ids: List[str],
+) -> Dict[str, int]:
+    """Map PDB chain IDs to processed ``asym_id`` values by chain name.
+
+    PDB chains whose ID equals a processed chain's ``name`` (the YAML ``id``)
+    are paired directly. Any left over are paired with the remaining
+    processed chains in order, with a warning; the residue check in
+    :func:`inject_pdb_coords_into_structure` catches a wrong pairing for
+    protein chains.
+    """
+    chains = processed_structure.chains[processed_structure.mask]
+    by_name = {str(c["name"]): int(c["asym_id"]) for c in chains}
+    mapping: Dict[str, int] = {}
+    leftover: List[str] = []
+    for cid in pdb_chain_ids:
+        if cid in by_name:
+            mapping[cid] = by_name[cid]
+        else:
+            leftover.append(cid)
+    if leftover:
+        used = set(mapping.values())
+        free = [int(c["asym_id"]) for c in chains if int(c["asym_id"]) not in used]
+        paired = dict(zip(leftover, free))
+        logger.warning(
+            "PDB chains %s have no processed chain of the same name; paired "
+            "by order: %s.", leftover, paired,
+        )
+        mapping.update(paired)
+    return mapping
 
 
 def inject_pdb_coords_into_structure(
@@ -31,9 +208,13 @@ def inject_pdb_coords_into_structure(
 ) -> Tuple[StructureV2, List[int]]:
     """Inject PDB atom coordinates into a processed StructureV2.
 
-    Matches atoms by chain_id → residue_index → atom_name. For any atom
-    in the processed structure that has a matching PDB atom, the PDB
-    coordinate is used. Unmatched atoms are zeroed out (coords set to
+    Matches atoms by chain_id → residue_index → atom_name. For protein
+    chains the residue index comes from :func:`map_chain_residues` (positional
+    when residue names agree, otherwise a realignment on the PDB's own residue
+    numbering), followed by a CA-CA continuity check; a mapping that cannot be
+    made consistent raises :class:`ResidueMappingError` instead of silently
+    shifting coordinates. For any atom in the processed structure that has a
+    matching PDB atom, the PDB coordinate is used. Unmatched atoms are zeroed out (coords set to
     ``[0, 0, 0]``) and their ``is_present`` flag remains ``False``.
 
     Parameters
@@ -54,8 +235,14 @@ def inject_pdb_coords_into_structure(
         A new StructureV2 with PDB coordinates injected, and a list of
         atom indices that had no PDB match (coords zeroed).
     """
-    # Build a lookup: (asym_id, residue_idx_0based, atom_name) → (x, y, z)
-    # Group PDB atoms by chain, then sort by residue number to get 0-based index
+    # Build a lookup: (asym_id, residue_idx_0based, atom_name) → (x, y, z).
+    # Protein chains are mapped by map_chain_residues (positional when the
+    # residue names agree, otherwise realigned on the PDB's own residue
+    # numbering); other chains (ligands) use order of appearance.
+    struct = processed_structure
+    chain_by_asym = {int(c["asym_id"]): c for c in struct.chains[struct.mask]}
+    protein_type = const.chain_type_ids["PROTEIN"]
+    realigned_asyms: set = set()
     pdb_by_chain: Dict[str, list] = {}
     for atom in pdb_atoms:
         cid = atom.chain_id
@@ -70,30 +257,45 @@ def inject_pdb_coords_into_structure(
             continue
         asym_id = chain_id_map[pdb_chain_id]
 
-        # Get unique residue numbers in order
-        res_numbers = []
+        # Unique residues in order of appearance, keyed by (number, icode).
+        residues: List[PdbResidue] = []
         seen = set()
         for a in atoms:
-            rn = a.residue_number
-            if rn not in seen:
-                res_numbers.append(rn)
-                seen.add(rn)
+            rk = (a.residue_number, getattr(a, "insertion_code", "") or "")
+            if rk not in seen:
+                residues.append((rk, a.residue_name))
+                seen.add(rk)
 
-        res_num_to_idx = {rn: i for i, rn in enumerate(res_numbers)}
+        chain = chain_by_asym.get(asym_id)
+        if chain is not None and int(chain["mol_type"]) == protein_type:
+            r0 = int(chain["res_idx"])
+            processed_names = [
+                str(r["name"]) for r in struct.residues[r0:r0 + int(chain["res_num"])]
+            ]
+            res_key_to_idx, realigned = map_chain_residues(
+                residues, processed_names, chain_label=pdb_chain_id,
+            )
+            if realigned:
+                realigned_asyms.add(asym_id)
+        else:
+            res_key_to_idx = {rk: i for i, (rk, _) in enumerate(residues)}
 
         for a in atoms:
-            res_idx = res_num_to_idx[a.residue_number]
+            rk = (a.residue_number, getattr(a, "insertion_code", "") or "")
+            res_idx = res_key_to_idx.get(rk)
+            if res_idx is None:
+                continue
             key = (asym_id, res_idx, a.name.strip())
             coord_lookup[key] = np.array([a.x, a.y, a.z], dtype=np.float32)
 
     # Now inject into structure
-    struct = processed_structure
     atoms = struct.atoms.copy()
     coords_array = struct.coords.copy()
 
     n_injected = 0
     n_missing = 0
     unmatched_atom_indices: List[int] = []
+    injected_coords: Dict[int, np.ndarray] = {}
 
     for chain in struct.chains[struct.mask]:
         asym_id = int(chain["asym_id"])
@@ -128,6 +330,7 @@ def inject_pdb_coords_into_structure(
 
                     # Mark atom as present
                     atoms[abs_atom_idx]["is_present"] = True
+                    injected_coords[abs_atom_idx] = new_coord
                     n_injected += 1
                 else:
                     abs_atom_idx = atom_start + atom_offset
@@ -145,6 +348,20 @@ def inject_pdb_coords_into_structure(
                         )
 
                     n_missing += 1
+
+    # Independent check on the residue mapping: neighbours in sequence must be
+    # neighbours in space. Only realigned chains can fail here — a chain that
+    # passed the positional name check is mapped correctly by construction,
+    # so its chain breaks (if any) are a property of the structure.
+    asym_to_label = {v: k for k, v in chain_id_map.items()}
+    for asym_id, chain in chain_by_asym.items():
+        if int(chain["mol_type"]) != protein_type or asym_id not in asym_to_label:
+            continue
+        _check_ca_continuity(
+            struct, chain, injected_coords,
+            chain_label=asym_to_label[asym_id],
+            strict=asym_id in realigned_asyms,
+        )
 
     if n_missing > 0:
         logger.warning(

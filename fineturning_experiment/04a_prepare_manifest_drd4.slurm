@@ -38,6 +38,7 @@ python "${EXP_DIR}/build_lora_manifest.py" \
     --ht2a-poses       "${HT2A_POSES_DIR}" \
     --target           DRD4 \
     --binder-threshold "${LORA_BINDER_THRESHOLD:-1.0}" \
-    --out              "${DRD4_LORA_MANIFEST}"
+    --out              "${DRD4_LORA_MANIFEST}" \
+    ${KEEP_CENSORED:+--keep-censored}
 
 echo "[$(date)] DRD4 manifest rows: $(tail -n +2 "${DRD4_LORA_MANIFEST}" | wc -l)"

@@ -53,6 +53,9 @@ class TrainingRun:
     huber_delta_k: Optional[float] = None
     huber_delta_per_epoch: Optional[list[float]] = None
     early_stopping_rel_delta: Optional[float] = None
+    # Affinity output the loss was computed on ("module1" | "ensemble");
+    # None on runs recorded before the option existed (= module1).
+    affinity_output: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TrainingRun":

@@ -41,9 +41,15 @@ from boltz.finetune.registry import FinetuneRegistry, default_registry
 from boltz.finetune.targets import resolve_targets
 
 # Reuse the LoRA-side machinery — these helpers are mode-agnostic.
-from boltz.lora.data import AssayGroupedSampler, LoRADataset, lora_collate
+from boltz.lora.data import (
+    AssayGroupedSampler,
+    LoRADataset,
+    lora_collate,
+    warn_if_censored_loss_without_censored_rows,
+)
 from boltz.lora.losses import LossFn, call_loss, load_loss_from_spec
 from boltz.lora.train import (
+    AFFINITY_OUTPUTS,
     _affinity_forward_trainable,
     _configure_train_cache,
     _extract_row_from_batch,
@@ -85,6 +91,8 @@ class FinetuneArgs:
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 0.005
     plot_loss_curve: bool = True
+    # See boltz.lora.train.TrainArgs.affinity_output.
+    affinity_output: str = "module1"
 
 
 # ── Parameter selection ─────────────────────────────────────────────────────
@@ -146,12 +154,20 @@ def train_finetune(
         msg = f"Unknown mode {args.mode!r}; expected 'rescore' or 'full'."
         raise ValueError(msg)
 
+    if args.affinity_output not in AFFINITY_OUTPUTS:
+        msg = (
+            f"Unknown affinity_output {args.affinity_output!r}; expected one "
+            f"of {AFFINITY_OUTPUTS}."
+        )
+        raise ValueError(msg)
+
     registry = registry or default_registry()
     device = _pick_device(args.device)
 
     dataset = LoRADataset(args.csv_path, mode=args.mode)
 
     has_groups = any(r.group_id for r in dataset.rows)
+    warn_if_censored_loss_without_censored_rows(args.loss_spec, dataset.rows)
     _sampler: Optional[AssayGroupedSampler] = None
     if args.batch_size > 1 and has_groups:
         _sampler = AssayGroupedSampler(
@@ -246,6 +262,7 @@ def train_finetune(
         mode=args.mode,
         loss_spec=args.loss_spec,
         epochs=args.epochs,
+        affinity_output=args.affinity_output,
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
         notes=args.notes,
@@ -337,6 +354,7 @@ def train_finetune(
                     continue
                 pred = _affinity_forward_trainable(
                     model, feats, recycling_steps=args.recycling_steps,
+                    affinity_output=args.affinity_output,
                 )
                 pred_combined = pred
             else:
@@ -364,6 +382,7 @@ def train_finetune(
                     pred_i = _affinity_forward_trainable(
                         model, feats_i,
                         recycling_steps=args.recycling_steps,
+                        affinity_output=args.affinity_output,
                     )
                     all_pred_values.append(pred_i["affinity_pred_value"])
                     if "affinity_logits_binary" in pred_i:
@@ -385,7 +404,7 @@ def train_finetune(
                         batch["target"] = batch["target"].index_select(
                             0, keep_t.to(batch["target"].device)
                         )
-                    for k in ("group_id", "is_binder", "name"):
+                    for k in ("group_id", "is_binder", "is_censored", "name"):
                         v = batch.get(k)
                         if isinstance(v, list):
                             batch[k] = [v[i] for i in kept_indices]

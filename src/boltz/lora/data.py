@@ -44,6 +44,7 @@ from __future__ import annotations
 import collections
 import csv
 import hashlib
+import logging
 import math
 import random as _random
 from dataclasses import dataclass
@@ -52,6 +53,8 @@ from typing import Any, Iterator, Optional
 
 import torch
 from torch.utils.data import Dataset, Sampler
+
+logger = logging.getLogger(__name__)
 
 REQUIRED_COLUMNS = ("ligand", "receptor", "target")
 OPTIONAL_COLUMNS = ("structure", "name", "group_id", "is_binder", "is_censored")
@@ -208,10 +211,29 @@ def lora_collate(items: list[dict[str, Any]]) -> dict[str, Any]:
         "structure": [it["structure"] for it in items],
         "group_id": [it.get("group_id") for it in items],
         "is_binder": [it.get("is_binder") for it in items],
+        "is_censored": [it.get("is_censored", 0) for it in items],
         "row_index": [it["row_index"] for it in items],
         "target": torch.stack([it["target"] for it in items]),
     }
     return out
+
+
+def warn_if_censored_loss_without_censored_rows(
+    loss_spec: str, rows: list[LoRARow],
+) -> None:
+    """Warn when a censored loss is used on data with no censored rows.
+
+    The one-sided terms only fire for rows with ``is_censored == 1``; without
+    any, a ``censored_*`` loss is identical to its uncensored counterpart. This
+    usually means the manifest was built without ``--keep-censored``.
+    """
+    if "censored" in loss_spec and not any(r.is_censored for r in rows):
+        logger.warning(
+            "Loss %r handles right-censored rows, but none of the %d training "
+            "rows has is_censored=1, so it reduces to the uncensored loss. "
+            "Rebuild the manifest with --keep-censored to use censored data.",
+            loss_spec, len(rows),
+        )
 
 
 class AssayGroupedSampler(Sampler[list[int]]):
@@ -307,11 +329,12 @@ class AssayGroupedSampler(Sampler[list[int]]):
 
 
 __all__ = [
-    "OPTIONAL_COLUMNS",
-    "REQUIRED_COLUMNS",
     "AssayGroupedSampler",
     "LoRADataset",
     "LoRARow",
+    "OPTIONAL_COLUMNS",
+    "REQUIRED_COLUMNS",
     "lora_collate",
     "parse_lora_csv",
+    "warn_if_censored_loss_without_censored_rows",
 ]

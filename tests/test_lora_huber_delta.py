@@ -1,15 +1,14 @@
 """Tests for data-derived Huber delta selection (BOLTZ_HUBER_DELTA_SPEC.md).
 
-CPU-cheap: the trainer runs end-to-end on a toy model with featurisation,
-the trunk forward and checkpoint loading stubbed out.
+CPU-cheap: the trainer runs end-to-end on the ``lora_harness`` toy model
+(tests/conftest.py) with featurisation, the trunk forward and checkpoint
+loading stubbed out.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-from pathlib import Path
 
 import pytest
 import torch
@@ -31,7 +30,6 @@ from boltz.lora.losses import (
     mse_loss,
     robust_delta,
 )
-from boltz.lora.registry import LoRARegistry
 
 HUBER_FAMILY = [
     "huber",
@@ -43,64 +41,9 @@ HUBER_FAMILY = [
 NO_DELTA = ["mse", "mae", "bce", "pairwise_ranking"]
 
 
-# ─── Toy trainer harness ─────────────────────────────────────────────────────
-
-
-class _Toy(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.affinity_module = nn.Sequential(nn.Linear(4, 8), nn.Tanh(), nn.Linear(8, 1))
-
-
-def _feat(name: str) -> torch.Tensor:
-    h = hashlib.sha256(name.encode()).digest()
-    return torch.tensor([b / 255.0 - 0.5 for b in h[:4]], dtype=torch.float32)
-
-
-def _base_model() -> _Toy:
-    torch.manual_seed(123)
-    return _Toy()
-
-
-def _forward(model, feats, *, recycling_steps):  # noqa: ANN001, ARG001
-    return {"affinity_pred_value": model.affinity_module(feats["x"])}
-
-
 @pytest.fixture
-def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("BOLTZ_TRAIN_CACHE_DIR", raising=False)
-    monkeypatch.setattr(T, "_load_base_model", lambda ckpt, dev: (_base_model(), "", ""))
-    monkeypatch.setattr(
-        T, "_featurize_row",
-        lambda row, **_: {"x": _feat(row["name"][0]).unsqueeze(0)},
-    )
-    monkeypatch.setattr(T, "_affinity_forward_trainable", _forward)
-
-    names = [f"m{i:02d}" for i in range(24)]
-    csv = tmp_path / "train.csv"
-    lines = ["name,ligand,receptor,target,structure,group_id"]
-    for i, n in enumerate(names):
-        lines.append(f"{n},C,r.yaml,{float(3 * _feat(n).sum()):.6f},s.pdb,g{i % 3}")
-    csv.write_text("\n".join(lines) + "\n")
-    registry = LoRARegistry(tmp_path / "reg")
-
-    def run(**overrides):
-        kw = dict(
-            name="toy", csv_path=str(csv), loss_spec="intra_assay_huber",
-            target_spec="affinity_module", epochs=4, batch_size=4,
-            learning_rate=1e-2, plot_loss_curve=False, device="cpu",
-            overwrite=True,
-        )
-        kw.update(overrides)
-        torch.manual_seed(0)
-        T.train_lora(T.TrainArgs(**kw), registry=registry)
-        _, state = registry.load(kw["name"])
-        meta = json.loads((registry.adapter_dir(kw["name"]) / "meta.json").read_text())
-        return state, meta["history"][-1]
-
-    run.csv = csv
-    run.names = names
-    return run
+def harness(lora_harness):
+    return lora_harness
 
 
 def _pred_batch(n: int = 64, seed: int = 0):
@@ -292,9 +235,9 @@ def test_scale_invariant_scales_value_terms(name):
 # ─── Mode behaviour ──────────────────────────────────────────────────────────
 
 
-def test_lora_disabled_reproduces_fresh_base_model():
-    base = _base_model()
-    adapted = _base_model()
+def test_lora_disabled_reproduces_fresh_base_model(harness):
+    base = harness.base_model()
+    adapted = harness.base_model()
     apply_lora(adapted, ("affinity_module",), r=4, alpha=8.0)
     for m in adapted.modules():
         if hasattr(m, "lora_B"):
@@ -312,10 +255,10 @@ def test_static_vanilla_resolves_once_from_base_residuals(harness, monkeypatch):
     monkeypatch.setattr(T, "bind_delta", lambda fn, d: bound.append(d) or real_bind(fn, d))
     _, run = harness(huber_delta_mode="static-vanilla", epochs=3)
 
-    base = _base_model()
+    base = harness.base_model()
     with torch.no_grad():
-        preds = torch.stack([base.affinity_module(_feat(n)).squeeze() for n in harness.names])
-    targets = torch.tensor([float(f"{float(3 * _feat(n).sum()):.6f}") for n in harness.names])
+        preds = torch.stack([base.affinity_module(harness.feat(n)).squeeze() for n in harness.names])
+    targets = torch.tensor([harness.target(n) for n in harness.names])
     expected = robust_delta(preds - targets, k=1.345)
 
     assert bound == [pytest.approx(expected, rel=1e-6)]  # bound once, never rebound

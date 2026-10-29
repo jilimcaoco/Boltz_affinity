@@ -365,6 +365,19 @@ def _featurizer_seed() -> int:
         return 42
 
 
+# Boltz-2's molecular-weight correction of the ensemble affinity value
+# (same constants as boltz.model.models.boltz2.Boltz2.forward).
+AFFINITY_MW_MODEL_COEF = 1.03525938
+AFFINITY_MW_COEF = -0.59992683
+AFFINITY_MW_BIAS = 2.83288489
+
+
+def apply_affinity_mw_correction(pred: Any, feats: Dict[str, Any]) -> Any:
+    """``1.035 * pred - 0.600 * MW**0.3 + 2.833`` (``feats['affinity_mw']``)."""
+    mw = feats["affinity_mw"][0] ** 0.3
+    return AFFINITY_MW_MODEL_COEF * pred + AFFINITY_MW_COEF * mw + AFFINITY_MW_BIAS
+
+
 def _get_module(model: Any, attr: str) -> Any:
     """Get a model submodule, unwrapping torch.compile if needed."""
     mod = getattr(model, attr)
@@ -641,11 +654,7 @@ def affinity_head_forward(
                 + out2["affinity_probability_binary"]
             ) / 2
             if model.affinity_mw_correction:
-                model_coef = 1.03525938
-                mw_coef = -0.59992683
-                bias = 2.83288489
-                mw = feats["affinity_mw"][0] ** 0.3
-                avg_pred = model_coef * avg_pred + mw_coef * mw + bias
+                avg_pred = apply_affinity_mw_correction(avg_pred, feats)
             results["affinity_pred_value"] = avg_pred.item()
             results["affinity_probability_binary"] = avg_prob.item()
             results["affinity_pred_value1"] = out1["affinity_pred_value"].item()

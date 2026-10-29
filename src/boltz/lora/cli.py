@@ -59,6 +59,14 @@ def _train_options(fn):
                      help="Built-in (mse|mae|huber|bce|pairwise_ranking) or "
                           "'path/to/file.py:function_name'."),
         click.option(
+            "--affinity-output", default="module1", show_default=True,
+            type=click.Choice(["module1", "ensemble"]),
+            help="Affinity value the loss is computed on. module1: "
+                 "affinity_module1's raw output (historical). ensemble: the "
+                 "module1/module2 average with the MW correction, i.e. the "
+                 "value `boltz rescore` reports (ensemble checkpoints only).",
+        ),
+        click.option(
             "--huber-delta-mode", default="fixed", show_default=True,
             type=click.Choice(["fixed", "static-vanilla", "dynamic-mad"]),
             help="How to set the Huber delta of losses that take one. fixed: "
@@ -174,6 +182,7 @@ def train_cmd(
     csv_path: str,
     mode: str,
     loss_spec: str,
+    affinity_output: str,
     huber_delta_mode: str,
     huber_delta: float,
     huber_delta_k: float,
@@ -224,6 +233,7 @@ def train_cmd(
         huber_delta=huber_delta,
         huber_delta_k=huber_delta_k,
         plot_loss_curve=plot_loss_curve,
+        affinity_output=affinity_output,
         val_csv_path=val_csv_path,
         val_split=val_split,
     )
@@ -248,6 +258,7 @@ def update_cmd(
     csv_path: str,
     mode: str,
     loss_spec: str,
+    affinity_output: str,
     huber_delta_mode: str,
     huber_delta: float,
     huber_delta_k: float,
@@ -311,6 +322,7 @@ def update_cmd(
         huber_delta=huber_delta,
         huber_delta_k=huber_delta_k,
         plot_loss_curve=plot_loss_curve,
+        affinity_output=affinity_output,
         val_csv_path=val_csv_path,
         val_split=val_split,
     )
@@ -381,11 +393,12 @@ def rm_cmd(name: str, yes: bool) -> None:
 @lora_cli.command("apply")
 @click.argument("name")
 @click.option("--checkpoint", default=None,
-              help="Optional checkpoint path (uses adapter's base by default). "
-                   "This command performs a dry-run load to verify compatibility.")
+              help="Optional base checkpoint path (default: the auto-resolved "
+                   "Boltz-2 affinity checkpoint). This command performs a "
+                   "dry-run load to verify compatibility.")
 def apply_cmd(name: str, checkpoint: Optional[str]) -> None:
     """Dry-run: verify an adapter loads cleanly into the affinity model."""
-    from boltz.affinity_rescoring.model_manager import AffinityModelManager
+    from boltz.affinity_rescoring.inference import AffinityModelManager
     from boltz.lora.apply import load_adapter_into_model
 
     mgr = AffinityModelManager()
@@ -408,7 +421,7 @@ def export_cmd(name: str, out_path: str, checkpoint: Optional[str]) -> None:
     """Export a merged checkpoint (base + LoRA folded into linear weights)."""
     import torch
 
-    from boltz.affinity_rescoring.model_manager import AffinityModelManager
+    from boltz.affinity_rescoring.inference import AffinityModelManager
     from boltz.lora.apply import load_adapter_into_model
 
     mgr = AffinityModelManager()

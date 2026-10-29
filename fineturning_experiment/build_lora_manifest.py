@@ -17,9 +17,12 @@ Mapping:
   - `ligand`      ← `canonical_smiles_std`
   - `name`        ← `{source_target}_{molecule_chembl_id}_{assay_chembl_id}`
 
-Censored (`is_censored=True`) rows are dropped by default since none of the
-built-in losses handle right-censoring correctly.  Use ``--keep-censored``
-together with ``--loss censored_intra_assay_huber`` to include them.
+Censored (`is_censored=True`) rows are dropped by default because only the
+``censored_*`` losses (``censored_intra_assay_huber``,
+``censored_boltz2_affinity``) treat them as one-sided bounds; every other loss
+would fit the reported "> X" value as if it were exact. Use ``--keep-censored``
+together with one of the censored losses to include them (set
+``KEEP_CENSORED=1`` in config.env).
 """
 
 from __future__ import annotations

@@ -115,6 +115,7 @@ def parse_structure_file(
                         chain_id=chain.name,
                         residue_name=res_name,
                         residue_number=residue.seqid.num if residue.seqid else 0,
+                        insertion_code=residue.seqid.icode.strip() if residue.seqid else "",
                         occupancy=atom.occ,
                         b_factor=atom.b_iso,
                         is_hetatm=residue.het_flag == "H",
@@ -137,22 +138,57 @@ def parse_structure_file(
 
 # ─── SEQRES / Entity Sequence Extraction ─────────────────────────────────────
 
-# Non-standard 3-letter → standard 3-letter mapping (same as get_chain_sequences
-# but used here for SEQRES conversion).  Uppercase one-letter-code conversion
-# from gemmi already handles standard residues; this catches force-field names
-# that appear in some PDB SEQRES records.
-_SEQRES_NONSTANDARD_TO_STANDARD: Dict[str, str] = {
-    # Histidine protonation
-    "HID": "HIS", "HIE": "HIS", "HIP": "HIS", "HSD": "HIS",
-    "HSE": "HIS", "HSP": "HIS",
-    # Cysteine
-    "CYX": "CYS", "CYM": "CYS",
-    # Protonation states
-    "ASH": "ASP", "GLH": "GLU",
-    # Modified residues → parent
-    "MSE": "MET", "SEC": "CYS", "TPO": "THR", "SEP": "SER", "PTR": "TYR",
-    "PYL": "LYS",
+# Residue-name tables shared by SEQRES conversion, sequence extraction and
+# coordinate injection (``boltz.affinity_rescoring.coord_injection``).
+# Standard 3-letter → 1-letter mapping
+THREE_TO_ONE: Dict[str, str] = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
 }
+
+# Non-standard / force-field residue name → standard name mapping.
+# Covers AMBER, CHARMM, GROMACS protonation states and variants.
+NONSTANDARD_TO_STANDARD: Dict[str, str] = {
+    # Histidine protonation states
+    "HID": "HIS", "HIE": "HIS", "HIP": "HIS", "HSD": "HIS",
+    "HSE": "HIS", "HSP": "HIS", "HSC": "HIS",
+    # Cysteine variants
+    "CYX": "CYS", "CYM": "CYS", "CYS2": "CYS", "CYF": "CYS",
+    # Aspartate / glutamate protonation
+    "ASH": "ASP", "GLH": "GLU", "GLUP": "GLU", "ASPP": "ASP",
+    # Lysine
+    "LYN": "LYS", "LYP": "LYS", "LYSH": "LYS",
+    # Terminal variants (AMBER)
+    "NALA": "ALA", "NARG": "ARG", "NASN": "ASN", "NASP": "ASP",
+    "NCYS": "CYS", "NGLN": "GLN", "NGLU": "GLU", "NGLY": "GLY",
+    "NHIS": "HIS", "NILE": "ILE", "NLEU": "LEU", "NLYS": "LYS",
+    "NMET": "MET", "NPHE": "PHE", "NPRO": "PRO", "NSER": "SER",
+    "NTHR": "THR", "NTRP": "TRP", "NTYR": "TYR", "NVAL": "VAL",
+    "CALA": "ALA", "CARG": "ARG", "CASN": "ASN", "CASP": "ASP",
+    "CCYS": "CYS", "CGLN": "GLN", "CGLU": "GLU", "CGLY": "GLY",
+    "CHIS": "HIS", "CILE": "ILE", "CLEU": "LEU", "CLYS": "LYS",
+    "CMET": "MET", "CPHE": "PHE", "CPRO": "PRO", "CSER": "SER",
+    "CTHR": "THR", "CTRP": "TRP", "CTYR": "TYR", "CVAL": "VAL",
+    # Other common non-standard names
+    "MSE": "MET",  # selenomethionine
+    "SEC": "CYS",  # selenocysteine (approximate)
+    "PYL": "LYS",  # pyrrolysine (approximate)
+    "TPO": "THR",  # phosphothreonine
+    "SEP": "SER",  # phosphoserine
+    "PTR": "TYR",  # phosphotyrosine
+}
+
+
+def normalize_residue_name(name: str) -> str:
+    """Map a force-field / modified residue name to its standard parent.
+
+    ``HID`` -> ``HIS``, ``MSE`` -> ``MET`` etc.; names already standard (or
+    unknown) are returned stripped and upper-cased.
+    """
+    key = name.strip().upper()
+    return NONSTANDARD_TO_STANDARD.get(key, key)
 
 
 def _seqres_three_to_one(three_letter: str) -> Optional[str]:
@@ -171,8 +207,8 @@ def _seqres_three_to_one(three_letter: str) -> Optional[str]:
     name = three_letter.strip().upper()
 
     # Check our non-standard mapping first (force-field names)
-    if name in _SEQRES_NONSTANDARD_TO_STANDARD:
-        name = _SEQRES_NONSTANDARD_TO_STANDARD[name]
+    if name in NONSTANDARD_TO_STANDARD:
+        name = NONSTANDARD_TO_STANDARD[name]
 
     info = gemmi.find_tabulated_residue(name)
     if not info.is_amino_acid():
@@ -342,46 +378,6 @@ def get_chain_sequences(
     dict
         Map of chain_id → amino acid sequence (1-letter codes).
     """
-    # Standard 3-letter → 1-letter mapping
-    THREE_TO_ONE = {
-        "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
-        "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
-        "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
-        "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
-    }
-
-    # Non-standard / force-field residue name → standard name mapping.
-    # Covers AMBER, CHARMM, GROMACS protonation states and variants.
-    NONSTANDARD_TO_STANDARD = {
-        # Histidine protonation states
-        "HID": "HIS", "HIE": "HIS", "HIP": "HIS", "HSD": "HIS",
-        "HSE": "HIS", "HSP": "HIS", "HSC": "HIS",
-        # Cysteine variants
-        "CYX": "CYS", "CYM": "CYS", "CYS2": "CYS", "CYF": "CYS",
-        # Aspartate / glutamate protonation
-        "ASH": "ASP", "GLH": "GLU", "GLUP": "GLU", "ASPP": "ASP",
-        # Lysine
-        "LYN": "LYS", "LYP": "LYS", "LYSH": "LYS",
-        # Terminal variants (AMBER)
-        "NALA": "ALA", "NARG": "ARG", "NASN": "ASN", "NASP": "ASP",
-        "NCYS": "CYS", "NGLN": "GLN", "NGLU": "GLU", "NGLY": "GLY",
-        "NHIS": "HIS", "NILE": "ILE", "NLEU": "LEU", "NLYS": "LYS",
-        "NMET": "MET", "NPHE": "PHE", "NPRO": "PRO", "NSER": "SER",
-        "NTHR": "THR", "NTRP": "TRP", "NTYR": "TYR", "NVAL": "VAL",
-        "CALA": "ALA", "CARG": "ARG", "CASN": "ASN", "CASP": "ASP",
-        "CCYS": "CYS", "CGLN": "GLN", "CGLU": "GLU", "CGLY": "GLY",
-        "CHIS": "HIS", "CILE": "ILE", "CLEU": "LEU", "CLYS": "LYS",
-        "CMET": "MET", "CPHE": "PHE", "CPRO": "PRO", "CSER": "SER",
-        "CTHR": "THR", "CTRP": "TRP", "CTYR": "TYR", "CVAL": "VAL",
-        # Other common non-standard names
-        "MSE": "MET",  # selenomethionine
-        "SEC": "CYS",  # selenocysteine (approximate)
-        "PYL": "LYS",  # pyrrolysine (approximate)
-        "TPO": "THR",  # phosphothreonine
-        "SEP": "SER",  # phosphoserine
-        "PTR": "TYR",  # phosphotyrosine
-    }
-
     chains: Dict[str, Dict[int, str]] = {}
     mapped_nonstandard: Dict[str, set] = {}  # Track for logging
 

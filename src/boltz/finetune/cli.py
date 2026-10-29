@@ -55,6 +55,14 @@ def _train_options(fn):
                  "(not yet wired).",
         ),
         click.option(
+            "--affinity-output", default="module1", show_default=True,
+            type=click.Choice(["module1", "ensemble"]),
+            help="Affinity value the loss is computed on. module1: "
+                 "affinity_module1's raw output (historical). ensemble: the "
+                 "module1/module2 average with the MW correction, i.e. the "
+                 "value `boltz rescore` reports (ensemble checkpoints only).",
+        ),
+        click.option(
             "--loss", "loss_spec", default="mse",
             help="Built-in (mse|mae|huber|bce|pairwise_ranking|"
                  "intra_assay_huber|boltz2_affinity) or "
@@ -142,6 +150,7 @@ def train_cmd(
     csv_path: str,
     mode: str,
     loss_spec: str,
+    affinity_output: str,
     target_spec: str,
     epochs: int,
     learning_rate: float,
@@ -184,6 +193,7 @@ def train_cmd(
         early_stopping_patience=early_stopping_patience,
         early_stopping_min_delta=early_stopping_min_delta,
         plot_loss_curve=plot_loss_curve,
+        affinity_output=affinity_output,
     )
     record = train_finetune(args)
     click.echo(
@@ -209,6 +219,7 @@ def update_cmd(
     csv_path: str,
     mode: str,
     loss_spec: str,
+    affinity_output: str,
     target_spec: str,
     epochs: int,
     learning_rate: float,
@@ -260,6 +271,7 @@ def update_cmd(
         early_stopping_patience=early_stopping_patience,
         early_stopping_min_delta=early_stopping_min_delta,
         plot_loss_curve=plot_loss_curve,
+        affinity_output=affinity_output,
     )
     record = train_finetune(
         args, registry=registry, init_state=init_state,
@@ -332,7 +344,7 @@ def rm_cmd(name: str, yes: bool) -> None:
               help="Optional override of the base checkpoint path.")
 def apply_cmd(name: str, checkpoint: Optional[str]) -> None:
     """Dry-run: verify a fine-tune loads cleanly into the affinity model."""
-    from boltz.affinity_rescoring.model_manager import AffinityModelManager
+    from boltz.affinity_rescoring.inference import AffinityModelManager
     from boltz.finetune.apply import load_finetune_into_model
 
     mgr = AffinityModelManager()
@@ -356,7 +368,7 @@ def export_cmd(name: str, out_path: str, checkpoint: Optional[str]) -> None:
     """Export a full checkpoint with fine-tuned weights applied."""
     import torch
 
-    from boltz.affinity_rescoring.model_manager import AffinityModelManager
+    from boltz.affinity_rescoring.inference import AffinityModelManager
     from boltz.finetune.apply import load_finetune_into_model
 
     mgr = AffinityModelManager()

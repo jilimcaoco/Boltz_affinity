@@ -137,6 +137,7 @@ class AtomInfo:
     occupancy: float = 1.0
     b_factor: float = 0.0
     is_hetatm: bool = False
+    insertion_code: str = ""
 
 
 @dataclass

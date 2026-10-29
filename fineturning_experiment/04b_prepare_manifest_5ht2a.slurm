@@ -38,6 +38,7 @@ python "${EXP_DIR}/build_lora_manifest.py" \
     --ht2a-poses       "${HT2A_POSES_DIR}" \
     --target           5HT2A \
     --binder-threshold "${LORA_BINDER_THRESHOLD:-1.0}" \
-    --out              "${HT2A_LORA_MANIFEST}"
+    --out              "${HT2A_LORA_MANIFEST}" \
+    ${KEEP_CENSORED:+--keep-censored}
 
 echo "[$(date)] 5HT2A manifest rows: $(tail -n +2 "${HT2A_LORA_MANIFEST}" | wc -l)"

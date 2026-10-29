@@ -203,6 +203,8 @@ class AffinityRescorer:
 
         # Results cache
         self._last_results: List[AffinityResult] = []
+        # Reason the most recent _run_direct_prediction returned None.
+        self._last_prediction_error: Optional[str] = None
 
     @property
     def results(self) -> ResultsExporter:
@@ -394,7 +396,11 @@ class AffinityRescorer:
 
                 if affinity_output is None:
                     result.validation_status = ValidationStatus.FAILED
-                    result.error_message = "Affinity prediction failed. Check logs."
+                    result.error_message = (
+                        f"Affinity prediction failed: {self._last_prediction_error}"
+                        if self._last_prediction_error
+                        else "Affinity prediction failed. Check logs."
+                    )
                     return result
 
                 # Step 8: Parse results
@@ -967,6 +973,7 @@ class AffinityRescorer:
         Bypasses diffusion and confidence — feeds PDB coords directly
         through trunk + affinity head.
         """
+        self._last_prediction_error = None
         work_dir = Path(tempfile.mkdtemp(prefix="boltz_direct_"))
 
         try:
@@ -1009,6 +1016,7 @@ class AffinityRescorer:
 
             return results
         except Exception as e:
+            self._last_prediction_error = f"{type(e).__name__}: {e}"
             logger.error(f"Direct affinity prediction failed: {e}")
             import traceback
             traceback.print_exc()
@@ -1236,7 +1244,11 @@ class AffinityRescorer:
                         score.validation_status = ValidationStatus.SUCCESS
                 else:
                     score.validation_status = ValidationStatus.FAILED
-                    score.error_message = "Boltz prediction failed"
+                    score.error_message = (
+                        f"Boltz prediction failed: {self._last_prediction_error}"
+                        if self._last_prediction_error
+                        else "Boltz prediction failed"
+                    )
 
             except Exception as e:
                 score.validation_status = ValidationStatus.FAILED

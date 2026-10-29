@@ -79,6 +79,9 @@ The training CSV must have a header row with these columns:
 | `target` | yes | Float to fit (e.g. pIC50, ΔG). |
 | `structure` | for `mode=rescore` | Path to the complex PDB/CIF whose coordinates you want to inject. |
 | `name` | optional | Free-form identifier; defaults to row index. |
+| `group_id` | optional | Assay identifier; with `--batch-size > 1` mini-batches are filled from one assay so the intra-assay pairwise terms fire. |
+| `is_binder` | optional | 0/1 label for the BCE branch of `boltz2_affinity` losses. |
+| `is_censored` | optional | 1 for right-censored rows (`"> X µM"`). Only the `censored_*` losses use it, treating `target` as a lower bound. A `censored_*` loss on a manifest with no `is_censored=1` rows warns and behaves like its uncensored version. |
 
 Extra columns are ignored.
 
@@ -122,6 +125,16 @@ Useful options:
   training.
 - `--checkpoint` — override the base affinity checkpoint (defaults to
   the cached `boltz2_aff.ckpt`).
+- `--affinity-output` — which affinity value the loss is computed on.
+  `module1` (default, historical) trains on `affinity_module1`'s raw
+  output. `ensemble` trains on the average of both affinity modules with
+  the molecular-weight correction, i.e. exactly the value `boltz rescore`
+  reports. With `module1`, `affinity_module2`'s adapter weights never
+  receive gradient, so at scoring time the learned shift is roughly halved
+  and then MW-corrected; prefer `ensemble` for new runs.
+- `--huber-delta-mode`, `--huber-delta`, `--huber-delta-k`,
+  `--early-stopping-rel-delta` — data-derived Huber transition point; see
+  `boltz lora train --help`.
 
 Output: a new adapter under `$BOLTZ_LORA_DIR/my_kinase_v1/` containing
 `meta.json` (provenance) and `adapter.pt` (LoRA tensors).

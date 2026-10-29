@@ -34,7 +34,12 @@ from torch.utils.data import DataLoader
 
 from boltz import __version__ as _BOLTZ_VERSION  # type: ignore[attr-defined]
 from boltz.lora.adapter import LoRAAdapter, LoRAConfig, TrainingRun
-from boltz.lora.data import AssayGroupedSampler, LoRADataset, lora_collate
+from boltz.lora.data import (
+    AssayGroupedSampler,
+    LoRADataset,
+    lora_collate,
+    warn_if_censored_loss_without_censored_rows,
+)
 from boltz.lora.inject import apply_lora, load_lora_state_dict, lora_state_dict
 from boltz.lora.losses import (
     LossFn,
@@ -100,9 +105,15 @@ class TrainArgs:
     # absolute early_stopping_min_delta applies). Required for dynamic-mad,
     # whose loss scale changes between epochs.
     early_stopping_rel_delta: float = 0.0
+    # Which affinity output the loss sees (see _affinity_forward_trainable).
+    # module1: affinity_module1's raw value (historical behaviour).
+    # ensemble: the module1/module2 average with the MW correction, i.e. the
+    #           value `boltz rescore` reports.
+    affinity_output: str = "module1"
 
 
 HUBER_DELTA_MODES = ("fixed", "static-vanilla", "dynamic-mad")
+AFFINITY_OUTPUTS = ("module1", "ensemble")
 
 
 def _pick_device(spec: str) -> torch.device:
@@ -610,8 +621,8 @@ def _featurize_row(
             return _cached
 
     from boltz.affinity_rescoring.coord_injection import (
-        build_chain_id_map,
         inject_pdb_coords_into_structure,
+        map_chains_by_name,
         save_pre_affinity_structure,
     )
     from boltz.affinity_rescoring.parsers import parse_structure_file
@@ -690,8 +701,10 @@ def _featurize_row(
 
         pdb_atoms, _meta = parse_structure_file(structure)
         chain_ids_in_pdb = sorted({a.chain_id for a in pdb_atoms})
-        asym_map = build_chain_id_map(proc, chain_ids_in_pdb)
-        full_map = {cid: asym_map[cid] for cid in chain_ids_in_pdb if cid in asym_map}
+        # By chain name (YAML id) rather than sorted order; a protein chain
+        # whose residues don't match raises ResidueMappingError and the
+        # caller skips the row.
+        full_map = map_chains_by_name(proc, chain_ids_in_pdb)
         injected, _ = inject_pdb_coords_into_structure(proc, pdb_atoms, full_map)
         save_pre_affinity_structure(injected, predictions_dir, record.id)
 
@@ -811,11 +824,39 @@ def _compute_trunk_z(
             m.train(was_training)
 
 
+def _ensemble_affinity_output(
+    model: Any,
+    out1: dict[str, torch.Tensor],
+    out2: dict[str, torch.Tensor],
+    feats: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Combine the two affinity modules exactly as scoring does.
+
+    Value: mean of both heads, then the MW correction when the model has it
+    enabled. Binary logits: logit of the mean probability (scoring averages
+    probabilities), so BCE terms see the reported binder probability.
+    """
+    from boltz.affinity_rescoring.inference import apply_affinity_mw_correction
+
+    value = (out1["affinity_pred_value"] + out2["affinity_pred_value"]) / 2
+    if getattr(model, "affinity_mw_correction", False):
+        value = apply_affinity_mw_correction(value, feats)
+    out = {"affinity_pred_value": value}
+    if "affinity_logits_binary" in out1 and "affinity_logits_binary" in out2:
+        prob = (
+            torch.sigmoid(out1["affinity_logits_binary"])
+            + torch.sigmoid(out2["affinity_logits_binary"])
+        ) / 2
+        out["affinity_logits_binary"] = torch.logit(prob, eps=1e-6)
+    return out
+
+
 def _affinity_forward_trainable(
     model: Any,
     feats: dict[str, Any],
     *,
     recycling_steps: int,
+    affinity_output: str = "module1",
 ) -> dict[str, torch.Tensor]:
     """Same compute graph as ``affinity_forward`` but allowing autograd.
 
@@ -827,6 +868,10 @@ def _affinity_forward_trainable(
     When the frozen-trunk cache is active and the trunk carries no trainable
     parameters, the post-recycling ``z`` is loaded from disk (computed once)
     instead of being re-derived each epoch.
+
+    ``affinity_output="ensemble"`` (ensemble checkpoints only) runs both
+    affinity modules and returns their MW-corrected average, matching
+    ``boltz rescore``; the default returns ``affinity_module1``'s raw output.
     """
     if "coords" not in feats:
         raise RuntimeError("LoRA training requires injected 'coords' in features.")
@@ -867,6 +912,16 @@ def _affinity_forward_trainable(
         coords_affinity = coords_affinity[:, :1]
 
     s_inputs = model.input_embedder(feats, affinity=True)
+
+    if affinity_output == "ensemble" and getattr(model, "affinity_ensemble", False):
+        outs = [
+            _unwrap(attr)(
+                s_inputs=s_inputs, z=z_affinity, x_pred=coords_affinity,
+                feats=feats, multiplicity=1, use_kernels=use_kernels,
+            )
+            for attr in ("affinity_module1", "affinity_module2")
+        ]
+        return _ensemble_affinity_output(model, outs[0], outs[1], feats)
 
     affinity_attr = "affinity_module1" if getattr(model, "affinity_ensemble", False) else "affinity_module"
     affinity_module = _unwrap(affinity_attr)
@@ -922,6 +977,7 @@ def _vanilla_residuals(
     use_msa_server: bool,
     recycling_steps: int,
     device: torch.device,
+    affinity_output: str = "module1",
 ) -> torch.Tensor:
     """Residuals of the un-adapted model over ``dataset`` (one no-grad pass).
 
@@ -951,6 +1007,7 @@ def _vanilla_residuals(
                     continue
                 pred = _affinity_forward_trainable(
                     model, feats, recycling_steps=recycling_steps,
+                    affinity_output=affinity_output,
                 )
                 out.append(_batch_residuals(pred, batch, batch["target"]))
     finally:
@@ -1032,6 +1089,12 @@ def train_lora(
             f"of {HUBER_DELTA_MODES}."
         )
         raise ValueError(msg)
+    if args.affinity_output not in AFFINITY_OUTPUTS:
+        msg = (
+            f"Unknown affinity_output {args.affinity_output!r}; expected one "
+            f"of {AFFINITY_OUTPUTS}."
+        )
+        raise ValueError(msg)
     if args.early_stopping_rel_delta < 0:
         msg = f"early_stopping_rel_delta must be >= 0, got {args.early_stopping_rel_delta}."
         raise ValueError(msg)
@@ -1096,6 +1159,7 @@ def train_lora(
         else [dataset.rows[i] for i in train_dataset.indices]  # Subset
     )
     has_groups = any(r.group_id for r in _train_rows)
+    warn_if_censored_loss_without_censored_rows(args.loss_spec, _train_rows)
     _sampler: Optional[AssayGroupedSampler] = None
     if args.batch_size > 1 and has_groups:
         _sampler = AssayGroupedSampler(
@@ -1162,6 +1226,11 @@ def train_lora(
         load_lora_state_dict(model, init_state, strict=False)
         logger.info("Loaded initial LoRA state (%d tensors).", len(init_state))
     logger.info("LoRA adapted %d layers: e.g. %s", len(adapted), adapted[:3])
+    if args.affinity_output == "ensemble" and not getattr(model, "affinity_ensemble", False):
+        logger.warning(
+            "affinity_output='ensemble' requested but the checkpoint has a "
+            "single affinity module; training on its output (same as module1)."
+        )
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     if not trainable:
@@ -1212,6 +1281,7 @@ def train_lora(
         huber_delta_mode=args.huber_delta_mode,
         huber_delta_k=args.huber_delta_k,
         early_stopping_rel_delta=args.early_stopping_rel_delta,
+        affinity_output=args.affinity_output,
     )
 
     # Early stopping state — uses val_loss when a val set is present, else train loss.
@@ -1279,6 +1349,7 @@ def train_lora(
                     model, train_dataset, cache_dir=cache_dir,
                     use_msa_server=args.use_msa_server,
                     recycling_steps=args.recycling_steps, device=device,
+                    affinity_output=args.affinity_output,
                 ),
                 args, "static-vanilla",
             )
@@ -1312,6 +1383,7 @@ def train_lora(
                     continue
                 pred = _affinity_forward_trainable(
                     model, feats, recycling_steps=args.recycling_steps,
+                    affinity_output=args.affinity_output,
                 )
                 pred_combined = pred
             else:
@@ -1334,6 +1406,7 @@ def train_lora(
                         continue
                     pred_i = _affinity_forward_trainable(
                         model, feats_i, recycling_steps=args.recycling_steps,
+                        affinity_output=args.affinity_output,
                     )
                     all_pred_values.append(pred_i["affinity_pred_value"])
                     if "affinity_logits_binary" in pred_i:
@@ -1408,6 +1481,7 @@ def train_lora(
                             continue
                         val_pred = _affinity_forward_trainable(
                             model, val_feats, recycling_steps=args.recycling_steps,
+                            affinity_output=args.affinity_output,
                         )
                         val_pred_combined = val_pred
                     else:
@@ -1434,6 +1508,7 @@ def train_lora(
                                 continue
                             val_pred_i = _affinity_forward_trainable(
                                 model, val_feats_i, recycling_steps=args.recycling_steps,
+                                affinity_output=args.affinity_output,
                             )
                             all_val_pred_values.append(val_pred_i["affinity_pred_value"])
                             if "affinity_logits_binary" in val_pred_i:
@@ -1600,4 +1675,4 @@ def prepare_update(
     return registry.load(name)
 
 
-__all__ = ["HUBER_DELTA_MODES", "TrainArgs", "prepare_update", "train_lora"]
+__all__ = ["AFFINITY_OUTPUTS", "HUBER_DELTA_MODES", "TrainArgs", "prepare_update", "train_lora"]
