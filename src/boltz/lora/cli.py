@@ -58,6 +58,24 @@ def _train_options(fn):
         click.option("--loss", "loss_spec", default="mse",
                      help="Built-in (mse|mae|huber|bce|pairwise_ranking) or "
                           "'path/to/file.py:function_name'."),
+        click.option(
+            "--huber-delta-mode", default="fixed", show_default=True,
+            type=click.Choice(["fixed", "static-vanilla", "dynamic-mad"]),
+            help="How to set the Huber delta of losses that take one. fixed: "
+                 "--huber-delta. static-vanilla: k * MAD-sigma of the "
+                 "un-adapted model's training residuals, resolved once. "
+                 "dynamic-mad: re-resolved from each epoch's training "
+                 "residuals (requires --early-stopping-rel-delta).",
+        ),
+        click.option(
+            "--huber-delta", default=1.0, type=float, show_default=True,
+            help="Delta for --huber-delta-mode fixed; also the first-epoch "
+                 "value for dynamic-mad and the fallback when estimation fails.",
+        ),
+        click.option(
+            "--huber-delta-k", default=1.345, type=float, show_default=True,
+            help="Tuning constant k in delta = k * MAD / 0.6745.",
+        ),
         click.option("--rank", default=8, type=int, show_default=True),
         click.option("--alpha", default=16.0, type=float, show_default=True),
         click.option("--dropout", default=0.0, type=float, show_default=True),
@@ -96,6 +114,13 @@ def _train_options(fn):
                  "the early-stopping patience counter.",
         ),
         click.option(
+            "--early-stopping-rel-delta", default=0.0, type=float, show_default=True,
+            help="Minimum improvement as a fraction of |best loss| (e.g. 0.01). "
+                 "0 = disabled. Mutually exclusive with "
+                 "--early-stopping-min-delta; required with "
+                 "--huber-delta-mode dynamic-mad.",
+        ),
+        click.option(
             "--plot-loss-curve/--no-plot-loss-curve", default=True, show_default=True,
             help="Save loss_curve.png to the adapter directory after training.",
         ),
@@ -118,6 +143,26 @@ def _train_options(fn):
     return fn
 
 
+def _check_huber_delta_options(huber_delta_mode: str, early_stopping_rel_delta: float) -> None:
+    """Reject option combinations that make early stopping scale-dependent."""
+    ctx = click.get_current_context()
+    min_delta_given = (
+        ctx.get_parameter_source("early_stopping_min_delta")
+        is not click.core.ParameterSource.DEFAULT
+    )
+    if early_stopping_rel_delta < 0:
+        raise click.BadParameter("must be >= 0.", param_hint="--early-stopping-rel-delta")
+    if early_stopping_rel_delta > 0 and min_delta_given:
+        msg = ("--early-stopping-rel-delta and --early-stopping-min-delta are "
+               "mutually exclusive.")
+        raise click.UsageError(msg)
+    if huber_delta_mode == "dynamic-mad" and early_stopping_rel_delta <= 0:
+        msg = ("--huber-delta-mode dynamic-mad requires --early-stopping-rel-delta "
+               "> 0: delta (and therefore the loss scale) changes every epoch, so "
+               "an absolute --early-stopping-min-delta threshold is not valid.")
+        raise click.UsageError(msg)
+
+
 @lora_cli.command("train")
 @click.option("--name", required=True, help="Adapter name (used as registry key).")
 @click.option("--overwrite", is_flag=True, default=False,
@@ -129,6 +174,9 @@ def train_cmd(
     csv_path: str,
     mode: str,
     loss_spec: str,
+    huber_delta_mode: str,
+    huber_delta: float,
+    huber_delta_k: float,
     rank: int,
     alpha: float,
     dropout: float,
@@ -145,6 +193,7 @@ def train_cmd(
     notes: Optional[str],
     early_stopping_patience: int,
     early_stopping_min_delta: float,
+    early_stopping_rel_delta: float,
     plot_loss_curve: bool,
     val_csv_path: Optional[str],
     val_split: float,
@@ -152,6 +201,7 @@ def train_cmd(
 ) -> None:
     """Train a fresh LoRA adapter."""
     _setup_logging(log_level)
+    _check_huber_delta_options(huber_delta_mode, early_stopping_rel_delta)
     if use_msa_server:
         from boltz.affinity_rescoring.msa_cache import raise_msa_server_disabled
         try:
@@ -169,6 +219,10 @@ def train_cmd(
         use_msa_server=use_msa_server, overwrite=overwrite, notes=notes,
         early_stopping_patience=early_stopping_patience,
         early_stopping_min_delta=early_stopping_min_delta,
+        early_stopping_rel_delta=early_stopping_rel_delta,
+        huber_delta_mode=huber_delta_mode,
+        huber_delta=huber_delta,
+        huber_delta_k=huber_delta_k,
         plot_loss_curve=plot_loss_curve,
         val_csv_path=val_csv_path,
         val_split=val_split,
@@ -194,6 +248,9 @@ def update_cmd(
     csv_path: str,
     mode: str,
     loss_spec: str,
+    huber_delta_mode: str,
+    huber_delta: float,
+    huber_delta_k: float,
     rank: int,
     alpha: float,
     dropout: float,
@@ -210,6 +267,7 @@ def update_cmd(
     notes: Optional[str],
     early_stopping_patience: int,
     early_stopping_min_delta: float,
+    early_stopping_rel_delta: float,
     plot_loss_curve: bool,
     val_csv_path: Optional[str],
     val_split: float,
@@ -217,6 +275,7 @@ def update_cmd(
 ) -> None:
     """Continue training an existing adapter on new (or additional) data."""
     _setup_logging(log_level)
+    _check_huber_delta_options(huber_delta_mode, early_stopping_rel_delta)
     if use_msa_server:
         from boltz.affinity_rescoring.msa_cache import raise_msa_server_disabled
         try:
@@ -247,6 +306,10 @@ def update_cmd(
         notes=notes,
         early_stopping_patience=early_stopping_patience,
         early_stopping_min_delta=early_stopping_min_delta,
+        early_stopping_rel_delta=early_stopping_rel_delta,
+        huber_delta_mode=huber_delta_mode,
+        huber_delta=huber_delta,
+        huber_delta_k=huber_delta_k,
         plot_loss_curve=plot_loss_curve,
         val_csv_path=val_csv_path,
         val_split=val_split,

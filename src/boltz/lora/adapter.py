@@ -45,6 +45,21 @@ class TrainingRun:
     batch_size: int = 1
     metrics: list[dict[str, float]] = field(default_factory=list)
     notes: Optional[str] = None
+    # Huber delta provenance (None on runs recorded before these fields
+    # existed). ``huber_delta_resolved`` is the delta the loss actually used
+    # (the last epoch's for dynamic-mad; None if the loss takes no delta).
+    huber_delta_mode: Optional[str] = None
+    huber_delta_resolved: Optional[float] = None
+    huber_delta_k: Optional[float] = None
+    huber_delta_per_epoch: Optional[list[float]] = None
+    early_stopping_rel_delta: Optional[float] = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TrainingRun":
+        """Build from a ``meta.json`` record, ignoring unknown keys so that
+        metadata written by a newer version still loads."""
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 @dataclass
@@ -91,7 +106,7 @@ class LoRAAdapter:
             base_checkpoint_path=data.get("base_checkpoint_path"),
             config=LoRAConfig.from_dict(data.get("config", {})),
             adapted_layers=list(data.get("adapted_layers", [])),
-            history=[TrainingRun(**h) for h in data.get("history", [])],
+            history=[TrainingRun.from_dict(h) for h in data.get("history", [])],
             parent_adapter=data.get("parent_adapter"),
             format_version=data.get("format_version", BOLTZ_LORA_FORMAT_VERSION),
         )

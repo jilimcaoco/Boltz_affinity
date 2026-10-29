@@ -14,10 +14,30 @@ batch dict yielded by :class:`boltz.lora.data.LoRADataset`; it must contain a
 Users can register their own via :func:`load_loss_from_spec`, which accepts
 either a built-in name (``"mse"``, ``"mae"``, ...) or a string of the form
 ``path/to/file.py:fn_name``.
+
+Huber convention
+----------------
+Every Huber-family loss here (``huber``, ``intra_assay_huber``,
+``censored_intra_assay_huber``, ``boltz2_affinity``,
+``censored_boltz2_affinity``) is computed with
+``F.smooth_l1_loss(..., beta=delta)``, which is **not** textbook Huber::
+
+    Huber(x, delta) = delta * smooth_l1(x, beta=delta)
+
+The two coincide only at ``delta = 1.0`` (the default). For other values the
+loss magnitude scales as ``1/delta`` relative to Huber, so losses obtained
+with different ``delta`` are not directly comparable. Pass
+``scale_invariant=True`` to multiply the Huber terms by ``delta`` and recover
+textbook ``Huber(delta)`` semantics; the default (``False``) preserves the
+historical values.
+
+``delta`` can be chosen from data with :func:`robust_delta` and attached to a
+loss with :func:`bind_delta`.
 """
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import inspect
 import os
@@ -60,9 +80,17 @@ def mae_loss(pred, batch, adapter_meta=None):  # noqa: ANN001
     return F.l1_loss(p, _target(batch, device=p.device))
 
 
-def huber_loss(pred, batch, adapter_meta=None):  # noqa: ANN001
+def huber_loss(
+    pred,  # noqa: ANN001
+    batch,  # noqa: ANN001
+    adapter_meta=None,  # noqa: ANN001
+    *,
+    delta: float = 1.0,
+    scale_invariant: bool = False,
+):
     p = _pred_value(pred).float()
-    return F.smooth_l1_loss(p, _target(batch, device=p.device))
+    loss = F.smooth_l1_loss(p, _target(batch, device=p.device), beta=delta)
+    return loss * delta if scale_invariant else loss
 
 
 def bce_loss(pred, batch, adapter_meta=None):  # noqa: ANN001
@@ -98,6 +126,7 @@ def intra_assay_huber_loss(
     *,
     delta: float = 1.0,
     pair_weight: float = 2.0,
+    scale_invariant: bool = False,
 ):
     """Boltz-2 style absolute + intra-assay pairwise Huber loss.
 
@@ -119,10 +148,15 @@ def intra_assay_huber_loss(
     With batch size 1 the pairwise term is zero, so this loss reduces to a
     plain Huber loss; use a grouped sampler (or sort the manifest by
     ``group_id`` and pick batch_size >= 4) to get real pairs per step.
+
+    ``scale_invariant=True`` multiplies the result by ``delta`` (textbook
+    Huber; see the module docstring).
     """
     p = _pred_value(pred).float()
     t = _target(batch, device=p.device)
     abs_loss = F.smooth_l1_loss(p, t, beta=delta, reduction="mean")
+    if scale_invariant:
+        abs_loss = abs_loss * delta
 
     groups = batch.get("group_id")
     if groups is None or p.numel() < 2:
@@ -149,6 +183,8 @@ def intra_assay_huber_loss(
     diff_pred = p.index_select(0, pl) - p.index_select(0, pr)
     diff_true = t.index_select(0, pl) - t.index_select(0, pr)
     pair_loss = F.smooth_l1_loss(diff_pred, diff_true, beta=delta, reduction="mean")
+    if scale_invariant:
+        pair_loss = pair_loss * delta
 
     return abs_loss + pair_weight * pair_loss
 
@@ -170,6 +206,7 @@ def censored_intra_assay_huber_loss(
     *,
     delta: float = 1.0,
     pair_weight: float = 2.0,
+    scale_invariant: bool = False,
 ):
     """Intra-assay Huber loss extended with support for right-censored measurements.
 
@@ -201,6 +238,9 @@ def censored_intra_assay_huber_loss(
     The ``is_censored`` flag is read from ``batch['is_censored']`` (list of
     int or tensor, 0/1).  If absent the function degrades gracefully to the
     standard :func:`intra_assay_huber_loss`.
+
+    ``scale_invariant=True`` multiplies the result by ``delta`` (textbook
+    Huber; see the module docstring).
     """
     p = _pred_value(pred).float()
     t = _target(batch, device=p.device)
@@ -228,6 +268,8 @@ def censored_intra_assay_huber_loss(
         if abs_terms
         else torch.zeros((), device=p.device)
     )
+    if scale_invariant:
+        abs_loss = abs_loss * delta
 
     # ---- Pairwise intra-assay term ---------------------------------------- #
     groups = batch.get("group_id")
@@ -296,6 +338,8 @@ def censored_intra_assay_huber_loss(
         if pair_terms
         else torch.zeros((), device=p.device)
     )
+    if scale_invariant:
+        pair_loss = pair_loss * delta
 
     return abs_loss + pair_weight * pair_loss
 
@@ -308,6 +352,7 @@ def censored_boltz2_affinity_loss(
     delta: float = 1.0,
     pair_weight: float = 2.0,
     bce_weight: float = 1.0,
+    scale_invariant: bool = False,
 ):
     """Censored variant of :func:`boltz2_affinity_loss`.
 
@@ -323,6 +368,7 @@ def censored_boltz2_affinity_loss(
     """
     value = censored_intra_assay_huber_loss(
         pred, batch, adapter_meta, delta=delta, pair_weight=pair_weight,
+        scale_invariant=scale_invariant,
     )
 
     if "affinity_logits_binary" not in pred:
@@ -391,6 +437,7 @@ def boltz2_affinity_loss(
     delta: float = 1.0,
     pair_weight: float = 2.0,
     bce_weight: float = 1.0,
+    scale_invariant: bool = False,
 ):
     """Boltz-2 paper multi-task affinity loss.
 
@@ -423,6 +470,7 @@ def boltz2_affinity_loss(
     """
     value = intra_assay_huber_loss(
         pred, batch, adapter_meta, delta=delta, pair_weight=pair_weight,
+        scale_invariant=scale_invariant,
     )
 
     if "affinity_logits_binary" not in pred:
@@ -511,23 +559,113 @@ def load_loss_from_spec(spec: str) -> LossFn:
     return fn  # type: ignore[return-value]
 
 
+_POSITIONAL_KINDS = (
+    inspect.Parameter.POSITIONAL_ONLY,
+    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+)
+
+
 def call_loss(
     loss_fn: LossFn,
     pred: Dict[str, torch.Tensor],
     batch: Dict[str, Any],
     adapter_meta: Optional[Any] = None,
 ) -> torch.Tensor:
-    """Call a loss fn defensively (handles 2- vs 3-arg signatures)."""
-    sig = inspect.signature(loss_fn)
-    if len(sig.parameters) >= 3:
+    """Call a loss fn defensively (handles 2- vs 3-arg signatures).
+
+    Only parameters that can be filled positionally are counted, so keyword-
+    only knobs (``delta``, ``pair_weight``, ...) and parameters bound by
+    :func:`bind_delta` (which ``functools.partial`` turns keyword-only) never
+    make a 2-arg loss look like a 3-arg one.
+    """
+    params = inspect.signature(loss_fn).parameters.values()
+    n_positional = sum(p.kind in _POSITIONAL_KINDS for p in params)
+    has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+    if has_varargs or n_positional >= 3:
         return loss_fn(pred, batch, adapter_meta)
     return loss_fn(pred, batch)  # type: ignore[call-arg]
+
+
+# ── Huber delta selection ────────────────────────────────────────────────────
+
+# MAD of a standard normal; sigma_hat = MAD / 0.6745 is consistent for sigma.
+_MAD_TO_SIGMA = 0.6745
+_MIN_ROBUST_N = 8
+
+
+def robust_delta(residuals, k: float = 1.345, floor: float = 1e-3) -> Optional[float]:  # noqa: ANN001
+    """Huber transition point from a robust scale estimate of `residuals`.
+
+    sigma_hat = MAD / 0.6745  (consistent with sigma for Gaussian data)
+    delta     = k * sigma_hat
+
+    k = 1.345 gives 95% asymptotic efficiency under Gaussian errors while
+    bounding the influence of outliers (Huber's standard tuning constant).
+
+    The MAD is taken about the *median* of the residuals (not about zero), so
+    a systematic prediction offset does not inflate the scale estimate.
+    Non-finite values are dropped. Returns ``None`` when fewer than 8 finite
+    residuals remain or the MAD is zero; callers should then fall back to a
+    fixed ``delta``. The result is clamped to ``>= floor``.
+    """
+    import numpy as np
+
+    if torch.is_tensor(residuals):
+        residuals = residuals.detach().cpu().double().numpy()
+    r = np.asarray(residuals, dtype=np.float64).ravel()
+    r = r[np.isfinite(r)]
+    if r.size < _MIN_ROBUST_N:
+        return None
+    mad = float(np.median(np.abs(r - np.median(r))))
+    if not mad > 0.0:
+        return None
+    return max(float(k) * mad / _MAD_TO_SIGMA, float(floor))
+
+
+def _delta_param(loss_fn: Callable) -> Optional[inspect.Parameter]:
+    """The ``delta`` parameter of ``loss_fn`` if it can be bound by keyword."""
+    try:
+        param = inspect.signature(loss_fn).parameters.get("delta")
+    except (TypeError, ValueError):
+        return None
+    if param is None or param.kind not in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY,
+    ):
+        return None
+    return param
+
+
+def accepts_delta(loss_fn: Callable) -> bool:
+    """Whether ``loss_fn`` has a keyword-bindable ``delta`` parameter."""
+    return _delta_param(loss_fn) is not None
+
+
+def loss_delta(loss_fn: Callable) -> Optional[float]:
+    """The ``delta`` ``loss_fn`` will use when called without one.
+
+    Reflects a value bound by :func:`bind_delta`. ``None`` when the loss has
+    no ``delta`` parameter or its default is not numeric.
+    """
+    param = _delta_param(loss_fn)
+    if param is None or isinstance(param.default, bool):
+        return None
+    return float(param.default) if isinstance(param.default, (int, float)) else None
+
+
+def bind_delta(loss_fn: LossFn, delta: float) -> LossFn:
+    """Return `loss_fn` with `delta` bound, or `loss_fn` unchanged if it has no
+    `delta` parameter."""
+    if not accepts_delta(loss_fn):
+        return loss_fn
+    return functools.partial(loss_fn, delta=float(delta))  # type: ignore[return-value]
 
 
 __all__ = [
     "BUILTIN_LOSSES",
     "LossFn",
+    "accepts_delta",
     "bce_loss",
+    "bind_delta",
     "boltz2_affinity_loss",
     "call_loss",
     "censored_boltz2_affinity_loss",
@@ -535,7 +673,9 @@ __all__ = [
     "huber_loss",
     "intra_assay_huber_loss",
     "load_loss_from_spec",
+    "loss_delta",
     "mae_loss",
     "mse_loss",
     "pairwise_ranking_loss",
+    "robust_delta",
 ]

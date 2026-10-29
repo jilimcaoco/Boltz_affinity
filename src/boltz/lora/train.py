@@ -18,8 +18,10 @@ adapter's ``meta.json`` via :class:`LoRARegistry`.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
+import math
 import os
 import tempfile
 import time
@@ -34,7 +36,15 @@ from boltz import __version__ as _BOLTZ_VERSION  # type: ignore[attr-defined]
 from boltz.lora.adapter import LoRAAdapter, LoRAConfig, TrainingRun
 from boltz.lora.data import AssayGroupedSampler, LoRADataset, lora_collate
 from boltz.lora.inject import apply_lora, load_lora_state_dict, lora_state_dict
-from boltz.lora.losses import LossFn, call_loss, load_loss_from_spec
+from boltz.lora.losses import (
+    LossFn,
+    accepts_delta,
+    bind_delta,
+    call_loss,
+    load_loss_from_spec,
+    loss_delta,
+    robust_delta,
+)
 from boltz.lora.registry import LoRARegistry, default_registry, hash_file
 from boltz.lora.targets import resolve_targets
 
@@ -74,6 +84,25 @@ class TrainArgs:
     # training rows to hold out.  When both are None/0 no validation is run.
     val_csv_path: Optional[str] = None
     val_split: float = 0.0
+    # Huber transition point for losses with a ``delta`` parameter (see the
+    # "Huber convention" note in boltz.lora.losses).
+    #   fixed          : huber_delta. At 1.0 (the built-in losses' default)
+    #                    the loss is left unbound, i.e. exactly as before.
+    #   static-vanilla : k * MAD-sigma of the un-adapted model's training-set
+    #                    residuals, resolved once before training.
+    #   dynamic-mad    : re-resolved from each epoch's training residuals for
+    #                    the next epoch; huber_delta seeds the first epoch.
+    huber_delta_mode: str = "fixed"
+    huber_delta: float = 1.0
+    huber_delta_k: float = 1.345
+    # Relative early stopping: an epoch counts as an improvement only if it
+    # beats the best loss by more than rel_delta * |best|. 0 = disabled (the
+    # absolute early_stopping_min_delta applies). Required for dynamic-mad,
+    # whose loss scale changes between epochs.
+    early_stopping_rel_delta: float = 0.0
+
+
+HUBER_DELTA_MODES = ("fixed", "static-vanilla", "dynamic-mad")
 
 
 def _pick_device(spec: str) -> torch.device:
@@ -848,6 +877,105 @@ def _affinity_forward_trainable(
     return out
 
 
+# ── Huber delta resolution ───────────────────────────────────────────────────
+
+
+@contextlib.contextmanager
+def _lora_disabled(model: Any):
+    """Zero every adapter's scaling so forwards reproduce the base model."""
+    from boltz.lora.layers import LoRALinear
+
+    mods = [m for m in model.modules() if isinstance(m, LoRALinear)]
+    saved = [m.scaling for m in mods]
+    for m in mods:
+        m.scaling = 0.0
+    try:
+        yield
+    finally:
+        for m, sc in zip(mods, saved):
+            m.scaling = sc
+
+
+def _batch_residuals(
+    pred: dict[str, torch.Tensor], batch: dict[str, Any], target: torch.Tensor,
+) -> torch.Tensor:
+    """Detached ``pred - target`` for a loss batch, on CPU.
+
+    Right-censored rows are dropped: their target is only a bound, so the
+    residual is not a sample of the error distribution.
+    """
+    r = (
+        pred["affinity_pred_value"].detach().float().reshape(-1).cpu()
+        - target.detach().float().reshape(-1).cpu()
+    )
+    cens = batch.get("is_censored")
+    if isinstance(cens, list) and len(cens) == r.numel():
+        r = r[torch.tensor([not int(c or 0) for c in cens], dtype=torch.bool)]
+    return r
+
+
+def _vanilla_residuals(
+    model: Any,
+    dataset: Any,
+    *,
+    cache_dir: Path,
+    use_msa_server: bool,
+    recycling_steps: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Residuals of the un-adapted model over ``dataset`` (one no-grad pass).
+
+    Adapter scaling is forced to zero, so this is the base model even after
+    injection or when resuming from adapter weights. Goes through the normal
+    featurize/forward path and therefore fills (or hits) the train cache.
+    Rows are collated directly rather than via a DataLoader so no global RNG
+    state is consumed.
+    """
+    out: list[torch.Tensor] = []
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad(), _lora_disabled(model):
+            for idx in range(len(dataset)):
+                batch = lora_collate([dataset[idx]])
+                try:
+                    feats = _featurize_row(
+                        batch, cache_dir=cache_dir,
+                        use_msa_server=use_msa_server, device=device,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Huber delta: skipping row %r: featurization failed (%s)",
+                        batch["name"][0], exc,
+                    )
+                    continue
+                pred = _affinity_forward_trainable(
+                    model, feats, recycling_steps=recycling_steps,
+                )
+                out.append(_batch_residuals(pred, batch, batch["target"]))
+    finally:
+        model.train(was_training)
+    return torch.cat(out) if out else torch.zeros(0)
+
+
+def _resolve_delta(residuals: torch.Tensor, args: TrainArgs, label: str) -> float:
+    """``robust_delta`` of ``residuals``, falling back to ``args.huber_delta``."""
+    n = int(residuals.numel())
+    delta = robust_delta(residuals, k=args.huber_delta_k)
+    if delta is None:
+        logger.warning(
+            "Huber delta (%s): cannot estimate from %d residuals (need >= 8 "
+            "finite values with non-zero MAD); falling back to huber_delta=%.4f.",
+            label, n, args.huber_delta,
+        )
+        return float(args.huber_delta)
+    logger.info(
+        "Huber delta (%s): sigma_hat=%.4f -> delta=%.4f (k=%.3f, n=%d)",
+        label, delta / args.huber_delta_k, delta, args.huber_delta_k, n,
+    )
+    return delta
+
+
 # ── Trainer ──────────────────────────────────────────────────────────────────
 
 
@@ -896,6 +1024,23 @@ def train_lora(
 
     if args.mode != "rescore":
         msg = f"Unknown mode {args.mode!r}; expected 'rescore' or 'full'."
+        raise ValueError(msg)
+
+    if args.huber_delta_mode not in HUBER_DELTA_MODES:
+        msg = (
+            f"Unknown huber_delta_mode {args.huber_delta_mode!r}; expected one "
+            f"of {HUBER_DELTA_MODES}."
+        )
+        raise ValueError(msg)
+    if args.early_stopping_rel_delta < 0:
+        msg = f"early_stopping_rel_delta must be >= 0, got {args.early_stopping_rel_delta}."
+        raise ValueError(msg)
+    if args.huber_delta_mode == "dynamic-mad" and args.early_stopping_rel_delta <= 0:
+        msg = (
+            "huber_delta_mode='dynamic-mad' requires early_stopping_rel_delta > 0 "
+            "(--early-stopping-rel-delta): delta changes every epoch, so the loss "
+            "scale does too and an absolute min-delta threshold is meaningless."
+        )
         raise ValueError(msg)
 
     registry = registry or default_registry()
@@ -972,10 +1117,37 @@ def train_lora(
 
     val_loader: Optional[DataLoader] = None
     if val_dataset is not None:
-        val_loader = DataLoader(
-            val_dataset, batch_size=1, shuffle=False,
-            collate_fn=lora_collate, num_workers=0,
+        # Grouped, NOT batch_size=1: a singleton batch makes every pairwise
+        # loss term (intra_assay_huber, censored_intra_assay_huber, ...)
+        # short-circuit to its absolute-only branch (see call sites: each
+        # returns early when p.numel() < 2), so val_loss silently measured
+        # only the absolute term regardless of loss variant. Mirror the
+        # train-side AssayGroupedSampler (shuffle=False: validation order
+        # need not vary run-to-run) so val_loss reflects the same pairwise/
+        # censored terms actually being optimised.
+        _val_rows = (
+            val_dataset.rows  # LoRADataset
+            if hasattr(val_dataset, "rows")
+            else [dataset.rows[i] for i in val_dataset.indices]  # Subset
         )
+        _val_has_groups = any(r.group_id for r in _val_rows)
+        if args.batch_size > 1 and _val_has_groups:
+            _val_sampler = AssayGroupedSampler(
+                _val_rows, batch_size=args.batch_size, shuffle=False,
+            )
+            val_loader = DataLoader(
+                val_dataset, batch_sampler=_val_sampler,
+                collate_fn=lora_collate, num_workers=0,
+            )
+            logger.info(
+                "Validation AssayGroupedSampler: %d assay groups, %d ungrouped rows.",
+                _val_sampler.n_assay_groups, _val_sampler.n_ungrouped,
+            )
+        else:
+            val_loader = DataLoader(
+                val_dataset, batch_size=1, shuffle=False,
+                collate_fn=lora_collate, num_workers=0,
+            )
 
     model, ckpt_path, ckpt_sha = _load_base_model(args.checkpoint, device)
     model.train()  # enables grad; LoRA params are the only trainable ones
@@ -1000,7 +1172,21 @@ def train_lora(
         trainable, lr=args.learning_rate, weight_decay=args.weight_decay,
     )
 
-    loss_fn: LossFn = load_loss_from_spec(args.loss_spec)
+    base_loss_fn: LossFn = load_loss_from_spec(args.loss_spec)
+    # Bound to the resolved Huber delta below (after resume); unbound in the
+    # default fixed/1.0 path so the loss call is exactly as before.
+    loss_fn: LossFn = base_loss_fn
+    delta_active = accepts_delta(base_loss_fn)
+    if not delta_active and (
+        args.huber_delta_mode != "fixed" or args.huber_delta != 1.0
+    ):
+        logger.warning(
+            "Loss %r has no 'delta' parameter; ignoring huber_delta_mode=%r / "
+            "huber_delta=%s.", args.loss_spec, args.huber_delta_mode, args.huber_delta,
+        )
+    dynamic_delta = delta_active and args.huber_delta_mode == "dynamic-mad"
+    current_delta: Optional[float] = None
+    huber_delta_per_epoch: list[float] = []
     cache_dir = Path(os.environ.get("BOLTZ_CACHE", "~/.boltz")).expanduser()
 
     adapter = LoRAAdapter(
@@ -1023,6 +1209,9 @@ def train_lora(
         loss_spec=args.loss_spec, epochs=args.epochs,
         learning_rate=args.learning_rate, batch_size=args.batch_size,
         notes=args.notes,
+        huber_delta_mode=args.huber_delta_mode,
+        huber_delta_k=args.huber_delta_k,
+        early_stopping_rel_delta=args.early_stopping_rel_delta,
     )
 
     # Early stopping state — uses val_loss when a val set is present, else train loss.
@@ -1071,15 +1260,39 @@ def train_lora(
         _es_patience_counter = _ckpt.get("es_patience_counter", 0)
         _es_best_state = _ckpt.get("es_best_state")
         _es_best_epoch = _ckpt.get("es_best_epoch", 0)
+        if (
+            args.huber_delta_mode != "fixed"
+            and _ckpt.get("huber_delta_mode") == args.huber_delta_mode
+        ):
+            current_delta = _ckpt.get("huber_delta_current")
+            huber_delta_per_epoch = list(_ckpt.get("huber_delta_per_epoch") or [])
         logger.info(
             "Resumed: start_epoch=%d, es_best_loss=%.5f, es_patience=%d.",
             start_epoch, _es_best_loss, _es_patience_counter,
         )
 
+    # ── Resolve the Huber delta ────────────────────────────────────────────
+    if delta_active and current_delta is None:
+        if args.huber_delta_mode == "static-vanilla":
+            current_delta = _resolve_delta(
+                _vanilla_residuals(
+                    model, train_dataset, cache_dir=cache_dir,
+                    use_msa_server=args.use_msa_server,
+                    recycling_steps=args.recycling_steps, device=device,
+                ),
+                args, "static-vanilla",
+            )
+        elif args.huber_delta_mode == "dynamic-mad" or args.huber_delta != 1.0:
+            current_delta = float(args.huber_delta)
+    if current_delta is not None:
+        loss_fn = bind_delta(base_loss_fn, current_delta)
+        logger.info("Huber delta (%s): using delta=%.4f.", args.huber_delta_mode, current_delta)
+
     for epoch in range(start_epoch, args.epochs):
         if _sampler is not None:
             _sampler.set_epoch(epoch)
         epoch_losses: list[float] = []
+        epoch_residuals: list[torch.Tensor] = []
         for batch in loader:
             target = batch["target"].to(device)
             n_rows = len(batch["name"]) if isinstance(batch["name"], list) else 1
@@ -1137,7 +1350,7 @@ def train_lora(
                         batch["target"] = batch["target"].index_select(
                             0, keep_t.to(batch["target"].device)
                         )
-                    for k in ("group_id", "is_binder", "name"):
+                    for k in ("group_id", "is_binder", "is_censored", "name"):
                         v = batch.get(k)
                         if isinstance(v, list):
                             batch[k] = [v[i] for i in kept_indices]
@@ -1156,9 +1369,14 @@ def train_lora(
                 torch.nn.utils.clip_grad_norm_(trainable, args.gradient_clip)
             optim.step()
             epoch_losses.append(float(loss.detach().cpu().item()))
+            if dynamic_delta:
+                epoch_residuals.append(_batch_residuals(pred_combined, batch_for_loss, target))
 
         mean_loss = sum(epoch_losses) / max(1, len(epoch_losses))
         # ── Validation pass (no grad) ──────────────────────────────────────
+        # Mirrors the training loop's single-row / multi-row branching above
+        # (grouped batches now that val_loader uses AssayGroupedSampler too)
+        # so pairwise/censored loss terms are actually exercised on val data.
         mean_val_loss: Optional[float] = None
         if val_loader is not None:
             model.eval()
@@ -1166,27 +1384,85 @@ def train_lora(
             with torch.no_grad():
                 for val_batch in val_loader:
                     val_target = val_batch["target"].to(device)
-                    try:
-                        val_feats = _featurize_row(
-                            val_batch, cache_dir=cache_dir,
-                            use_msa_server=args.use_msa_server, device=device,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        vname = (
-                            val_batch["name"][0]
-                            if isinstance(val_batch["name"], list)
-                            else val_batch["name"]
-                        )
-                        logger.warning(
-                            "Val: skipping row %r: featurization failed (%s)",
-                            vname, exc,
-                        )
-                        continue
-                    val_pred = _affinity_forward_trainable(
-                        model, val_feats, recycling_steps=args.recycling_steps,
+                    val_n_rows = (
+                        len(val_batch["name"])
+                        if isinstance(val_batch["name"], list) else 1
                     )
+
+                    if val_n_rows == 1:
+                        try:
+                            val_feats = _featurize_row(
+                                val_batch, cache_dir=cache_dir,
+                                use_msa_server=args.use_msa_server, device=device,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            vname = (
+                                val_batch["name"][0]
+                                if isinstance(val_batch["name"], list)
+                                else val_batch["name"]
+                            )
+                            logger.warning(
+                                "Val: skipping row %r: featurization failed (%s)",
+                                vname, exc,
+                            )
+                            continue
+                        val_pred = _affinity_forward_trainable(
+                            model, val_feats, recycling_steps=args.recycling_steps,
+                        )
+                        val_pred_combined = val_pred
+                    else:
+                        all_val_pred_values: list[torch.Tensor] = []
+                        all_val_logits_binary: list[torch.Tensor] = []
+                        val_kept_indices: list[int] = []
+                        for i in range(val_n_rows):
+                            val_row_i = _extract_row_from_batch(val_batch, i)
+                            try:
+                                val_feats_i = _featurize_row(
+                                    val_row_i, cache_dir=cache_dir,
+                                    use_msa_server=args.use_msa_server, device=device,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                vname = (
+                                    val_row_i["name"][0]
+                                    if isinstance(val_row_i["name"], list)
+                                    else val_row_i["name"]
+                                )
+                                logger.warning(
+                                    "Val: skipping row %r: featurization failed (%s)",
+                                    vname, exc,
+                                )
+                                continue
+                            val_pred_i = _affinity_forward_trainable(
+                                model, val_feats_i, recycling_steps=args.recycling_steps,
+                            )
+                            all_val_pred_values.append(val_pred_i["affinity_pred_value"])
+                            if "affinity_logits_binary" in val_pred_i:
+                                all_val_logits_binary.append(val_pred_i["affinity_logits_binary"])
+                            val_kept_indices.append(i)
+                        if not all_val_pred_values:
+                            logger.warning("Val: skipping batch: no rows survived featurization")
+                            continue
+                        if len(val_kept_indices) != val_n_rows:
+                            keep_t = torch.tensor(val_kept_indices, device=val_target.device, dtype=torch.long)
+                            val_target = val_target.index_select(0, keep_t)
+                            if isinstance(val_batch.get("target"), torch.Tensor):
+                                val_batch["target"] = val_batch["target"].index_select(
+                                    0, keep_t.to(val_batch["target"].device)
+                                )
+                            for k in ("group_id", "is_binder", "is_censored", "name"):
+                                v = val_batch.get(k)
+                                if isinstance(v, list):
+                                    val_batch[k] = [v[i] for i in val_kept_indices]
+                        val_pred_combined = {
+                            "affinity_pred_value": torch.cat(all_val_pred_values, dim=0)
+                        }
+                        if all_val_logits_binary and len(all_val_logits_binary) == len(val_kept_indices):
+                            val_pred_combined["affinity_logits_binary"] = torch.cat(
+                                all_val_logits_binary, dim=0
+                            )
+
                     val_batch_for_loss = {**val_batch, "target": val_target}
-                    val_loss_val = call_loss(loss_fn, val_pred, val_batch_for_loss, adapter)
+                    val_loss_val = call_loss(loss_fn, val_pred_combined, val_batch_for_loss, adapter)
                     val_epoch_losses.append(float(val_loss_val.detach().cpu().item()))
             model.train()
             if val_epoch_losses:
@@ -1212,7 +1488,14 @@ def train_lora(
         if args.early_stopping_patience > 0:
             # Use val_loss for early stopping when available, else train loss.
             _es_monitor = mean_val_loss if mean_val_loss is not None else mean_loss
-            if _es_monitor < _es_best_loss - args.early_stopping_min_delta:
+            # Relative criterion when requested (scale-free, see TrainArgs);
+            # the first epoch (best = inf) always counts as an improvement.
+            _es_threshold = (
+                args.early_stopping_rel_delta * abs(_es_best_loss)
+                if args.early_stopping_rel_delta > 0 and math.isfinite(_es_best_loss)
+                else args.early_stopping_min_delta
+            )
+            if _es_monitor < _es_best_loss - _es_threshold:
                 _es_best_loss = _es_monitor
                 _es_patience_counter = 0
                 _es_best_epoch = epoch + 1
@@ -1242,6 +1525,19 @@ def train_lora(
                     )
                     _es_stop = True
 
+        # ── Dynamic Huber delta: re-estimate for the next epoch ─────────────
+        # Train and val of this epoch both used current_delta; the estimate
+        # from this epoch's (already accumulated) training residuals applies
+        # from the next epoch on.
+        if dynamic_delta:
+            huber_delta_per_epoch.append(float(current_delta))
+            if not _es_stop and epoch + 1 < args.epochs:
+                residuals = torch.cat(epoch_residuals) if epoch_residuals else torch.zeros(0)
+                current_delta = _resolve_delta(
+                    residuals, args, f"dynamic-mad, after epoch {epoch + 1}",
+                )
+                loss_fn = bind_delta(base_loss_fn, current_delta)
+
         # ── Checkpoint (one file per completed epoch) ───────────────────────────
         ckpt_path = _checkpoint_path_for_epoch(ckpt_dir, epoch)
         _save_checkpoint(ckpt_path, {
@@ -1257,6 +1553,9 @@ def train_lora(
             "es_patience_counter": _es_patience_counter,
             "es_best_epoch": _es_best_epoch,
             "es_best_state": _es_best_state,
+            "huber_delta_mode": args.huber_delta_mode,
+            "huber_delta_current": current_delta,
+            "huber_delta_per_epoch": huber_delta_per_epoch,
         })
         logger.debug("Checkpoint saved after epoch %d.", epoch + 1)
 
@@ -1276,6 +1575,12 @@ def train_lora(
         load_lora_state_dict(model, _es_best_state, strict=False)
 
     run.finished_at = time.time()
+    # The delta the loss actually ran with (last trained epoch for dynamic).
+    run.huber_delta_resolved = (
+        huber_delta_per_epoch[-1] if dynamic_delta and huber_delta_per_epoch
+        else loss_delta(loss_fn)
+    )
+    run.huber_delta_per_epoch = huber_delta_per_epoch if dynamic_delta else None
     adapter.history.append(run)
 
     state = lora_state_dict(model)
@@ -1295,4 +1600,4 @@ def prepare_update(
     return registry.load(name)
 
 
-__all__ = ["TrainArgs", "prepare_update", "train_lora"]
+__all__ = ["HUBER_DELTA_MODES", "TrainArgs", "prepare_update", "train_lora"]
