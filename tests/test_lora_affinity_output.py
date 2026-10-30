@@ -123,7 +123,10 @@ def test_trainer_records_affinity_output(lora_harness):
     _, run = lora_harness(affinity_output="ensemble", epochs=1)
     assert run["affinity_output"] == "ensemble"
     _, run = lora_harness(epochs=1)
+    assert run["affinity_output"] == "ensemble"  # trainer v2 default
+    _, run = lora_harness(epochs=1, legacy_trainer=True)
     assert run["affinity_output"] == "module1"
+    assert run["trainer_semantics"] == "legacy"
     with pytest.raises(ValueError, match="affinity_output"):
         lora_harness(affinity_output="both", epochs=1)
 

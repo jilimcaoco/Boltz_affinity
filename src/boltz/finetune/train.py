@@ -5,9 +5,10 @@ Twin of :mod:`boltz.lora.train` — same CSV manifest, same losses, same
 adapters and freezing the base, we directly mark a subset of the *base*
 parameters as trainable and let AdamW update them.
 
-We deliberately reuse :func:`boltz.lora.train._featurize_row` and
-:func:`boltz.lora.train._affinity_forward_trainable` so the two training
-modes share an identical compute graph.  Anything that improves
+We deliberately reuse :func:`boltz.lora.train._forward_batch` (featurisation
++ :func:`boltz.lora.train._affinity_forward_trainable`) and its validation /
+gradient-coverage helpers so the two training modes share an identical
+compute graph and stopping criterion.  Anything that improves
 featurisation or the forward pass automatically benefits both.
 
 Saved artefact: a *partial* state-dict (only the trained tensors) plus
@@ -18,6 +19,7 @@ provenance metadata.  Re-applying it during inference is a
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import re
@@ -48,20 +50,27 @@ from boltz.lora.data import (
     warn_if_censored_loss_without_censored_rows,
 )
 from boltz.lora.losses import LossFn, call_loss, load_loss_from_spec
+from boltz.lora.provenance import repo_state
 from boltz.lora.train import (
-    AFFINITY_OUTPUTS,
-    _affinity_forward_trainable,
-    _configure_train_cache,
-    _extract_row_from_batch,
-    _featurize_row,
-    _load_base_model,
-    _load_checkpoint,
+    GradCoverage,
+    _build_val_loader,
     _checkpoint_path_for_epoch,
+    _configure_train_cache,
+    _dataset_rows,
+    _forward_batch,
     _iter_checkpoint_paths,
     _latest_checkpoint_path,
+    _load_base_model,
+    _load_checkpoint,
     _pick_device,
     _plot_loss_curve,
+    _run_validation,
     _save_checkpoint,
+    _split_train_val,
+    affinity_modules_for,
+    check_grad_coverage,
+    resolve_affinity_output,
+    set_checkpoint_mode,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,8 +100,14 @@ class FinetuneArgs:
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 0.005
     plot_loss_curve: bool = True
-    # See boltz.lora.train.TrainArgs.affinity_output.
-    affinity_output: str = "module1"
+    # See boltz.lora.train.TrainArgs.affinity_output / legacy_trainer.
+    affinity_output: Optional[str] = None
+    legacy_trainer: bool = False
+    # Validation, as in boltz.lora.train.TrainArgs: explicit CSV, or the last
+    # ``val_split`` fraction of training rows. val_loss then drives early
+    # stopping, so LoRA and full fine-tune arms stop on the same criterion.
+    val_csv_path: Optional[str] = None
+    val_split: float = 0.0
 
 
 # ── Parameter selection ─────────────────────────────────────────────────────
@@ -154,27 +169,31 @@ def train_finetune(
         msg = f"Unknown mode {args.mode!r}; expected 'rescore' or 'full'."
         raise ValueError(msg)
 
-    if args.affinity_output not in AFFINITY_OUTPUTS:
-        msg = (
-            f"Unknown affinity_output {args.affinity_output!r}; expected one "
-            f"of {AFFINITY_OUTPUTS}."
-        )
-        raise ValueError(msg)
+    requested_output = args.affinity_output
+    args = dataclasses.replace(
+        args,
+        affinity_output=resolve_affinity_output(args.affinity_output, args.legacy_trainer),
+    )
 
     registry = registry or default_registry()
     device = _pick_device(args.device)
 
     dataset = LoRADataset(args.csv_path, mode=args.mode)
+    train_dataset, val_dataset = _split_train_val(
+        dataset, mode=args.mode,
+        val_csv_path=args.val_csv_path, val_split=args.val_split,
+    )
+    _train_rows = _dataset_rows(train_dataset, dataset)
 
-    has_groups = any(r.group_id for r in dataset.rows)
-    warn_if_censored_loss_without_censored_rows(args.loss_spec, dataset.rows)
+    has_groups = any(r.group_id for r in _train_rows)
+    warn_if_censored_loss_without_censored_rows(args.loss_spec, _train_rows)
     _sampler: Optional[AssayGroupedSampler] = None
     if args.batch_size > 1 and has_groups:
         _sampler = AssayGroupedSampler(
-            dataset.rows, batch_size=args.batch_size, shuffle=True,
+            _train_rows, batch_size=args.batch_size, shuffle=True,
         )
         loader = DataLoader(
-            dataset, batch_sampler=_sampler,
+            train_dataset, batch_sampler=_sampler,
             collate_fn=lora_collate, num_workers=0,
         )
         logger.info(
@@ -183,14 +202,32 @@ def train_finetune(
         )
     else:
         loader = DataLoader(
-            dataset, batch_size=max(1, args.batch_size), shuffle=True,
+            train_dataset, batch_size=max(1, args.batch_size), shuffle=True,
             collate_fn=lora_collate, num_workers=0,
         )
+    val_loader: Optional[DataLoader] = (
+        _build_val_loader(val_dataset, dataset, args.batch_size)
+        if val_dataset is not None else None
+    )
 
     model, ckpt_path, ckpt_sha = _load_base_model(args.checkpoint, device)
     model.train()
 
-    target_patterns = resolve_targets(args.target_spec)
+    set_checkpoint_mode(model, legacy=args.legacy_trainer)
+    target_modules = affinity_modules_for(model, args.affinity_output)
+    target_patterns = resolve_targets(
+        args.target_spec, modules=target_modules, legacy=args.legacy_trainer,
+    )
+    logger.info(
+        "Trainer semantics: %s (affinity_output=%s, target modules=%s).",
+        "legacy" if args.legacy_trainer else "v2", args.affinity_output,
+        ",".join(target_modules),
+    )
+    if requested_output == "ensemble" and not getattr(model, "affinity_ensemble", False):
+        logger.warning(
+            "affinity_output='ensemble' requested but the checkpoint has a "
+            "single affinity module; training on its output (same as module1)."
+        )
     selected = _select_trainable_params(model, target_patterns)
     trainable_names = {n for n, _ in selected}
     _freeze_all_then_unfreeze(model, trainable_names)
@@ -266,7 +303,11 @@ def train_finetune(
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
         notes=args.notes,
+        trainer_semantics="legacy" if args.legacy_trainer else "v2",
+        target_modules=list(target_modules),
+        **repo_state(),
     )
+    grad_coverage = GradCoverage(list(selected))
 
     _es_best_loss: float = float("inf")
     _es_patience_counter: int = 0
@@ -320,106 +361,26 @@ def train_finetune(
         _es_patience_counter = _ckpt.get("es_patience_counter", 0)
         _es_best_state = _ckpt.get("es_best_state")
         _es_best_epoch = _ckpt.get("es_best_epoch", 0)
+        run.grad_coverage = _ckpt.get("grad_coverage")
         logger.info(
             "Resumed: start_epoch=%d, es_best_loss=%.5f, es_patience=%d.",
             start_epoch, _es_best_loss, _es_patience_counter,
         )
 
+    fwd_kwargs = dict(
+        device=device, cache_dir=cache_dir, use_msa_server=args.use_msa_server,
+        recycling_steps=args.recycling_steps, affinity_output=args.affinity_output,
+    )
     for epoch in range(start_epoch, args.epochs):
         if _sampler is not None:
             _sampler.set_epoch(epoch)
         epoch_losses: list[float] = []
         for batch in loader:
-            target = batch["target"].to(device)
-            n_rows = (
-                len(batch["name"]) if isinstance(batch["name"], list) else 1
-            )
             optim.zero_grad(set_to_none=True)
-
-            if n_rows == 1:
-                try:
-                    feats = _featurize_row(
-                        batch, cache_dir=cache_dir,
-                        use_msa_server=args.use_msa_server, device=device,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    name = (
-                        batch["name"][0]
-                        if isinstance(batch["name"], list) else batch["name"]
-                    )
-                    logger.warning(
-                        "Skipping row %r: featurization failed (%s)",
-                        name, exc,
-                    )
-                    continue
-                pred = _affinity_forward_trainable(
-                    model, feats, recycling_steps=args.recycling_steps,
-                    affinity_output=args.affinity_output,
-                )
-                pred_combined = pred
-            else:
-                all_pred_values: list[torch.Tensor] = []
-                all_logits_binary: list[torch.Tensor] = []
-                kept_indices: list[int] = []
-                for i in range(n_rows):
-                    row_i = _extract_row_from_batch(batch, i)
-                    try:
-                        feats_i = _featurize_row(
-                            row_i, cache_dir=cache_dir,
-                            use_msa_server=args.use_msa_server, device=device,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        name = (
-                            row_i["name"][0]
-                            if isinstance(row_i["name"], list)
-                            else row_i["name"]
-                        )
-                        logger.warning(
-                            "Skipping row %r: featurization failed (%s)",
-                            name, exc,
-                        )
-                        continue
-                    pred_i = _affinity_forward_trainable(
-                        model, feats_i,
-                        recycling_steps=args.recycling_steps,
-                        affinity_output=args.affinity_output,
-                    )
-                    all_pred_values.append(pred_i["affinity_pred_value"])
-                    if "affinity_logits_binary" in pred_i:
-                        all_logits_binary.append(
-                            pred_i["affinity_logits_binary"]
-                        )
-                    kept_indices.append(i)
-                if not all_pred_values:
-                    logger.warning(
-                        "Skipping batch: no rows survived featurization"
-                    )
-                    continue
-                if len(kept_indices) != n_rows:
-                    keep_t = torch.tensor(
-                        kept_indices, device=target.device, dtype=torch.long,
-                    )
-                    target = target.index_select(0, keep_t)
-                    if isinstance(batch.get("target"), torch.Tensor):
-                        batch["target"] = batch["target"].index_select(
-                            0, keep_t.to(batch["target"].device)
-                        )
-                    for k in ("group_id", "is_binder", "is_censored", "name"):
-                        v = batch.get(k)
-                        if isinstance(v, list):
-                            batch[k] = [v[i] for i in kept_indices]
-                pred_combined = {
-                    "affinity_pred_value": torch.cat(all_pred_values, dim=0),
-                }
-                if (
-                    all_logits_binary
-                    and len(all_logits_binary) == len(kept_indices)
-                ):
-                    pred_combined["affinity_logits_binary"] = torch.cat(
-                        all_logits_binary, dim=0,
-                    )
-
-            batch_for_loss = {**batch, "target": target}
+            fwd = _forward_batch(model, batch, **fwd_kwargs)
+            if fwd is None:
+                continue
+            pred_combined, batch_for_loss, _ = fwd
             # ``call_loss`` accepts the LoRA adapter as a third arg purely
             # for metadata; we don't have one, so pass None — losses that
             # don't use it ignore it, and those that do (rare) will get a
@@ -429,6 +390,8 @@ def train_finetune(
                 loss, args.l2_sp_weight, trainable_param_dict, initial_params,
             )
             loss.backward()
+            if run.grad_coverage is None:
+                grad_coverage.update()
             if args.gradient_clip > 0:
                 torch.nn.utils.clip_grad_norm_(
                     [p for _, p in selected], args.gradient_clip,
@@ -437,16 +400,39 @@ def train_finetune(
             epoch_losses.append(float(loss.detach().cpu().item()))
 
         mean_loss = sum(epoch_losses) / max(1, len(epoch_losses))
-        logger.info(
-            "epoch %d / %d  mean_loss=%.5f",
-            epoch + 1, args.epochs, mean_loss,
+        if run.grad_coverage is None and epoch_losses:
+            run.grad_coverage = grad_coverage.summary()
+            check_grad_coverage(
+                run.grad_coverage, forward_modules=target_modules,
+                legacy=args.legacy_trainer,
+            )
+        # Validation is scored on the task loss only (no L2-SP penalty), so it
+        # is comparable with LoRA arms' val_loss.
+        mean_val_loss: Optional[float] = (
+            _run_validation(model, val_loader, loss_fn, None, **fwd_kwargs)
+            if val_loader is not None else None
         )
-        run.metrics.append({"epoch": float(epoch), "loss": mean_loss})
+        if mean_val_loss is not None:
+            logger.info(
+                "epoch %d / %d  mean_loss=%.5f  val_loss=%.5f",
+                epoch + 1, args.epochs, mean_loss, mean_val_loss,
+            )
+            run.metrics.append({
+                "epoch": float(epoch), "loss": mean_loss, "val_loss": mean_val_loss,
+            })
+        else:
+            logger.info(
+                "epoch %d / %d  mean_loss=%.5f",
+                epoch + 1, args.epochs, mean_loss,
+            )
+            run.metrics.append({"epoch": float(epoch), "loss": mean_loss})
 
         _es_stop = False
         if args.early_stopping_patience > 0:
-            if mean_loss < _es_best_loss - args.early_stopping_min_delta:
-                _es_best_loss = mean_loss
+            # val_loss when a validation set is present, else train loss.
+            _es_monitor = mean_val_loss if mean_val_loss is not None else mean_loss
+            if _es_monitor < _es_best_loss - args.early_stopping_min_delta:
+                _es_best_loss = _es_monitor
                 _es_patience_counter = 0
                 _es_best_epoch = epoch + 1
                 _es_best_state = {
@@ -490,6 +476,7 @@ def train_finetune(
             "es_patience_counter": _es_patience_counter,
             "es_best_epoch": _es_best_epoch,
             "es_best_state": _es_best_state,
+            "grad_coverage": run.grad_coverage,
         })
         logger.debug("Checkpoint saved after epoch %d.", epoch + 1)
 

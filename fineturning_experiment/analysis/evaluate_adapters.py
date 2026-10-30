@@ -255,11 +255,28 @@ def _discover_models(target: str, scores_dir: Path) -> list[str]:
 
 def _merge(target: str, scores_dir: Path, labels_dir: Path,
            models: list[str]) -> pd.DataFrame:
+    """Labels inner-joined with every model's SUCCESS rows.
+
+    All models are therefore evaluated on the same compounds, but that set
+    is the intersection: a compound any one model failed to score is dropped
+    for all of them, and adding a model can shrink every model's set. The
+    per-model SUCCESS counts are printed and kept in ``df.attrs["n_success"]``
+    so the loss is visible in the metrics table.
+    """
     labels = pd.read_csv(labels_dir / f"labels_{target}.csv")
     df = labels
+    n_success: dict[str, int] = {}
     for tag in models:
         scores = _load_scores(scores_dir / f"{target}_{tag}.csv", tag)
+        n_success[tag] = int(scores["id"].isin(labels["name"]).sum())
         df = df.merge(scores, left_on="name", right_on="id", how="inner").drop(columns=["id"])
+    print(
+        f"[{target}] SUCCESS rows matching labels: "
+        + ", ".join(f"{m}={n}" for m, n in n_success.items())
+        + f"; evaluated on the {len(df)} compounds scored by all models "
+        f"(of {len(labels)} labelled)."
+    )
+    df.attrs["n_success"] = n_success
     return df
 
 
@@ -345,6 +362,8 @@ def compute_metrics(df: pd.DataFrame, target: str, n_boot: int = 1000,
         rows.append({
             "target": target, "model": model,
             "n_compounds": int(len(df)),
+            # This model's own SUCCESS rows before the cross-model join.
+            "n_success": int(df.attrs.get("n_success", {}).get(model, len(df))),
             "n_with_activity": int(mask.sum()),
             "n_binders": int(df["is_binder"].fillna(0).sum()) if "is_binder" in df else 0,
             # Headline ranking metrics

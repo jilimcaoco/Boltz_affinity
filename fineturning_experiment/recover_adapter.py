@@ -18,6 +18,7 @@ from boltz.lora.adapter import (
     BOLTZ_LORA_FORMAT_VERSION,
 )
 from boltz.lora.registry import default_registry
+from boltz.lora.targets import TARGET_PRESETS
 
 adapter_dir = Path(__file__).parent / "adapters" / "drd4_v2_rank_64"
 
@@ -33,13 +34,18 @@ print("Model state keys (3) :", model_state_keys[:3])
 if not model_state_keys:
     sys.exit("ERROR: model_state is empty — this checkpoint may not contain LoRA weights.")
 
+# Layer names come from the tensors themselves (two tensors per layer). Writing
+# them (and the preset's patterns) into meta.json keeps the adapter loadable
+# with strict layer checking; an empty list makes load_adapter_into_model fail.
+adapted_layers = sorted({k.rsplit(".", 1)[0] for k in model_state_keys})
+
 # ── Reconstruct proper adapter.pt format ─────────────────────────────────────
 config = LoRAConfig(
     rank=32,
     alpha=64.0,
     dropout=0.0,
     target_spec="heads_pairformer",
-    target_patterns=[],
+    target_patterns=list(TARGET_PRESETS["heads_pairformer"]),
 )
 proper_blob = {
     "state_dict": ckpt["model_state"],
@@ -71,6 +77,7 @@ run = TrainingRun(
 adapter = LoRAAdapter(
     name="drd4_v2_rank_64",
     config=config,
+    adapted_layers=adapted_layers,
     history=[run],
 )
 (adapter_dir / "meta.json").write_text(adapter.to_json())
@@ -86,7 +93,7 @@ idx["drd4_v2_rank_64"] = {
     "parent_adapter": None,
     "rank": config.rank,
     "target_spec": config.target_spec,
-    "num_adapted_layers": len(model_state_keys),
+    "num_adapted_layers": len(adapted_layers),
 }
 registry._write_index(idx)
 print("Updated registry.json")

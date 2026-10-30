@@ -333,7 +333,6 @@ class TestConfigIntegration:
 
         assert loaded.device == original.device
         assert loaded.recycling_steps == original.recycling_steps
-        assert loaded.diffusion_samples == original.diffusion_samples
         assert loaded.validation_level == original.validation_level
 
     def test_env_vars_override_yaml(self, tmp_path):

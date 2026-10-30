@@ -55,12 +55,20 @@ def _train_options(fn):
                  "(not yet wired).",
         ),
         click.option(
-            "--affinity-output", default="module1", show_default=True,
+            "--affinity-output", default=None,
             type=click.Choice(["module1", "ensemble"]),
-            help="Affinity value the loss is computed on. module1: "
-                 "affinity_module1's raw output (historical). ensemble: the "
+            help="Affinity value the loss is computed on. ensemble: the "
                  "module1/module2 average with the MW correction, i.e. the "
-                 "value `boltz rescore` reports (ensemble checkpoints only).",
+                 "value `boltz rescore` reports. module1: affinity_module1's "
+                 "raw output (pre-v2 behaviour).  [default: ensemble; "
+                 "module1 with --legacy-trainer]",
+        ),
+        click.option(
+            "--legacy-trainer", is_flag=True, default=False,
+            help="Reproduce artifacts trained before trainer v2: no gradient "
+                 "reaches the affinity pairformer stack (reentrant activation "
+                 "checkpointing), module1 output, pre-v2 preset resolution. "
+                 "See docs/MIGRATION_TRAINER_V2.md.",
         ),
         click.option(
             "--loss", "loss_spec", default="mse",
@@ -70,10 +78,11 @@ def _train_options(fn):
         ),
         click.option(
             "--target-spec", default="affinity_module", show_default=True,
-            help="Preset (affinity_module|affinity_heads|"
-                 "affinity_pairformer|heads_pairformer), regex, or "
-                 "comma-separated regex list. "
-                 "Matched against model.named_parameters().",
+            help="Preset (affinity_module|affinity_heads|affinity_pairformer|"
+                 "affinity_heads_pairformer — the same module scopes as the "
+                 "LoRA presets of the same name), regex, or comma-separated "
+                 "regex list. Matched against model.named_parameters(). "
+                 "`heads`/`heads_pairformer` are deprecated aliases.",
         ),
         click.option("--epochs", default=5, type=int, show_default=True),
         click.option(
@@ -128,6 +137,17 @@ def _train_options(fn):
             "--plot-loss-curve/--no-plot-loss-curve",
             default=True, show_default=True,
         ),
+        click.option(
+            "--val-csv", "val_csv_path", default=None, type=str,
+            help="Optional held-out validation CSV (same schema as --csv). "
+                 "val_loss is then computed each epoch, drives early "
+                 "stopping (as in `boltz lora train`) and is plotted.",
+        ),
+        click.option(
+            "--val-split", default=0.0, type=float, show_default=True,
+            help="Fraction of training rows (the last ones in the CSV) to "
+                 "hold out for validation [0, 1). Ignored with --val-csv.",
+        ),
         click.option("--log-level", default="INFO"),
     ]
     for dec in reversed(decorators):
@@ -150,7 +170,8 @@ def train_cmd(
     csv_path: str,
     mode: str,
     loss_spec: str,
-    affinity_output: str,
+    affinity_output: Optional[str],
+    legacy_trainer: bool,
     target_spec: str,
     epochs: int,
     learning_rate: float,
@@ -166,6 +187,8 @@ def train_cmd(
     early_stopping_patience: int,
     early_stopping_min_delta: float,
     plot_loss_curve: bool,
+    val_csv_path: Optional[str],
+    val_split: float,
     log_level: str,
 ) -> None:
     """Train a fresh affinity-module fine-tune."""
@@ -193,7 +216,10 @@ def train_cmd(
         early_stopping_patience=early_stopping_patience,
         early_stopping_min_delta=early_stopping_min_delta,
         plot_loss_curve=plot_loss_curve,
+        val_csv_path=val_csv_path,
+        val_split=val_split,
         affinity_output=affinity_output,
+        legacy_trainer=legacy_trainer,
     )
     record = train_finetune(args)
     click.echo(
@@ -219,7 +245,8 @@ def update_cmd(
     csv_path: str,
     mode: str,
     loss_spec: str,
-    affinity_output: str,
+    affinity_output: Optional[str],
+    legacy_trainer: bool,
     target_spec: str,
     epochs: int,
     learning_rate: float,
@@ -235,6 +262,8 @@ def update_cmd(
     early_stopping_patience: int,
     early_stopping_min_delta: float,
     plot_loss_curve: bool,
+    val_csv_path: Optional[str],
+    val_split: float,
     log_level: str,
 ) -> None:
     """Continue training an existing fine-tune on new data."""
@@ -271,7 +300,10 @@ def update_cmd(
         early_stopping_patience=early_stopping_patience,
         early_stopping_min_delta=early_stopping_min_delta,
         plot_loss_curve=plot_loss_curve,
+        val_csv_path=val_csv_path,
+        val_split=val_split,
         affinity_output=affinity_output,
+        legacy_trainer=legacy_trainer,
     )
     record = train_finetune(
         args, registry=registry, init_state=init_state,

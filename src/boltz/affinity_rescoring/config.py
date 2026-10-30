@@ -7,6 +7,7 @@ and multiple deployment modes (development, testing, production).
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from pathlib import Path
@@ -75,7 +76,9 @@ def load_config(config_path: Optional[str | Path] = None) -> RescoreConfig:
     RescoreConfig
         Validated configuration object
     """
-    config_data = dict(DEFAULT_CONFIG)
+    # Deep copy: _deep_merge / env overrides mutate nested sections in place,
+    # which with a shallow copy leaked one call's settings into DEFAULT_CONFIG.
+    config_data = copy.deepcopy(DEFAULT_CONFIG)
 
     # Load from file
     if config_path is not None:
@@ -104,7 +107,7 @@ def load_config(config_path: Optional[str | Path] = None) -> RescoreConfig:
     return RescoreConfig(
         checkpoint=config_data.get("model", {}).get("checkpoint", "auto"),
         device=DeviceOption(config_data.get("model", {}).get("device", "auto")),
-        recycling_steps=config_data.get("inference", {}).get("recycling_steps", 5),
+        recycling_steps=config_data.get("inference", {}).get("recycling_steps", DEFAULT_CONFIG["inference"]["recycling_steps"]),
         affinity_mw_correction=config_data.get("inference", {}).get("affinity_mw_correction", True),
         validation_level=ValidationLevel(
             config_data.get("validation", {}).get("level", "moderate")

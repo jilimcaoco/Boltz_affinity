@@ -614,7 +614,7 @@ class TestConfiguration:
         from boltz.affinity_rescoring.config import load_config
 
         config = load_config()
-        assert config.recycling_steps == 5
+        assert config.recycling_steps == 3  # DEFAULT_CONFIG / RescoreConfig default
         assert config.validation_level.value == "moderate"
         assert config.device.value == "auto"
 
@@ -1261,3 +1261,15 @@ END
                     assert "seqres_A" in metadata
             finally:
                 os.unlink(f.name)
+
+
+def test_load_config_does_not_mutate_defaults(tmp_path):
+    """A loaded file must not leak into later load_config() calls."""
+    from boltz.affinity_rescoring.config import DEFAULT_CONFIG, load_config
+
+    before = DEFAULT_CONFIG["inference"]["recycling_steps"]
+    cfg = tmp_path / "rescore_config.yaml"
+    cfg.write_text("inference:\n  recycling_steps: 7\n")
+    assert load_config(cfg).recycling_steps == 7
+    assert DEFAULT_CONFIG["inference"]["recycling_steps"] == before
+    assert load_config(tmp_path / "absent.yaml").recycling_steps == before

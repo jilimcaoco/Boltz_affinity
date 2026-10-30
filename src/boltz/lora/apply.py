@@ -9,6 +9,7 @@ unless ``allow_restack=True`` (v1 supports a single adapter at a time).
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 from boltz.lora.adapter import LoRAAdapter
@@ -72,6 +73,17 @@ def load_adapter_into_model(
     # Use the same target patterns that were used at training time so the
     # injected LoRALinear layers exactly match the saved state_dict keys.
     target_patterns = adapter.config.target_patterns or list(adapter.adapted_layers)
+    if not target_patterns and state:
+        # Metadata lost its layer list (e.g. adapters re-registered by a
+        # recovery script). The tensors themselves name every adapted layer
+        # exactly, so inject at those paths and nowhere else.
+        layers = sorted({k.rsplit(".", 1)[0] for k in state if k.endswith((".lora_A", ".lora_B"))})
+        target_patterns = [rf"^{re.escape(name)}$" for name in layers]
+        adapter.adapted_layers = layers
+        logger.warning(
+            "Adapter '%s' metadata lists no target layers; using the %d layers "
+            "named in adapter.pt.", adapter.name, len(layers),
+        )
     if not target_patterns:
         msg = (
             f"Adapter '{adapter.name}' lists no target layers; "

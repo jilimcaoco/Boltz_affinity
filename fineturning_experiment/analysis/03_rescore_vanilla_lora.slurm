@@ -25,6 +25,7 @@ source ../config.env
 ANALYSIS_DIR="${EXP_DIR}/analysis"
 VAL_POSES_DIR="${ANALYSIS_DIR}/poses"
 SCORES_DIR="${ANALYSIS_DIR}/scores"
+LABELS_DIR="${ANALYSIS_DIR}/labels"
 
 mkdir -p "${SCORES_DIR}" "${LOG_DIR}"
 
@@ -42,6 +43,20 @@ export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 export BOLTZ_CACHE BOLTZ_LORA_DIR BOLTZ_FINETUNE_DIR BOLTZ_MSA_CACHE_DIR
 
 nvidia-smi || true
+
+# Ligand SMILES from the labels (columns name,smiles; name == pose stem).
+# Without them rescoring infers each ligand from pose coordinates, which fails
+# outright for many poses and feeds an inferred molecular weight into the MW
+# correction. Populates the SMILES_ARGS array for the given target.
+_smiles_args() {
+    local tgt="$1" labels="${LABELS_DIR}/labels_$1.csv"
+    SMILES_ARGS=()
+    if [[ -s "${labels}" ]]; then
+        SMILES_ARGS=(--smiles-csv "${labels}")
+    else
+        echo "[$(date)] WARNING: ${labels} missing; ${tgt} ligand SMILES will be inferred from coordinates."
+    fi
+}
 
 # Returns 0 (proceed) when the output does not exist or FORCE_RESCORE=true.
 _should_rescore() {
@@ -63,12 +78,14 @@ rescore_vanilla() {
     fi
     if _should_rescore "${SCORES_DIR}/${tgt}_vanilla.csv" "${tgt} VANILLA"; then
         echo "[$(date)] rescore ${tgt} VANILLA"
+        _smiles_args "${tgt}"
         boltz rescore batch \
             --input-dir   "${in_dir}" \
             --output      "${SCORES_DIR}/${tgt}_vanilla.csv" \
             --output-format csv \
             --device      cuda \
             --msa-directory "${MSA_DIR}" \
+            "${SMILES_ARGS[@]}" \
             --log-level   INFO
     fi
 }
@@ -81,12 +98,14 @@ rescore_lora() {
     fi
     if _should_rescore "${SCORES_DIR}/${tgt}_lora_${adapter}.csv" "${tgt} LoRA=${adapter}"; then
         echo "[$(date)] rescore ${tgt} LoRA=${adapter}"
+        _smiles_args "${tgt}"
         boltz rescore batch \
             --input-dir   "${in_dir}" \
             --output      "${SCORES_DIR}/${tgt}_lora_${adapter}.csv" \
             --output-format csv \
             --device      cuda \
             --msa-directory "${MSA_DIR}" \
+            "${SMILES_ARGS[@]}" \
             --use-lora    "${adapter}" \
             --log-level   INFO
     fi
@@ -100,12 +119,14 @@ rescore_finetune() {
     fi
     if _should_rescore "${SCORES_DIR}/${tgt}_finetune_${adapter}.csv" "${tgt} FINETUNE=${adapter}"; then
         echo "[$(date)] rescore ${tgt} FINETUNE=${adapter}"
+        _smiles_args "${tgt}"
         boltz rescore batch \
             --input-dir   "${in_dir}" \
             --output      "${SCORES_DIR}/${tgt}_finetune_${adapter}.csv" \
             --output-format csv \
             --device      cuda \
             --msa-directory "${MSA_DIR}" \
+            "${SMILES_ARGS[@]}" \
             --use-finetune "${adapter}" \
             --log-level   INFO
     fi

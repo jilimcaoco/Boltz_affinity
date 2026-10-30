@@ -24,7 +24,9 @@ if drd4_path.exists() and (drd4_path / "meta.json").exists():
     meta = json.loads((drd4_path / "meta.json").read_text())
     # Count LoRA tensors
     ckpt = torch.load(drd4_path / "adapter.pt", map_location="cpu", weights_only=False)
-    num_tensors = len(ckpt.get("state_dict", {})) if isinstance(ckpt, dict) and "state_dict" in ckpt else 0
+    state = ckpt.get("state_dict", {}) if isinstance(ckpt, dict) else {}
+    num_tensors = len(state)
+    num_layers = len({k.rsplit(".", 1)[0] for k in state})  # lora_A + lora_B per layer
     
     registry["drd4_v2_rank_64"] = {
         "path": str(drd4_path.resolve()),
@@ -33,16 +35,18 @@ if drd4_path.exists() and (drd4_path / "meta.json").exists():
         "parent_adapter": None,
         "rank": meta["config"]["rank"],
         "target_spec": meta["config"]["target_spec"],
-        "num_adapted_layers": num_tensors,
+        "num_adapted_layers": num_layers,
     }
-    print(f"✓ Added drd4_v2_rank_64 ({num_tensors} tensors)")
+    print(f"✓ Added drd4_v2_rank_64 ({num_layers} layers, {num_tensors} tensors)")
 
 # Add 5ht2a_v2_rank_64
 ht2a_path = adapter_dir / "5ht2a_v2_rank_64"
 if ht2a_path.exists() and (ht2a_path / "meta.json").exists():
     meta = json.loads((ht2a_path / "meta.json").read_text())
     ckpt = torch.load(ht2a_path / "adapter.pt", map_location="cpu", weights_only=False)
-    num_tensors = len(ckpt.get("state_dict", {})) if isinstance(ckpt, dict) and "state_dict" in ckpt else 0
+    state = ckpt.get("state_dict", {}) if isinstance(ckpt, dict) else {}
+    num_tensors = len(state)
+    num_layers = len({k.rsplit(".", 1)[0] for k in state})  # lora_A + lora_B per layer
     
     registry["5ht2a_v2_rank_64"] = {
         "path": str(ht2a_path.resolve()),
@@ -51,9 +55,9 @@ if ht2a_path.exists() and (ht2a_path / "meta.json").exists():
         "parent_adapter": None,
         "rank": meta["config"]["rank"],
         "target_spec": meta["config"]["target_spec"],
-        "num_adapted_layers": num_tensors,
+        "num_adapted_layers": num_layers,
     }
-    print(f"✓ Added 5ht2a_v2_rank_64 ({num_tensors} tensors)")
+    print(f"✓ Added 5ht2a_v2_rank_64 ({num_layers} layers, {num_tensors} tensors)")
 
 # Write updated registry
 with open(registry_path, "w") as f:

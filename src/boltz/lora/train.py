@@ -19,10 +19,12 @@ adapter's ``meta.json`` via :class:`LoRARegistry`.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import logging
 import math
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -50,6 +52,7 @@ from boltz.lora.losses import (
     loss_delta,
     robust_delta,
 )
+from boltz.lora.provenance import repo_state
 from boltz.lora.registry import LoRARegistry, default_registry, hash_file
 from boltz.lora.targets import resolve_targets
 
@@ -67,7 +70,7 @@ class TrainArgs:
     rank: int = 8
     alpha: float = 16.0
     dropout: float = 0.0
-    target_spec: str = "heads_pairformer"
+    target_spec: str = "affinity_heads_pairformer"
     epochs: int = 5
     learning_rate: float = 1e-4
     batch_size: int = 1
@@ -109,7 +112,13 @@ class TrainArgs:
     # module1: affinity_module1's raw value (historical behaviour).
     # ensemble: the module1/module2 average with the MW correction, i.e. the
     #           value `boltz rescore` reports.
-    affinity_output: str = "module1"
+    # None resolves to "ensemble", or "module1" with legacy_trainer.
+    affinity_output: Optional[str] = None
+    # Reproduce artifacts trained before trainer v2: reentrant activation
+    # checkpointing (no gradient reaches the affinity pairformer stack),
+    # module1 output, pre-v2 target-preset resolution. See
+    # docs/MIGRATION_TRAINER_V2.md.
+    legacy_trainer: bool = False
 
 
 HUBER_DELTA_MODES = ("fixed", "static-vanilla", "dynamic-mad")
@@ -1033,6 +1042,296 @@ def _resolve_delta(residuals: torch.Tensor, args: TrainArgs, label: str) -> floa
     return delta
 
 
+# ── Trainer semantics (shared with boltz.finetune) ───────────────────────────
+
+
+def resolve_affinity_output(affinity_output: Optional[str], legacy_trainer: bool) -> str:
+    """``None`` -> ``"ensemble"`` (v2) or ``"module1"`` (legacy); validates."""
+    if affinity_output is None:
+        return "module1" if legacy_trainer else "ensemble"
+    if affinity_output not in AFFINITY_OUTPUTS:
+        msg = (
+            f"Unknown affinity_output {affinity_output!r}; expected one "
+            f"of {AFFINITY_OUTPUTS}."
+        )
+        raise ValueError(msg)
+    return affinity_output
+
+
+def set_checkpoint_mode(model: Any, *, legacy: bool) -> int:
+    """Select reentrant (legacy) or non-reentrant activation checkpointing.
+
+    Reentrant checkpointing returns an output without a graph when the layer
+    input does not require grad, so on a frozen trunk no parameter inside the
+    affinity pairformer stack is ever trained. Returns the number of
+    pairformer modules configured.
+    """
+    from boltz.model.layers.pairformer import PairformerModule, PairformerNoSeqModule
+
+    n = 0
+    for mod in model.modules():
+        if isinstance(mod, (PairformerModule, PairformerNoSeqModule)):
+            mod.checkpoint_use_reentrant = legacy
+            n += 1
+    return n
+
+
+def affinity_modules_for(model: Any, affinity_output: str) -> tuple[str, ...]:
+    """Affinity-module attribute names the training forward actually uses."""
+    if getattr(model, "affinity_ensemble", False):
+        if affinity_output == "ensemble":
+            return ("affinity_module1", "affinity_module2")
+        return ("affinity_module1",)
+    return ("affinity_module",)
+
+
+_SCOPE_RE = re.compile(r"^(.*?\.(?:pairformer_stack|affinity_heads))\.")
+
+
+def _grad_scope(name: str) -> str:
+    m = _SCOPE_RE.match(name)
+    return m.group(1).replace("._orig_mod", "") if m else name.split(".")[0]
+
+
+class GradCoverage:
+    """Which trainable tensors received a nonzero gradient.
+
+    Updated after each ``backward()`` of the first epoch. A whole scope
+    (``affinity_module1.pairformer_stack``, ``...affinity_heads``, or a
+    top-level module) that never receives gradient is frozen in practice,
+    whatever the optimizer is told — the failure mode that left every
+    pre-v2 adapter heads-only.
+    """
+
+    def __init__(self, named_params: list[tuple[str, torch.nn.Parameter]]) -> None:
+        self._params = [(n, p) for n, p in named_params if p.requires_grad]
+        self._seen: set[str] = set()
+
+    def update(self) -> None:
+        for n, p in self._params:
+            if n not in self._seen and p.grad is not None and bool(p.grad.detach().ne(0).any()):
+                self._seen.add(n)
+
+    def summary(self) -> dict[str, Any]:
+        scopes: dict[str, list[int]] = {}
+        for n, _ in self._params:
+            c = scopes.setdefault(_grad_scope(n), [0, 0])
+            c[0] += n in self._seen
+            c[1] += 1
+        return {
+            "n_trainable": len(self._params),
+            "n_without_grad": len(self._params) - len(self._seen),
+            "scopes": scopes,
+        }
+
+
+def check_grad_coverage(
+    summary: dict[str, Any], *, forward_modules: tuple[str, ...], legacy: bool,
+) -> None:
+    """Fail (warn in legacy mode) when a scope in the forward got no gradient.
+
+    Scopes outside the training forward (e.g. ``confidence_module`` adapted
+    by the deprecated ``heads_pairformer`` preset, or ``affinity_module2``
+    with ``affinity_output='module1'``) only warn: they cannot be trained by
+    construction. Partially reached scopes are expected for some losses
+    (e.g. a Huber loss never reaches the binary-logit head) and are logged.
+    """
+    in_forward = set(forward_modules) | set(_TRUNK_MODULE_ATTRS)
+    dead_fwd, dead_out = [], []
+    for scope, (n_grad, n_total) in sorted(summary["scopes"].items()):
+        if n_grad == 0:
+            (dead_fwd if scope.split(".")[0] in in_forward else dead_out).append(
+                f"{scope}: 0/{n_total}")
+        elif n_grad < n_total:
+            logger.info(
+                "Gradient coverage: %s %d/%d trainable tensors received gradient.",
+                scope, n_grad, n_total,
+            )
+    if dead_out:
+        logger.warning(
+            "Trainable tensors outside the training forward never receive "
+            "gradient and stay at their initial values: %s.", ", ".join(dead_out),
+        )
+    if dead_fwd:
+        msg = (
+            "No gradient reached these trainable scopes during the first epoch: "
+            f"{', '.join(dead_fwd)}. They would silently stay frozen."
+        )
+        if legacy:
+            logger.warning("%s (legacy_trainer: expected, recorded in meta.json)", msg)
+        else:
+            raise RuntimeError(
+                msg + " Check activation checkpointing (see "
+                "set_checkpoint_mode) and that the target spec matches the "
+                "modules used by affinity_output."
+            )
+
+
+# ── Shared batch / validation helpers (LoRA + full fine-tune) ────────────────
+
+
+def _dataset_rows(ds: Any, base: LoRADataset) -> list:
+    """Rows of a LoRADataset or of a Subset of ``base``."""
+    return ds.rows if hasattr(ds, "rows") else [base.rows[i] for i in ds.indices]
+
+
+def _split_train_val(
+    dataset: LoRADataset,
+    *,
+    mode: str,
+    val_csv_path: Optional[str],
+    val_split: float,
+) -> tuple[Any, Optional[Any]]:
+    """Train / validation datasets: explicit val CSV > tail split > none."""
+    if val_csv_path:
+        val_dataset = LoRADataset(val_csv_path, mode=mode)
+        logger.info("Validation CSV: %d rows (%s)", len(val_dataset), val_csv_path)
+        return dataset, val_dataset
+    if val_split and 0.0 < val_split < 1.0:
+        import torch.utils.data as _tud
+        n_val = max(1, int(math.ceil(len(dataset) * val_split)))
+        n_train = len(dataset) - n_val
+        if n_train < 1:
+            logger.warning(
+                "val_split=%.2f leaves 0 training rows — ignoring split.", val_split,
+            )
+            return dataset, None
+        # Deterministic split: the last n_val CSV rows become validation (not
+        # shuffled or stratified; sort/split the manifest upstream if assays
+        # must not straddle the boundary).
+        logger.info(
+            "val_split=%.2f → %d train rows, %d val rows.", val_split, n_train, n_val,
+        )
+        return (
+            _tud.Subset(dataset, list(range(n_train))),
+            _tud.Subset(dataset, list(range(n_train, len(dataset)))),
+        )
+    return dataset, None
+
+
+def _build_val_loader(val_dataset: Any, base: LoRADataset, batch_size: int) -> DataLoader:
+    """Validation loader mirroring the train-side grouping (no shuffle).
+
+    Grouped, NOT batch_size=1: a singleton batch makes every pairwise loss
+    term short-circuit to its absolute-only branch, so val_loss would only
+    measure the absolute term regardless of loss variant.
+    """
+    rows = _dataset_rows(val_dataset, base)
+    if batch_size > 1 and any(r.group_id for r in rows):
+        sampler = AssayGroupedSampler(rows, batch_size=batch_size, shuffle=False)
+        logger.info(
+            "Validation AssayGroupedSampler: %d assay groups, %d ungrouped rows.",
+            sampler.n_assay_groups, sampler.n_ungrouped,
+        )
+        return DataLoader(
+            val_dataset, batch_sampler=sampler, collate_fn=lora_collate, num_workers=0,
+        )
+    return DataLoader(
+        val_dataset, batch_size=1, shuffle=False, collate_fn=lora_collate, num_workers=0,
+    )
+
+
+def _forward_batch(
+    model: Any,
+    batch: dict[str, Any],
+    *,
+    device: torch.device,
+    cache_dir: Path,
+    use_msa_server: bool,
+    recycling_steps: int,
+    affinity_output: str,
+    log_prefix: str = "",
+) -> Optional[tuple[dict[str, torch.Tensor], dict[str, Any], torch.Tensor]]:
+    """Featurize + forward a collated batch; ``(pred, batch_for_loss, target)``.
+
+    Multi-row batches keep every row's graph alive so a pairwise loss term
+    can back-propagate through all of them in one ``backward()``. Rows that
+    fail featurization are dropped and the per-row batch fields subset to
+    match. Returns ``None`` when no row survives.
+    """
+    target = batch["target"].to(device)
+    n_rows = len(batch["name"]) if isinstance(batch["name"], list) else 1
+
+    if n_rows == 1:
+        # Fast path: single row — featurize once, forward once.
+        try:
+            feats = _featurize_row(
+                batch, cache_dir=cache_dir, use_msa_server=use_msa_server, device=device,
+            )
+        except Exception as exc:  # noqa: BLE001
+            name = batch["name"][0] if isinstance(batch["name"], list) else batch["name"]
+            logger.warning("%sSkipping row %r: featurization failed (%s)", log_prefix, name, exc)
+            return None
+        pred_combined = _affinity_forward_trainable(
+            model, feats, recycling_steps=recycling_steps,
+            affinity_output=affinity_output,
+        )
+        return pred_combined, {**batch, "target": target}, target
+
+    all_pred_values: list[torch.Tensor] = []
+    all_logits_binary: list[torch.Tensor] = []
+    kept_indices: list[int] = []
+    for i in range(n_rows):
+        row_i = _extract_row_from_batch(batch, i)
+        try:
+            feats_i = _featurize_row(
+                row_i, cache_dir=cache_dir, use_msa_server=use_msa_server, device=device,
+            )
+        except Exception as exc:  # noqa: BLE001
+            name = row_i["name"][0] if isinstance(row_i["name"], list) else row_i["name"]
+            logger.warning("%sSkipping row %r: featurization failed (%s)", log_prefix, name, exc)
+            continue
+        pred_i = _affinity_forward_trainable(
+            model, feats_i, recycling_steps=recycling_steps,
+            affinity_output=affinity_output,
+        )
+        all_pred_values.append(pred_i["affinity_pred_value"])
+        if "affinity_logits_binary" in pred_i:
+            all_logits_binary.append(pred_i["affinity_logits_binary"])
+        kept_indices.append(i)
+    if not all_pred_values:
+        logger.warning("%sSkipping batch: no rows survived featurization", log_prefix)
+        return None
+    # Subset the per-row target/group/is_binder/is_censored lists to kept rows.
+    if len(kept_indices) != n_rows:
+        keep_t = torch.tensor(kept_indices, device=target.device, dtype=torch.long)
+        target = target.index_select(0, keep_t)
+        if isinstance(batch.get("target"), torch.Tensor):
+            batch["target"] = batch["target"].index_select(
+                0, keep_t.to(batch["target"].device)
+            )
+        for k in ("group_id", "is_binder", "is_censored", "name"):
+            v = batch.get(k)
+            if isinstance(v, list):
+                batch[k] = [v[i] for i in kept_indices]
+    pred_combined = {"affinity_pred_value": torch.cat(all_pred_values, dim=0)}
+    if all_logits_binary and len(all_logits_binary) == len(kept_indices):
+        pred_combined["affinity_logits_binary"] = torch.cat(all_logits_binary, dim=0)
+    return pred_combined, {**batch, "target": target}, target
+
+
+def _run_validation(
+    model: Any,
+    val_loader: DataLoader,
+    loss_fn: LossFn,
+    loss_meta: Any,
+    **forward_kwargs: Any,
+) -> Optional[float]:
+    """Mean validation loss (no grad, eval mode), or None if nothing scored."""
+    model.eval()
+    losses: list[float] = []
+    with torch.no_grad():
+        for val_batch in val_loader:
+            out = _forward_batch(model, val_batch, log_prefix="Val: ", **forward_kwargs)
+            if out is None:
+                continue
+            pred, batch_for_loss, _ = out
+            val_loss = call_loss(loss_fn, pred, batch_for_loss, loss_meta)
+            losses.append(float(val_loss.detach().cpu().item()))
+    model.train()
+    return sum(losses) / len(losses) if losses else None
+
+
 # ── Trainer ──────────────────────────────────────────────────────────────────
 
 
@@ -1089,12 +1388,11 @@ def train_lora(
             f"of {HUBER_DELTA_MODES}."
         )
         raise ValueError(msg)
-    if args.affinity_output not in AFFINITY_OUTPUTS:
-        msg = (
-            f"Unknown affinity_output {args.affinity_output!r}; expected one "
-            f"of {AFFINITY_OUTPUTS}."
-        )
-        raise ValueError(msg)
+    requested_output = args.affinity_output
+    args = dataclasses.replace(
+        args,
+        affinity_output=resolve_affinity_output(args.affinity_output, args.legacy_trainer),
+    )
     if args.early_stopping_rel_delta < 0:
         msg = f"early_stopping_rel_delta must be >= 0, got {args.early_stopping_rel_delta}."
         raise ValueError(msg)
@@ -1111,53 +1409,16 @@ def train_lora(
 
     dataset = LoRADataset(args.csv_path, mode=args.mode)
 
-    # ── Build train / val datasets ────────────────────────────────────────────
-    # Priority: explicit val CSV > random split > no validation.
-    val_dataset: Optional[LoRADataset] = None
-    if args.val_csv_path:
-        val_dataset = LoRADataset(args.val_csv_path, mode=args.mode)
-        train_dataset = dataset
-        logger.info(
-            "Validation CSV: %d rows (%s)",
-            len(val_dataset), args.val_csv_path,
-        )
-    elif args.val_split and 0.0 < args.val_split < 1.0:
-        import math as _math
-        import copy as _copy
-        n_val = max(1, int(_math.ceil(len(dataset) * args.val_split)))
-        n_train = len(dataset) - n_val
-        if n_train < 1:
-            logger.warning(
-                "val_split=%.2f leaves 0 training rows — ignoring split.",
-                args.val_split,
-            )
-            train_dataset = dataset
-        else:
-            # Deterministic stratified split: last n_val rows become validation.
-            # Rows are already randomised by the sampler each epoch, so order
-            # here is just insertion order from the CSV (stable, reproducible).
-            import torch.utils.data as _tud
-            train_dataset = _tud.Subset(dataset, list(range(n_train)))
-            val_dataset_sub = _tud.Subset(dataset, list(range(n_train, len(dataset))))
-            # Wrap in a thin proxy so __len__ / __getitem__ are consistent
-            val_dataset = val_dataset_sub  # type: ignore[assignment]
-            logger.info(
-                "val_split=%.2f → %d train rows, %d val rows.",
-                args.val_split, n_train, n_val,
-            )
-            train_dataset = train_dataset  # noqa: PLW0127 (assigned above)
-    else:
-        train_dataset = dataset
+    train_dataset, val_dataset = _split_train_val(
+        dataset, mode=args.mode,
+        val_csv_path=args.val_csv_path, val_split=args.val_split,
+    )
 
     # ── Build data loaders ────────────────────────────────────────────────────
     # Use the assay-grouped batch sampler when group_id is populated and
     # batch_size > 1 so that the intra-assay pairwise Huber loss always has
     # same-assay pairs within every mini-batch.
-    _train_rows = (
-        train_dataset.rows  # LoRADataset
-        if hasattr(train_dataset, "rows")
-        else [dataset.rows[i] for i in train_dataset.indices]  # Subset
-    )
+    _train_rows = _dataset_rows(train_dataset, dataset)
     has_groups = any(r.group_id for r in _train_rows)
     warn_if_censored_loss_without_censored_rows(args.loss_spec, _train_rows)
     _sampler: Optional[AssayGroupedSampler] = None
@@ -1179,44 +1440,24 @@ def train_lora(
             collate_fn=lora_collate, num_workers=0,
         )
 
-    val_loader: Optional[DataLoader] = None
-    if val_dataset is not None:
-        # Grouped, NOT batch_size=1: a singleton batch makes every pairwise
-        # loss term (intra_assay_huber, censored_intra_assay_huber, ...)
-        # short-circuit to its absolute-only branch (see call sites: each
-        # returns early when p.numel() < 2), so val_loss silently measured
-        # only the absolute term regardless of loss variant. Mirror the
-        # train-side AssayGroupedSampler (shuffle=False: validation order
-        # need not vary run-to-run) so val_loss reflects the same pairwise/
-        # censored terms actually being optimised.
-        _val_rows = (
-            val_dataset.rows  # LoRADataset
-            if hasattr(val_dataset, "rows")
-            else [dataset.rows[i] for i in val_dataset.indices]  # Subset
-        )
-        _val_has_groups = any(r.group_id for r in _val_rows)
-        if args.batch_size > 1 and _val_has_groups:
-            _val_sampler = AssayGroupedSampler(
-                _val_rows, batch_size=args.batch_size, shuffle=False,
-            )
-            val_loader = DataLoader(
-                val_dataset, batch_sampler=_val_sampler,
-                collate_fn=lora_collate, num_workers=0,
-            )
-            logger.info(
-                "Validation AssayGroupedSampler: %d assay groups, %d ungrouped rows.",
-                _val_sampler.n_assay_groups, _val_sampler.n_ungrouped,
-            )
-        else:
-            val_loader = DataLoader(
-                val_dataset, batch_size=1, shuffle=False,
-                collate_fn=lora_collate, num_workers=0,
-            )
+    val_loader: Optional[DataLoader] = (
+        _build_val_loader(val_dataset, dataset, args.batch_size)
+        if val_dataset is not None else None
+    )
 
     model, ckpt_path, ckpt_sha = _load_base_model(args.checkpoint, device)
     model.train()  # enables grad; LoRA params are the only trainable ones
 
-    target_patterns = resolve_targets(args.target_spec)
+    set_checkpoint_mode(model, legacy=args.legacy_trainer)
+    target_modules = affinity_modules_for(model, args.affinity_output)
+    target_patterns = resolve_targets(
+        args.target_spec, modules=target_modules, legacy=args.legacy_trainer,
+    )
+    logger.info(
+        "Trainer semantics: %s (affinity_output=%s, target modules=%s).",
+        "legacy" if args.legacy_trainer else "v2", args.affinity_output,
+        ",".join(target_modules),
+    )
     adapted = apply_lora(
         model, target_patterns,
         r=args.rank, alpha=args.alpha, dropout=args.dropout, freeze_base=True,
@@ -1226,7 +1467,7 @@ def train_lora(
         load_lora_state_dict(model, init_state, strict=False)
         logger.info("Loaded initial LoRA state (%d tensors).", len(init_state))
     logger.info("LoRA adapted %d layers: e.g. %s", len(adapted), adapted[:3])
-    if args.affinity_output == "ensemble" and not getattr(model, "affinity_ensemble", False):
+    if requested_output == "ensemble" and not getattr(model, "affinity_ensemble", False):
         logger.warning(
             "affinity_output='ensemble' requested but the checkpoint has a "
             "single affinity module; training on its output (same as module1)."
@@ -1282,7 +1523,11 @@ def train_lora(
         huber_delta_k=args.huber_delta_k,
         early_stopping_rel_delta=args.early_stopping_rel_delta,
         affinity_output=args.affinity_output,
+        trainer_semantics="legacy" if args.legacy_trainer else "v2",
+        target_modules=list(target_modules),
+        **repo_state(),
     )
+    grad_coverage = GradCoverage(list(model.named_parameters()))
 
     # Early stopping state — uses val_loss when a val set is present, else train loss.
     _es_best_loss: float = float("inf")
@@ -1330,6 +1575,7 @@ def train_lora(
         _es_patience_counter = _ckpt.get("es_patience_counter", 0)
         _es_best_state = _ckpt.get("es_best_state")
         _es_best_epoch = _ckpt.get("es_best_epoch", 0)
+        run.grad_coverage = _ckpt.get("grad_coverage")
         if (
             args.huber_delta_mode != "fixed"
             and _ckpt.get("huber_delta_mode") == args.huber_delta_mode
@@ -1359,85 +1605,25 @@ def train_lora(
         loss_fn = bind_delta(base_loss_fn, current_delta)
         logger.info("Huber delta (%s): using delta=%.4f.", args.huber_delta_mode, current_delta)
 
+    fwd_kwargs = dict(
+        device=device, cache_dir=cache_dir, use_msa_server=args.use_msa_server,
+        recycling_steps=args.recycling_steps, affinity_output=args.affinity_output,
+    )
     for epoch in range(start_epoch, args.epochs):
         if _sampler is not None:
             _sampler.set_epoch(epoch)
         epoch_losses: list[float] = []
         epoch_residuals: list[torch.Tensor] = []
         for batch in loader:
-            target = batch["target"].to(device)
-            n_rows = len(batch["name"]) if isinstance(batch["name"], list) else 1
-
             optim.zero_grad(set_to_none=True)
-
-            if n_rows == 1:
-                # Fast path: single row — featurize once, forward once.
-                try:
-                    feats = _featurize_row(
-                        batch, cache_dir=cache_dir,
-                        use_msa_server=args.use_msa_server, device=device,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    name = batch["name"][0] if isinstance(batch["name"], list) else batch["name"]
-                    logger.warning("Skipping row %r: featurization failed (%s)", name, exc)
-                    continue
-                pred = _affinity_forward_trainable(
-                    model, feats, recycling_steps=args.recycling_steps,
-                    affinity_output=args.affinity_output,
-                )
-                pred_combined = pred
-            else:
-                # Multi-row path: featurize and forward each row keeping all
-                # computation graphs live simultaneously so the pairwise loss
-                # term can back-prop through all of them in one .backward().
-                all_pred_values: list[torch.Tensor] = []
-                all_logits_binary: list[torch.Tensor] = []
-                kept_indices: list[int] = []
-                for i in range(n_rows):
-                    row_i = _extract_row_from_batch(batch, i)
-                    try:
-                        feats_i = _featurize_row(
-                            row_i, cache_dir=cache_dir,
-                            use_msa_server=args.use_msa_server, device=device,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        name = row_i["name"][0] if isinstance(row_i["name"], list) else row_i["name"]
-                        logger.warning("Skipping row %r: featurization failed (%s)", name, exc)
-                        continue
-                    pred_i = _affinity_forward_trainable(
-                        model, feats_i, recycling_steps=args.recycling_steps,
-                        affinity_output=args.affinity_output,
-                    )
-                    all_pred_values.append(pred_i["affinity_pred_value"])
-                    if "affinity_logits_binary" in pred_i:
-                        all_logits_binary.append(pred_i["affinity_logits_binary"])
-                    kept_indices.append(i)
-                if not all_pred_values:
-                    logger.warning("Skipping batch: no rows survived featurization")
-                    continue
-                # Subset the per-row target/group/is_binder lists to kept rows.
-                if len(kept_indices) != n_rows:
-                    keep_t = torch.tensor(kept_indices, device=target.device, dtype=torch.long)
-                    target = target.index_select(0, keep_t)
-                    if isinstance(batch.get("target"), torch.Tensor):
-                        batch["target"] = batch["target"].index_select(
-                            0, keep_t.to(batch["target"].device)
-                        )
-                    for k in ("group_id", "is_binder", "is_censored", "name"):
-                        v = batch.get(k)
-                        if isinstance(v, list):
-                            batch[k] = [v[i] for i in kept_indices]
-                pred_combined = {
-                    "affinity_pred_value": torch.cat(all_pred_values, dim=0)
-                }
-                if all_logits_binary and len(all_logits_binary) == len(kept_indices):
-                    pred_combined["affinity_logits_binary"] = torch.cat(
-                        all_logits_binary, dim=0
-                    )
-
-            batch_for_loss = {**batch, "target": target}
+            fwd = _forward_batch(model, batch, **fwd_kwargs)
+            if fwd is None:
+                continue
+            pred_combined, batch_for_loss, target = fwd
             loss = call_loss(loss_fn, pred_combined, batch_for_loss, adapter)
             loss.backward()
+            if run.grad_coverage is None:
+                grad_coverage.update()
             if args.gradient_clip > 0:
                 torch.nn.utils.clip_grad_norm_(trainable, args.gradient_clip)
             optim.step()
@@ -1446,102 +1632,20 @@ def train_lora(
                 epoch_residuals.append(_batch_residuals(pred_combined, batch_for_loss, target))
 
         mean_loss = sum(epoch_losses) / max(1, len(epoch_losses))
+        # ── Gradient coverage (first trained epoch) ─────────────────────────
+        if run.grad_coverage is None and epoch_losses:
+            run.grad_coverage = grad_coverage.summary()
+            check_grad_coverage(
+                run.grad_coverage, forward_modules=target_modules,
+                legacy=args.legacy_trainer,
+            )
         # ── Validation pass (no grad) ──────────────────────────────────────
-        # Mirrors the training loop's single-row / multi-row branching above
-        # (grouped batches now that val_loader uses AssayGroupedSampler too)
+        # Same single-row / multi-row forward as training (grouped batches)
         # so pairwise/censored loss terms are actually exercised on val data.
-        mean_val_loss: Optional[float] = None
-        if val_loader is not None:
-            model.eval()
-            val_epoch_losses: list[float] = []
-            with torch.no_grad():
-                for val_batch in val_loader:
-                    val_target = val_batch["target"].to(device)
-                    val_n_rows = (
-                        len(val_batch["name"])
-                        if isinstance(val_batch["name"], list) else 1
-                    )
-
-                    if val_n_rows == 1:
-                        try:
-                            val_feats = _featurize_row(
-                                val_batch, cache_dir=cache_dir,
-                                use_msa_server=args.use_msa_server, device=device,
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            vname = (
-                                val_batch["name"][0]
-                                if isinstance(val_batch["name"], list)
-                                else val_batch["name"]
-                            )
-                            logger.warning(
-                                "Val: skipping row %r: featurization failed (%s)",
-                                vname, exc,
-                            )
-                            continue
-                        val_pred = _affinity_forward_trainable(
-                            model, val_feats, recycling_steps=args.recycling_steps,
-                            affinity_output=args.affinity_output,
-                        )
-                        val_pred_combined = val_pred
-                    else:
-                        all_val_pred_values: list[torch.Tensor] = []
-                        all_val_logits_binary: list[torch.Tensor] = []
-                        val_kept_indices: list[int] = []
-                        for i in range(val_n_rows):
-                            val_row_i = _extract_row_from_batch(val_batch, i)
-                            try:
-                                val_feats_i = _featurize_row(
-                                    val_row_i, cache_dir=cache_dir,
-                                    use_msa_server=args.use_msa_server, device=device,
-                                )
-                            except Exception as exc:  # noqa: BLE001
-                                vname = (
-                                    val_row_i["name"][0]
-                                    if isinstance(val_row_i["name"], list)
-                                    else val_row_i["name"]
-                                )
-                                logger.warning(
-                                    "Val: skipping row %r: featurization failed (%s)",
-                                    vname, exc,
-                                )
-                                continue
-                            val_pred_i = _affinity_forward_trainable(
-                                model, val_feats_i, recycling_steps=args.recycling_steps,
-                                affinity_output=args.affinity_output,
-                            )
-                            all_val_pred_values.append(val_pred_i["affinity_pred_value"])
-                            if "affinity_logits_binary" in val_pred_i:
-                                all_val_logits_binary.append(val_pred_i["affinity_logits_binary"])
-                            val_kept_indices.append(i)
-                        if not all_val_pred_values:
-                            logger.warning("Val: skipping batch: no rows survived featurization")
-                            continue
-                        if len(val_kept_indices) != val_n_rows:
-                            keep_t = torch.tensor(val_kept_indices, device=val_target.device, dtype=torch.long)
-                            val_target = val_target.index_select(0, keep_t)
-                            if isinstance(val_batch.get("target"), torch.Tensor):
-                                val_batch["target"] = val_batch["target"].index_select(
-                                    0, keep_t.to(val_batch["target"].device)
-                                )
-                            for k in ("group_id", "is_binder", "is_censored", "name"):
-                                v = val_batch.get(k)
-                                if isinstance(v, list):
-                                    val_batch[k] = [v[i] for i in val_kept_indices]
-                        val_pred_combined = {
-                            "affinity_pred_value": torch.cat(all_val_pred_values, dim=0)
-                        }
-                        if all_val_logits_binary and len(all_val_logits_binary) == len(val_kept_indices):
-                            val_pred_combined["affinity_logits_binary"] = torch.cat(
-                                all_val_logits_binary, dim=0
-                            )
-
-                    val_batch_for_loss = {**val_batch, "target": val_target}
-                    val_loss_val = call_loss(loss_fn, val_pred_combined, val_batch_for_loss, adapter)
-                    val_epoch_losses.append(float(val_loss_val.detach().cpu().item()))
-            model.train()
-            if val_epoch_losses:
-                mean_val_loss = sum(val_epoch_losses) / len(val_epoch_losses)
+        mean_val_loss: Optional[float] = (
+            _run_validation(model, val_loader, loss_fn, adapter, **fwd_kwargs)
+            if val_loader is not None else None
+        )
 
         # ── Log epoch summary ──────────────────────────────────────────────
         if mean_val_loss is not None:
@@ -1631,6 +1735,7 @@ def train_lora(
             "huber_delta_mode": args.huber_delta_mode,
             "huber_delta_current": current_delta,
             "huber_delta_per_epoch": huber_delta_per_epoch,
+            "grad_coverage": run.grad_coverage,
         })
         logger.debug("Checkpoint saved after epoch %d.", epoch + 1)
 
@@ -1675,4 +1780,15 @@ def prepare_update(
     return registry.load(name)
 
 
-__all__ = ["AFFINITY_OUTPUTS", "HUBER_DELTA_MODES", "TrainArgs", "prepare_update", "train_lora"]
+__all__ = [
+    "AFFINITY_OUTPUTS",
+    "HUBER_DELTA_MODES",
+    "GradCoverage",
+    "TrainArgs",
+    "affinity_modules_for",
+    "check_grad_coverage",
+    "prepare_update",
+    "resolve_affinity_output",
+    "set_checkpoint_mode",
+    "train_lora",
+]

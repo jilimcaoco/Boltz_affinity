@@ -35,12 +35,23 @@ are the only trainable parameters. $B$ is zero at init, so an untrained
 adapter is the identity. Typical adapter sizes are 1–5% of the affinity
 model's params.
 
-**Targets.** Two presets are shipped:
+**Targets.** Presets name module subtrees inside the affinity module(s) the
+training forward uses (`affinity_module1` + `affinity_module2` with the default
+`--affinity-output ensemble`, `affinity_module1` with `module1`). LoRA wraps
+every `nn.Linear` inside them; `boltz finetune` presets of the same name train
+every parameter inside the same subtrees.
 
 | Preset | Layers wrapped |
 |---|---|
-| `heads` | The three MLPs inside `AffinityHeadsTransformer` (smallest, lowest risk). |
-| `heads_pairformer` *(default)* | `heads` + attention/transition linears in the affinity-side pairformer stack. |
+| `affinity_heads` | The MLPs inside `AffinityHeadsTransformer` (9 Linears per module; smallest, lowest risk). |
+| `affinity_pairformer` | Every Linear in the affinity pairformer stack (triangle attention, triangle multiplication, transitions; 23 per block). |
+| `affinity_heads_pairformer` *(default)* | Both of the above. |
+| `affinity_module` | Every Linear in the affinity module (adds the pairwise conditioner and input projections). |
+| `heads`, `heads_pairformer` | **Deprecated**, kept only to reproduce old adapters: `heads_pairformer` matches only the heads and `transition*.fc*` layers and also adapts `confidence_module`. |
+
+Adapters trained before trainer v2 only ever trained the heads (see
+[MIGRATION_TRAINER_V2.md](MIGRATION_TRAINER_V2.md)); `--legacy-trainer`
+reproduces them.
 
 You can also pass an explicit regex (matched with `re.search` against
 `model.named_modules()` names) or a list of regexes for full control.
@@ -101,7 +112,7 @@ boltz lora train \
     --csv data/kinase_train.csv \
     --loss huber \
     --rank 8 --alpha 16 --dropout 0.0 \
-    --target-spec heads_pairformer \
+    --target-spec affinity_heads_pairformer \
     --epochs 10 --learning-rate 1e-4 \
     --recycling-steps 3 \
     --device auto \
@@ -110,8 +121,8 @@ boltz lora train \
 
 Useful options:
 
-- `--target-spec` — `heads`, `heads_pairformer`, or any regex. Try
-  `heads` first if you have ≤ ~1k labelled pairs.
+- `--target-spec` — a preset above or any regex. Try `affinity_heads`
+  first if you have ≤ ~1k labelled pairs.
 - `--rank` — 4–16 covers most use cases. Higher rank ⇒ more capacity ⇒
   more risk of overfitting on small data.
 - `--gradient-clip` — defaults to 1.0; loosen for very small losses.
@@ -126,12 +137,14 @@ Useful options:
 - `--checkpoint` — override the base affinity checkpoint (defaults to
   the cached `boltz2_aff.ckpt`).
 - `--affinity-output` — which affinity value the loss is computed on.
-  `module1` (default, historical) trains on `affinity_module1`'s raw
-  output. `ensemble` trains on the average of both affinity modules with
+  `ensemble` (default) trains on the average of both affinity modules with
   the molecular-weight correction, i.e. exactly the value `boltz rescore`
-  reports. With `module1`, `affinity_module2`'s adapter weights never
-  receive gradient, so at scoring time the learned shift is roughly halved
-  and then MW-corrected; prefer `ensemble` for new runs.
+  reports. `module1` trains on `affinity_module1`'s raw output only; the
+  learned shift is then roughly halved and MW-corrected at scoring time.
+- `--legacy-trainer` — reproduce adapters trained before trainer v2
+  (no gradient reaches the affinity pairformer stack, `module1` output,
+  old preset resolution). Every run records `trainer_semantics`,
+  `grad_coverage` and the repo `boltz_git_sha` in `meta.json`.
 - `--huber-delta-mode`, `--huber-delta`, `--huber-delta-k`,
   `--early-stopping-rel-delta` — data-derived Huber transition point; see
   `boltz lora train --help`.
@@ -364,7 +377,7 @@ Lower-level building blocks:
 
 **`apply_lora matched zero layers`** — your target spec didn't match any
 linear layer name. Run `python -c "from boltz...; print([n for n,_ in model.named_modules()])"`
-or use one of the presets (`heads`, `heads_pairformer`).
+or use one of the presets (`affinity_heads`, `affinity_heads_pairformer`, ...).
 
 **Loss won't go down** — check that `structure` paths actually contain
 the docked complex (not the apo receptor), and that `target` is in a

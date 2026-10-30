@@ -65,7 +65,15 @@ def test_target_presets_known() -> None:
 
 
 def test_resolve_targets_preset_and_regex() -> None:
-    assert resolve_targets("affinity_heads") == TARGET_PRESETS["affinity_heads"]
+    # Legacy resolution keeps the original patterns; v2 uses the anchored
+    # scope shared with LoRA. Both select the same parameters here.
+    assert resolve_targets("affinity_heads", legacy=True) == TARGET_PRESETS["affinity_heads"]
+    model = _ToyBoltz()
+    assert (
+        {n for n, _ in _select_trainable_params(model, resolve_targets("affinity_heads"))}
+        == {n for n, _ in _select_trainable_params(
+            model, resolve_targets("affinity_heads", legacy=True))}
+    )
     assert resolve_targets(r"^my_custom\.layer$") == (r"^my_custom\.layer$",)
     assert resolve_targets("a,b") == ("a", "b")
 

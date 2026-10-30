@@ -59,12 +59,20 @@ def _train_options(fn):
                      help="Built-in (mse|mae|huber|bce|pairwise_ranking) or "
                           "'path/to/file.py:function_name'."),
         click.option(
-            "--affinity-output", default="module1", show_default=True,
+            "--affinity-output", default=None,
             type=click.Choice(["module1", "ensemble"]),
-            help="Affinity value the loss is computed on. module1: "
-                 "affinity_module1's raw output (historical). ensemble: the "
+            help="Affinity value the loss is computed on. ensemble: the "
                  "module1/module2 average with the MW correction, i.e. the "
-                 "value `boltz rescore` reports (ensemble checkpoints only).",
+                 "value `boltz rescore` reports. module1: affinity_module1's "
+                 "raw output (pre-v2 behaviour).  [default: ensemble; "
+                 "module1 with --legacy-trainer]",
+        ),
+        click.option(
+            "--legacy-trainer", is_flag=True, default=False,
+            help="Reproduce artifacts trained before trainer v2: no gradient "
+                 "reaches the affinity pairformer stack (reentrant activation "
+                 "checkpointing), module1 output, pre-v2 preset resolution. "
+                 "See docs/MIGRATION_TRAINER_V2.md.",
         ),
         click.option(
             "--huber-delta-mode", default="fixed", show_default=True,
@@ -87,10 +95,13 @@ def _train_options(fn):
         click.option("--rank", default=8, type=int, show_default=True),
         click.option("--alpha", default=16.0, type=float, show_default=True),
         click.option("--dropout", default=0.0, type=float, show_default=True),
-        click.option("--target-spec", default="heads_pairformer",
+        click.option("--target-spec", default="affinity_heads_pairformer",
                      show_default=True,
-                     help="Preset name (affinity_heads|heads_pairformer), regex, "
-                          "or comma-separated regex list."),
+                     help="Preset (affinity_heads|affinity_pairformer|"
+                          "affinity_heads_pairformer|affinity_module: every "
+                          "Linear in those affinity-module subtrees) or a "
+                          "regex. `heads`/`heads_pairformer` are deprecated "
+                          "(kept for reproducing old adapters)."),
         click.option("--epochs", default=5, type=int, show_default=True),
         click.option("--learning-rate", "--lr", "learning_rate",
                      default=1e-4, type=float, show_default=True),
@@ -182,7 +193,8 @@ def train_cmd(
     csv_path: str,
     mode: str,
     loss_spec: str,
-    affinity_output: str,
+    affinity_output: Optional[str],
+    legacy_trainer: bool,
     huber_delta_mode: str,
     huber_delta: float,
     huber_delta_k: float,
@@ -234,6 +246,7 @@ def train_cmd(
         huber_delta_k=huber_delta_k,
         plot_loss_curve=plot_loss_curve,
         affinity_output=affinity_output,
+        legacy_trainer=legacy_trainer,
         val_csv_path=val_csv_path,
         val_split=val_split,
     )
@@ -258,7 +271,8 @@ def update_cmd(
     csv_path: str,
     mode: str,
     loss_spec: str,
-    affinity_output: str,
+    affinity_output: Optional[str],
+    legacy_trainer: bool,
     huber_delta_mode: str,
     huber_delta: float,
     huber_delta_k: float,
@@ -323,6 +337,7 @@ def update_cmd(
         huber_delta_k=huber_delta_k,
         plot_loss_curve=plot_loss_curve,
         affinity_output=affinity_output,
+        legacy_trainer=legacy_trainer,
         val_csv_path=val_csv_path,
         val_split=val_split,
     )

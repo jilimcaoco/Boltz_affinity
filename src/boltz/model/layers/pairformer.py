@@ -137,6 +137,11 @@ class PairformerModule(nn.Module):
         self.num_heads = num_heads
         self.post_layer_norm = post_layer_norm
         self.activation_checkpointing = activation_checkpointing
+        # Non-reentrant checkpointing lets gradients reach the parameters inside
+        # each layer even when the layer *input* does not require grad (e.g.
+        # fine-tuning on top of a frozen trunk). Reentrant mode silently drops
+        # them in that case. Set True only to reproduce that legacy behaviour.
+        self.checkpoint_use_reentrant = False
 
         self.layers = nn.ModuleList()
         for _ in range(num_blocks):
@@ -195,6 +200,7 @@ class PairformerModule(nn.Module):
                     pair_mask,
                     chunk_size_tri_attn,
                     use_kernels,
+                    use_reentrant=self.checkpoint_use_reentrant,
                 )
             else:
                 s, z = layer(s, z, mask, pair_mask, chunk_size_tri_attn, use_kernels)
@@ -289,6 +295,11 @@ class PairformerNoSeqModule(nn.Module):
         self.dropout = dropout
         self.post_layer_norm = post_layer_norm
         self.activation_checkpointing = activation_checkpointing
+        # Non-reentrant checkpointing lets gradients reach the parameters inside
+        # each layer even when the layer *input* does not require grad (e.g.
+        # fine-tuning on top of a frozen trunk). Reentrant mode silently drops
+        # them in that case. Set True only to reproduce that legacy behaviour.
+        self.checkpoint_use_reentrant = False
 
         self.layers = nn.ModuleList()
         for i in range(num_blocks):
@@ -324,6 +335,7 @@ class PairformerNoSeqModule(nn.Module):
                     pair_mask,
                     chunk_size_tri_attn,
                     use_kernels,
+                    use_reentrant=self.checkpoint_use_reentrant,
                 )
             else:
                 z = layer(

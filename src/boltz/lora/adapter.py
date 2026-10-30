@@ -56,6 +56,17 @@ class TrainingRun:
     # Affinity output the loss was computed on ("module1" | "ensemble");
     # None on runs recorded before the option existed (= module1).
     affinity_output: Optional[str] = None
+    # Trainer semantics ("v2" | "legacy"; None = trained before v2, i.e. legacy
+    # behaviour) and the affinity modules the target spec was restricted to.
+    trainer_semantics: Optional[str] = None
+    target_modules: Optional[list[str]] = None
+    # Per-scope count of trainable tensors that received gradient in the
+    # first epoch: {"n_trainable", "n_without_grad", "scopes": {scope: [n, total]}}.
+    grad_coverage: Optional[dict[str, Any]] = None
+    # Code provenance (boltz.lora.provenance.repo_state).
+    boltz_git_sha: Optional[str] = None
+    boltz_git_dirty: Optional[bool] = None
+    torch_version: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TrainingRun":
